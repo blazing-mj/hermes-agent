@@ -3466,7 +3466,7 @@ class GatewayRunner:
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
             "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "If it was mid-turn, I'll try to resume automatically after restart and report back here."
             if self._restart_requested
             else "Your current task will be interrupted."
         )
@@ -14587,7 +14587,10 @@ class GatewayRunner:
             metadata = {"thread_id": thread_id} if thread_id else None
             result = await adapter.send(
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                (
+                    "♻ Gateway restarted successfully. I'm back online. "
+                    "If a turn was interrupted, it will auto-resume; otherwise I'm idle."
+                ),
                 metadata=metadata,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
