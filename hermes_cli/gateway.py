@@ -563,8 +563,8 @@ def find_profile_gateway_processes(
 
 def _gateway_run_args_for_profile(profile: str) -> list[str]:
     args = [get_python_path(), "-m", "hermes_cli.main"]
-    if profile != "default":
-        args.extend(["--profile", profile])
+    # Always emit --profile for symmetry: removes silent special-case, eases debugging
+    args.extend(["--profile", profile])
     args.extend(["gateway", "run", "--replace"])
     return args
 
@@ -6094,3 +6094,6 @@ def _gateway_command_inner(args):
             print("Legacy unit migration only applies to systemd-based Linux hosts.")
             return
         remove_legacy_hermes_units(interactive=not yes, dry_run=dry_run)
+
+    elif subcmd == "revive-all":
+        _cmd_gateway_revive_all(args)
