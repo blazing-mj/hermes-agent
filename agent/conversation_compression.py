@@ -596,9 +596,41 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
     return changed_count > 0
 
 
+def format_compression_boot_log(compressor: Any, *, enabled: bool) -> str:
+    """Render the resolved compression configuration in a single INFO line.
+
+    Surfaces every knob a stale-config or stale-runtime mismatch could
+    quietly diverge on — threshold %, target %, head/tail protections,
+    model context_length, and the absolute token trigger. Pair this with
+    Preflight compression log lines to immediately tell whether the live
+    threshold matches the user's config.yaml.
+    """
+    if not enabled:
+        return "Compression configured: disabled"
+
+    threshold_pct = int(round(getattr(compressor, "threshold_percent", 0.0) * 100))
+    target_pct = int(round(getattr(compressor, "summary_target_ratio", 0.0) * 100))
+    return (
+        "Compression configured: "
+        f"threshold={threshold_pct}% "
+        f"target={target_pct}% "
+        f"protect_first={getattr(compressor, 'protect_first_n', 0)} "
+        f"protect_last={getattr(compressor, 'protect_last_n', 0)} "
+        f"context_len={getattr(compressor, 'context_length', 0)} "
+        f"trigger_at={getattr(compressor, 'threshold_tokens', 0)} tokens"
+    )
+
+
+def log_compression_configured(compressor: Any, *, enabled: bool) -> None:
+    """Emit the boot-time INFO line so it lands in agent.log every startup."""
+    logger.info(format_compression_boot_log(compressor, enabled=enabled))
+
+
 __all__ = [
     "check_compression_model_feasibility",
     "replay_compression_warning",
     "compress_context",
+    "format_compression_boot_log",
+    "log_compression_configured",
     "try_shrink_image_parts_in_messages",
 ]
