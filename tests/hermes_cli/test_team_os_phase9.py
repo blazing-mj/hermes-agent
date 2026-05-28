@@ -439,6 +439,7 @@ def test_run_active_dispatch_production_gate_blocks_kill_switch_enabled(tmp_path
         heartbeat_stale_seconds=5.0,
         kill_switch=ks,
         production_mode=True,
+        audit_path=tmp_path / "audit.jsonl",
     )
 
     assert result.blocks_task is True
@@ -467,6 +468,7 @@ def test_run_active_dispatch_production_gate_blocks_no_approval(tmp_path):
         heartbeat_stale_seconds=5.0,
         kill_switch=ks,
         production_mode=True,
+        audit_path=tmp_path / "audit.jsonl",
     )
 
     assert result.blocks_task is True
@@ -494,6 +496,7 @@ def test_run_active_dispatch_production_gate_blocks_low_confidence(tmp_path):
         heartbeat_stale_seconds=5.0,
         kill_switch=ks,
         production_mode=True,
+        audit_path=tmp_path / "audit.jsonl",
     )
 
     assert result.blocks_task is True
@@ -518,6 +521,7 @@ def test_run_active_dispatch_production_mode_requires_kill_switch(tmp_path):
         heartbeat_stale_seconds=5.0,
         kill_switch=None,
         production_mode=True,
+        audit_path=tmp_path / "audit.jsonl",
     )
 
     assert result.blocks_task is True
@@ -641,11 +645,11 @@ def test_dispatch_result_to_dict_includes_production_mode(tmp_path):
     json.dumps(d)  # must be JSON-serializable
 
 
-def test_run_active_dispatch_production_mode_no_audit_path_succeeds_without_audit(tmp_path):
-    """production_mode=True with audit_path=None: dispatch succeeds but no audit file written.
+def test_run_active_dispatch_production_mode_no_audit_path_fails_closed(tmp_path):
+    """production_mode=True with audit_path=None fails closed before dispatch.
 
-    This is documented behavior: the caller is responsible for passing audit_path
-    in production mode; omitting it silently skips the audit trail.
+    Phase 10 tightened the Phase 9 library contract: production-mode callers
+    must pass an audit path instead of relying on the CLI defaulting layer.
     """
     from hermes_cli.team_os.kill_switch import KillSwitch
     from hermes_cli.team_os.loop_runner import run_active_dispatch
@@ -653,13 +657,14 @@ def test_run_active_dispatch_production_mode_no_audit_path_succeeds_without_audi
     ks = KillSwitch(tmp_path / "ks.json")  # disabled
     ws = _simple_workspace(tmp_path)
     task = _make_task(approval_status="approved", task_confidence="high", quota_confidence="high")
+    lock_path = tmp_path / "lock"
 
     result = run_active_dispatch(
         task,
         workspace=ws,
         worker_command=[sys.executable, "-c", "pass"],
         heartbeat_path=tmp_path / "hb",
-        lock_path=tmp_path / "lock",
+        lock_path=lock_path,
         owner="test-no-audit-path",
         max_runtime_seconds=5.0,
         heartbeat_stale_seconds=5.0,
@@ -668,10 +673,11 @@ def test_run_active_dispatch_production_mode_no_audit_path_succeeds_without_audi
         audit_path=None,  # explicitly no audit path
     )
 
-    # Dispatch still runs and succeeds — but no audit file exists
-    assert result.status == "succeeded"
+    assert result.status == "production_audit_required"
+    assert result.blocks_task is True
     assert result.production_mode is True
-    # No stray audit files created
+    assert "audit_path" in result.reason
+    assert not lock_path.exists()
     jsonl_files = list(tmp_path.glob("*.jsonl"))
     assert jsonl_files == [], f"unexpected audit files: {jsonl_files}"
 

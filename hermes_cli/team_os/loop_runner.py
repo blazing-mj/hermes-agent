@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +102,71 @@ class RunnerLock:
             return
         if current_owner == self.owner:
             self.path.unlink()
+
+
+@dataclass(frozen=True)
+class WorkerResourceLimits:
+    """Opt-in resource ceilings for sandbox workers.
+
+    All fields default to None, so existing callers see no behavior change.
+    Limits are applied in the child process via POSIX RLIMIT_* when supported.
+    """
+
+    max_file_size_bytes: int | None = None
+    max_processes: int | None = None
+    max_address_space_bytes: int | None = None
+    max_cpu_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_file_size_bytes",
+            "max_processes",
+            "max_address_space_bytes",
+            "max_cpu_seconds",
+        ):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+    def to_dict(self) -> dict[str, int | None]:
+        return {
+            "max_file_size_bytes": self.max_file_size_bytes,
+            "max_processes": self.max_processes,
+            "max_address_space_bytes": self.max_address_space_bytes,
+            "max_cpu_seconds": self.max_cpu_seconds,
+        }
+
+
+def build_resource_preexec_fn(limits: WorkerResourceLimits | None) -> Callable[[], None] | None:
+    """Build a POSIX preexec function that applies worker resource limits."""
+    if limits is None or all(value is None for value in limits.to_dict().values()):
+        return None
+    if sys.platform == "win32":
+        return None
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    def _set_limit(kind: int, soft: int | None) -> None:
+        if soft is None:
+            return
+        try:
+            hard = resource.getrlimit(kind)[1]
+            if hard == resource.RLIM_INFINITY or soft <= hard:
+                resource.setrlimit(kind, (soft, hard))
+        except (OSError, ValueError):
+            pass
+
+    def _apply() -> None:
+        _set_limit(resource.RLIMIT_FSIZE, limits.max_file_size_bytes)
+        if hasattr(resource, "RLIMIT_NPROC"):
+            _set_limit(resource.RLIMIT_NPROC, limits.max_processes)
+        if hasattr(resource, "RLIMIT_AS"):
+            _set_limit(resource.RLIMIT_AS, limits.max_address_space_bytes)
+        _set_limit(resource.RLIMIT_CPU, limits.max_cpu_seconds)
+
+    return _apply
 
 
 def _skip_reason(
@@ -370,6 +437,7 @@ class DispatchResult:
     owner: str
     dry_run: bool = False
     production_mode: bool = False
+    resource_limits: WorkerResourceLimits | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -385,25 +453,49 @@ class DispatchResult:
             "owner": self.owner,
             "dry_run": self.dry_run,
             "production_mode": self.production_mode,
+            "resource_limits": self.resource_limits.to_dict() if self.resource_limits is not None else None,
         }
 
 
 def _terminate_process(proc: "subprocess.Popen[Any]", *, grace: float = 0.25) -> None:
+    """Terminate ``proc`` and its entire process group (SIGTERM → SIGKILL).
+
+    Phase 10: because workers are started with ``start_new_session=True``,
+    ``os.killpg`` reaches grandchildren that the worker spawned without their
+    own session.  Falls back to ``proc.terminate()`` / ``proc.kill()`` on
+    platforms without ``os.killpg`` (Windows).
+    """
     if proc.poll() is not None:
         return
-    try:
-        proc.terminate()
-    except ProcessLookupError:
-        return
+
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    else:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+
     deadline = time.time() + grace
     while time.time() < deadline:
         if proc.poll() is not None:
             return
         time.sleep(0.02)
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        return
+
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    else:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+
     try:
         proc.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
@@ -441,6 +533,7 @@ def run_active_dispatch(
     poll_hook: Callable[[], None] | None = None,
     production_mode: bool = False,
     audit_path: Path | None = None,
+    resource_limits: "WorkerResourceLimits | None" = None,
 ) -> DispatchResult:
     """Run a single sandbox worker for ``task`` while honouring the lock,
     heartbeat-staleness reclaim window, and max runtime.
@@ -450,15 +543,46 @@ def run_active_dispatch(
     The runner itself does not open sockets; OS-level network isolation is an
     operator boundary and is not enforced here.
 
+    Phase 10 additions:
+        * Workers are started with ``start_new_session=True`` so the runner can
+          use ``os.killpg`` to reach grandchildren on timeout/reclaim/abort.
+        * ``resource_limits`` applies optional RLIMIT_* ceilings via
+          ``preexec_fn`` (POSIX only, silently ignored on Windows).
+        * ``production_mode=True`` with ``audit_path=None`` returns a
+          fail-closed :class:`DispatchResult` (status='production_audit_required')
+          without acquiring the lock or spawning the worker.
+
     Args:
         production_mode: When True, runs the production gate before acquiring the
             lock.  Any gate violation returns a fail-closed :class:`DispatchResult`
             without spawning the worker or writing the lock.  On success, writes an
-            audit trail entry to ``audit_path`` (required in production mode).
-        audit_path: Path for the JSONL production audit trail.  Written only when
-            ``production_mode=True`` and the dispatch succeeds.  Ignored in sandbox
-            mode (production_mode=False).
+            audit trail entry to ``audit_path``.
+        audit_path: Path for the JSONL production audit trail.  When
+            ``production_mode=True`` and ``audit_path=None``, dispatch returns
+            a fail-closed result (status='production_audit_required').
+            Ignored in sandbox mode (production_mode=False).
+        resource_limits: Optional :class:`WorkerResourceLimits` applied to the
+            worker process via ``preexec_fn`` (POSIX only, soft degradation on
+            unsupported platforms).  None (default) means no resource ceilings.
     """
+    # Phase 10: production_mode without audit_path → fail closed (no lock, no worker).
+    if production_mode and audit_path is None:
+        now = time.time()
+        return DispatchResult(
+            task_id=task.task_id,
+            status="production_audit_required",
+            exit_code=None,
+            reason="production_mode=True requires an explicit audit_path; none provided",
+            workspace=str(workspace.root),
+            heartbeats_observed=0,
+            started_at=now,
+            ended_at=now,
+            blocks_task=True,
+            owner=owner,
+            dry_run=False,
+            production_mode=True,
+        )
+
     # Phase 9: production-mode gate — runs before acquiring the lock.
     if production_mode:
         from hermes_cli.team_os.production_gate import (  # noqa: PLC0415
@@ -519,12 +643,19 @@ def run_active_dispatch(
     try:
         env = _sandbox_worker_env(task, heartbeat_path=heartbeat_path, workspace=workspace)
 
+        # Phase 10: apply resource ceilings via preexec_fn (POSIX only).
+        preexec_fn: Callable[[], None] | None = None
+        if resource_limits is not None:
+            preexec_fn = build_resource_preexec_fn(resource_limits)
+
         proc = subprocess.Popen(  # noqa: S603 — caller-supplied argv, sandboxed cwd
             list(worker_command),
             cwd=str(workspace.root),
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,   # Phase 10: new session = new process group → killpg reaches grandchildren
+            preexec_fn=preexec_fn,
         )
 
         try:
@@ -613,6 +744,7 @@ def run_active_dispatch(
         blocks_task=blocks_task,
         owner=owner,
         production_mode=production_mode,
+        resource_limits=resource_limits,
     )
 
     # Phase 9: write audit trail for successful production dispatches only.
