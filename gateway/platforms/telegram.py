@@ -478,6 +478,21 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Team OS approval delivery state (Phase 7).  Maps the 16-char token
+        # embedded in callback_data to (approval_id, db_path) so the inline
+        # buttons can resolve the approval in the local Team OS SQLite DB
+        # without requiring shared in-process state.
+        self._team_os_approval_state: Dict[str, tuple] = {}
+        # Pending text-capture for reject/defer/approve-modified replies.
+        # Maps "{chat_id}:{user_id}" → (token, action) so the next incoming
+        # text message from the same user in the same chat completes the
+        # decision rather than being routed to the agent.  Keying by user
+        # prevents another participant in a group chat from accidentally
+        # supplying the rejection/defer reason.  A second pending capture from
+        # the same user in the same chat replaces the previous capture; the
+        # previous approval remains pending and therefore fails closed.
+        # (chat_id:user_id) -> (token, action)
+        self._team_os_modify_capture: Dict[str, tuple] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -2650,6 +2665,75 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_team_os_approval(
+        self,
+        chat_id: str,
+        delivery: Any,
+        db_path: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Team OS Phase 7 approval prompt with Approve/Reject/Defer/Approve-Modified.
+
+        ``delivery`` is a :class:`hermes_cli.team_os.delivery.TelegramApprovalDelivery`
+        — imported lazily to avoid pulling the team-os modules into the gateway
+        import graph.  ``db_path`` is the local Team OS SQLite file the callback
+        handler will record the decision into.
+
+        Renders the seven-field prompt as plain text (no markdown) so the body
+        survives Telegram's parser without escaping.  Sends 4 inline buttons
+        keyed by an opaque 16-char token; the callback handler matches by token
+        rather than approval_id so callback_data stays under Telegram's 64-byte
+        cap.
+        """
+        from hermes_cli.team_os.delivery import TelegramApprovalDelivery  # noqa: F401
+
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            from uuid import uuid4
+            token = uuid4().hex[:16]
+
+            text = delivery.prompt
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"ta:approve:{token}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"ta:reject:{token}"),
+                ],
+                [
+                    InlineKeyboardButton("⏸ Defer", callback_data=f"ta:defer:{token}"),
+                    InlineKeyboardButton("✏️ Approve-Modified", callback_data=f"ta:modify:{token}"),
+                ],
+            ])
+
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": text,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+
+            self._team_os_approval_state[token] = (delivery.approval_id, db_path)
+
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_team_os_approval failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -3124,6 +3208,85 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Team OS approval callbacks (ta:action:token) ---
+        if data.startswith("ta:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                action = parts[1]  # approve, reject, defer, modify
+                token = parts[2]
+
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to approve tasks.")
+                    return
+
+                state_entry = self._team_os_approval_state.get(token)
+                if state_entry is None:
+                    await query.answer(text="This approval has already been resolved.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User") or "User"
+
+                if action == "approve":
+                    approval_id, db_path = self._team_os_approval_state.pop(token)
+                    try:
+                        from hermes_cli.team_os.db import TeamOSState
+                        TeamOSState(db_path).record_approval_decision(
+                            approval_id,
+                            decision="approve",
+                            actor=user_display,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "[%s] team-os approve callback failed: %s",
+                            self.name, exc,
+                        )
+                    await query.answer(text="✅ Approved")
+                    try:
+                        await query.edit_message_text(
+                            text=f"✅ Approved by {user_display}",
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                if action in {"reject", "defer", "modify"}:
+                    chat_part = str(query_chat_id) if query_chat_id is not None else caller_id
+                    capture_key = f"{chat_part}:{caller_id}"
+                    self._team_os_modify_capture[capture_key] = (token, action)
+                    prompt_map = {
+                        "reject": "Reply with the reason to reject this task.",
+                        "defer": "Reply with when/why to defer this task.",
+                        "modify": "Reply with the modified scope to approve.",
+                    }
+                    awaiting_label = {
+                        "reject": "rejection reason",
+                        "defer": "defer note",
+                        "modify": "modified scope",
+                    }
+                    await query.answer(text=prompt_map[action])
+                    try:
+                        await query.edit_message_text(
+                            text=(
+                                f"⏳ Awaiting {awaiting_label[action]} from "
+                                f"{user_display}…"
+                            ),
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                await query.answer(text="Unknown action.")
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
@@ -4957,16 +5120,115 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        # Team OS (Phase 7): intercept parked reject/defer/approve-modified
+        # replies before mention/free-response gating. The capture key already
+        # restricts this to the user who clicked the button, and the text path
+        # re-checks authorization before recording the decision.
+        if await self._maybe_capture_team_os_reply(msg):
+            return
+
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
-        await self._ensure_forum_commands(update.message)
+        await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    async def _maybe_capture_team_os_reply(self, msg) -> bool:
+        """Complete a parked Team OS approval decision with the user's reply.
+
+        Returns True when the message was consumed by an in-progress
+        reject/defer/approve-modified capture (the agent must NOT see it),
+        False otherwise.
+        """
+        chat_id = getattr(msg, "chat_id", None)
+        if chat_id is None:
+            chat_obj = getattr(msg, "chat", None)
+            chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+        if chat_id is None:
+            return False
+        sender = getattr(msg, "from_user", None)
+        sender_user_id = getattr(sender, "id", None) if sender else None
+        if sender_user_id is None:
+            return False
+        capture_key = f"{chat_id}:{sender_user_id}"
+        entry = self._team_os_modify_capture.pop(capture_key, None)
+        if not entry:
+            return False
+        token, action = entry
+
+        # Re-check authorization on the text path — the user that clicked
+        # the button may have been removed from the allow-list before they
+        # finished typing their reply.  On failure, drop the capture and
+        # the parked approval so the entry isn't restored to a stale state.
+        chat_obj = getattr(msg, "chat", None)
+        chat_type = getattr(chat_obj, "type", None) if chat_obj else None
+        thread_id = getattr(msg, "message_thread_id", None)
+        user_name = getattr(sender, "first_name", None)
+        if not self._is_callback_user_authorized(
+            str(sender_user_id),
+            chat_id=chat_id,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            self._team_os_approval_state.pop(token, None)
+            try:
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text="⛔ You are not authorized to approve tasks.",
+                    **self._link_preview_kwargs(),
+                )
+            except Exception:
+                pass
+            return True
+
+        approval_entry = self._team_os_approval_state.pop(token, None)
+        if not approval_entry:
+            return False
+        approval_id, db_path = approval_entry
+        text = getattr(msg, "text", "") or ""
+
+        decision_map = {
+            "reject": ("reject", "reason"),
+            "defer": ("defer", "reason"),
+            "modify": ("approve-modified", "modified_scope"),
+        }
+        decision, field = decision_map.get(action, ("reject", "reason"))
+        actor = getattr(getattr(msg, "from_user", None), "first_name", None) or "User"
+
+        try:
+            from hermes_cli.team_os.db import TeamOSState
+            kwargs: Dict[str, Any] = {"decision": decision, "actor": actor}
+            kwargs[field] = text
+            TeamOSState(db_path).record_approval_decision(approval_id, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "[%s] team-os text-capture record failed: %s",
+                self.name, exc,
+            )
+
+        reply_map = {
+            "reject": f"❌ Rejected — recorded reason from {actor}.",
+            "defer": f"⏸ Deferred — recorded note from {actor}.",
+            "modify": f"✅ Approved with modifications from {actor}.",
+        }
+        try:
+            await self._bot.send_message(
+                chat_id=int(chat_id),
+                text=reply_map.get(action, "Decision recorded."),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] team-os text-capture reply failed: %s",
+                self.name, exc,
+            )
+        return True
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

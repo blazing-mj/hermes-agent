@@ -9,6 +9,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .approvals import build_approval_sample
+from .delivery import TelegramApprovalDelivery, build_delivery_from_sample
 from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
@@ -220,6 +221,39 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         else:
             print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
         return 0 if report.can_close else 1
+    if command == "deliver-approval":
+        sample = build_approval_sample(
+            task_id=getattr(args, "task_id"),
+            title=getattr(args, "title"),
+            action=getattr(args, "action"),
+        )
+        dry_run = bool(getattr(args, "dry_run", True))
+        state_db = (
+            Path(getattr(args, "state_db")).expanduser()
+            if getattr(args, "state_db", None)
+            else None
+        )
+        if state_db:
+            delivery = build_delivery_from_sample(
+                sample, TeamOSState(state_db), dry_run=dry_run,
+            )
+        else:
+            delivery = TelegramApprovalDelivery.from_approval_sample(
+                sample, approval_id=0, dry_run=True,
+            )
+        rendered_delivery = json.dumps(delivery.to_dict(), indent=2, sort_keys=True)
+        output_delivery = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        if output_delivery:
+            output_delivery.parent.mkdir(parents=True, exist_ok=True)
+            output_delivery.write_text(rendered_delivery + "\n", encoding="utf-8")
+            print(str(output_delivery))
+        else:
+            print(rendered_delivery)
+        return 0
     if command == "approval-sample":
         sample = build_approval_sample(
             task_id=getattr(args, "task_id", "AGENTS-68"),
@@ -302,6 +336,27 @@ def register_cli(parent) -> None:  # noqa: ANN001
     snapshot.add_argument("--state-db", help="Optional local Team OS SQLite state DB path")
     snapshot.add_argument("--output", help="Optional JSON output path")
     snapshot.set_defaults(func=cmd_team_os)
+
+    deliver_approval = sub.add_parser(
+        "deliver-approval",
+        help="Build a Telegram approval delivery payload (data only, no network)",
+    )
+    deliver_approval.add_argument("--task-id", required=True)
+    deliver_approval.add_argument("--title", required=True)
+    deliver_approval.add_argument("--action", required=True)
+    deliver_approval.add_argument(
+        "--state-db",
+        default=None,
+        help="Optional Team OS SQLite DB to persist the approval request",
+    )
+    deliver_approval.add_argument("--output", help="Optional JSON output path")
+    deliver_approval.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Mark the delivery as dry-run (default).  Production opt-in is explicit.",
+    )
+    deliver_approval.set_defaults(func=cmd_team_os)
 
     approval_sample = sub.add_parser(
         "approval-sample",
