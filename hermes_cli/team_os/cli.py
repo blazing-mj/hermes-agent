@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from .approvals import build_approval_sample
@@ -12,6 +13,7 @@ from .collectors import collect_observations
 from .db import TeamOSState
 from .loop_runner import acquire_runner_lock, load_loop_tasks, select_next_task, write_loop_decision
 from .quota import quota_status_unknown
+from .router import TaskHints, route_task
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
 
 
@@ -61,8 +63,47 @@ def build_snapshot(
     }
 
 
+def _codex_probe_from_arg(value: str | None) -> Callable[[], bool] | None:
+    """Map the CLI ``--codex-probe`` value to a deterministic probe callable.
+
+    The CLI never reaches the network: callers explicitly select the probe
+    outcome.  ``unavailable`` is the default because Codex usage is not
+    confirmed.
+    """
+
+    normalized = (value or "unavailable").strip().lower()
+    if normalized in {"available", "ok", "yes", "true"}:
+        return lambda: True
+    if normalized in {"unavailable", "no", "false"}:
+        return lambda: False
+    if normalized in {"error", "raise", "fail"}:
+        def _raises() -> bool:
+            raise RuntimeError("codex probe explicitly forced to fail by --codex-probe")
+        return _raises
+    raise SystemExit(f"unknown --codex-probe value: {value!r}")
+
+
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "route":
+        hints = TaskHints(
+            task_id=getattr(args, "task_id"),
+            labels=tuple(getattr(args, "label", None) or ()),
+            task_type=getattr(args, "task_type", "unknown") or "unknown",
+            quota_confidence_codex=getattr(args, "quota_confidence_codex", "unknown") or "unknown",
+            quota_confidence_claude_max=getattr(args, "quota_confidence_claude_max", "unknown") or "unknown",
+        )
+        probe = _codex_probe_from_arg(getattr(args, "codex_probe", None))
+        decision = route_task(hints, codex_probe=probe)
+        rendered = json.dumps(decision.to_dict(), indent=2, sort_keys=True)
+        output_path = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0
     if command == "loop-runner":
         task_file = Path(getattr(args, "tasks")).expanduser()
         output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
@@ -225,4 +266,36 @@ def register_cli(parent) -> None:  # noqa: ANN001
     loop_runner.add_argument("--lock", default="~/.hermes/state/team-os-loop-runner.lock")
     loop_runner.add_argument("--owner", default="team-os-loop-runner")
     loop_runner.set_defaults(func=cmd_team_os)
+
+    route = sub.add_parser(
+        "route",
+        help="Decide Codex vs Claude Code Max for a task in dry-run mode",
+    )
+    route.add_argument("task_id")
+    route.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Task label such as type:code or type:host (repeatable)",
+    )
+    route.add_argument("--task-type", default="unknown")
+    route.add_argument(
+        "--quota-confidence-codex",
+        default="unknown",
+        help="Codex quota confidence: high|medium|low|unknown|unavailable|exhausted",
+    )
+    route.add_argument(
+        "--quota-confidence-claude-max",
+        default="unknown",
+        help="Claude-max quota confidence: high|medium|low|unknown|unavailable|exhausted",
+    )
+    route.add_argument(
+        "--codex-probe",
+        default="unavailable",
+        choices=("available", "unavailable", "error"),
+        help="Deterministic codex availability probe outcome (no network)",
+    )
+    route.add_argument("--output", help="Optional decision JSON output path")
+    route.set_defaults(func=cmd_team_os)
+
     parent.set_defaults(func=cmd_team_os)
