@@ -11,6 +11,7 @@ from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
 from .quota import quota_status_unknown
+from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
 
 
 def build_snapshot(
@@ -61,6 +62,28 @@ def build_snapshot(
 
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "verification-gate":
+        task_id = getattr(args, "task_id")
+        changed_files = list(getattr(args, "changed_file", None) or [])
+        focused_tests = list(getattr(args, "test", None) or [])
+        plan = build_verification_plan(task_id=task_id, changed_files=changed_files, focused_tests=focused_tests)
+        output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+        if getattr(args, "plan_only", False):
+            rendered_plan = json.dumps(plan.to_dict(), indent=2, sort_keys=True)
+            if output:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(rendered_plan + "\n", encoding="utf-8")
+                print(str(output))
+            else:
+                print(rendered_plan)
+            return 0
+        report = run_verification_plan(plan, cwd=Path.cwd())
+        if output:
+            write_proof_artifact(report, output)
+            print(str(output))
+        else:
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0 if report.can_close else 1
     if command == "approval-sample":
         sample = build_approval_sample(
             task_id=getattr(args, "task_id", "AGENTS-68"),
@@ -153,4 +176,25 @@ def register_cli(parent) -> None:  # noqa: ANN001
     approval_sample.add_argument("--action", default="run database migration")
     approval_sample.add_argument("--output", help="Optional JSON output path")
     approval_sample.set_defaults(func=cmd_team_os)
+
+    verification_gate = sub.add_parser(
+        "verification-gate",
+        help="Run the Phase 3 local verification gate and write proof JSON",
+    )
+    verification_gate.add_argument("task_id")
+    verification_gate.add_argument(
+        "--changed-file",
+        action="append",
+        default=[],
+        help="Changed file path used for syntax/lint/smoke selection (repeatable)",
+    )
+    verification_gate.add_argument(
+        "--test",
+        action="append",
+        default=[],
+        help="Focused pytest target from the task plan/grounding (repeatable)",
+    )
+    verification_gate.add_argument("--output", help="Optional proof JSON output path")
+    verification_gate.add_argument("--plan-only", action="store_true", help="Write selected commands without running them")
+    verification_gate.set_defaults(func=cmd_team_os)
     parent.set_defaults(func=cmd_team_os)
