@@ -483,7 +483,6 @@ def run_active_dispatch(
                 dry_run=False,
                 production_mode=True,
             )
-
     # Phase 9A: fail closed immediately if the kill-switch is armed (sandbox path).
     elif kill_switch is not None and kill_switch.is_enabled():
         from hermes_cli.team_os.kill_switch import KillSwitchActive  # noqa: PLC0415
@@ -632,8 +631,6 @@ def run_active_dispatch(
         )
 
     return result
-
-
 def write_dispatch_result(result: DispatchResult, output_path: Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

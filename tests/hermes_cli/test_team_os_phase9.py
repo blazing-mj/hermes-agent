@@ -613,6 +613,41 @@ def test_dispatch_result_to_dict_includes_production_mode(tmp_path):
     json.dumps(d)  # must be JSON-serializable
 
 
+def test_run_active_dispatch_production_mode_no_audit_path_succeeds_without_audit(tmp_path):
+    """production_mode=True with audit_path=None: dispatch succeeds but no audit file written.
+
+    This is documented behavior: the caller is responsible for passing audit_path
+    in production mode; omitting it silently skips the audit trail.
+    """
+    from hermes_cli.team_os.kill_switch import KillSwitch
+    from hermes_cli.team_os.loop_runner import run_active_dispatch
+
+    ks = KillSwitch(tmp_path / "ks.json")  # disabled
+    ws = _simple_workspace(tmp_path)
+    task = _make_task(approval_status="approved", task_confidence="high", quota_confidence="high")
+
+    result = run_active_dispatch(
+        task,
+        workspace=ws,
+        worker_command=[sys.executable, "-c", "pass"],
+        heartbeat_path=tmp_path / "hb",
+        lock_path=tmp_path / "lock",
+        owner="test-no-audit-path",
+        max_runtime_seconds=5.0,
+        heartbeat_stale_seconds=5.0,
+        kill_switch=ks,
+        production_mode=True,
+        audit_path=None,  # explicitly no audit path
+    )
+
+    # Dispatch still runs and succeeds — but no audit file exists
+    assert result.status == "succeeded"
+    assert result.production_mode is True
+    # No stray audit files created
+    jsonl_files = list(tmp_path.glob("*.jsonl"))
+    assert jsonl_files == [], f"unexpected audit files: {jsonl_files}"
+
+
 # ---------------------------------------------------------------------------
 # No accidental production execution: sandbox can never write audit trail
 # ---------------------------------------------------------------------------
