@@ -72,6 +72,10 @@ class KillSwitch:
         if out["enabled"]:
             out["reason"] = state.get("reason", "")
             out["enabled_at"] = state.get("enabled_at", "")
+            if source := state.get("source"):
+                out["source"] = source
+            if read_error := state.get("read_error"):
+                out["read_error"] = read_error
         return out
 
     # ------------------------------------------------------------------
@@ -96,12 +100,21 @@ class KillSwitch:
     # ------------------------------------------------------------------
 
     def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return dict(_DEFAULT_STATE)
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return dict(_DEFAULT_STATE)
+            if not self.path.exists():
+                return dict(_DEFAULT_STATE)
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("kill-switch state must be a JSON object")
+            return state
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            return {
+                "enabled": True,
+                "reason": "kill-switch state file is unreadable or corrupt",
+                "enabled_at": _utc_iso(),
+                "source": "corrupt",
+                "read_error": str(exc),
+            }
 
     def _write(self, state: dict[str, Any]) -> None:
         """Atomically write ``state`` to disk (write-to-tmp + os.replace)."""

@@ -79,6 +79,79 @@ def test_kill_switch_status_when_disabled(tmp_path):
     assert status["enabled"] is False
 
 
+def test_kill_switch_corrupt_state_file_fails_closed(tmp_path):
+    """A present-but-unparsable state file must halt Team OS."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+
+    path = tmp_path / "ks.json"
+    path.write_text("{not valid json", encoding="utf-8")
+
+    ks = KillSwitch(path)
+    assert ks.is_enabled() is True
+    status = ks.status()
+    assert status["enabled"] is True
+    assert "corrupt" in status["reason"] or "unreadable" in status["reason"]
+    assert status["source"] == "corrupt"
+
+
+def test_kill_switch_unreadable_state_file_fails_closed(tmp_path, monkeypatch):
+    """A read error on an existing state file must halt Team OS."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+
+    path = tmp_path / "ks.json"
+    path.write_text('{"enabled": false}', encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def fail_for_state_file(self, *args, **kwargs):
+        if self == path:
+            raise OSError("permission denied")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_for_state_file)
+
+    ks = KillSwitch(path)
+    assert ks.is_enabled() is True
+    status = ks.status()
+    assert status["enabled"] is True
+    assert status["source"] == "corrupt"
+
+
+def test_kill_switch_missing_file_remains_disabled(tmp_path):
+    """Absent state file is normal startup state, not a read failure."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+
+    ks = KillSwitch(tmp_path / "missing.json")
+    assert ks.is_enabled() is False
+    assert ks.status()["enabled"] is False
+
+
+def test_kill_switch_env_override_still_forces_enabled(tmp_path, monkeypatch):
+    """Environment override keeps precedence over clean disabled state."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+
+    monkeypatch.setenv("HERMES_TEAM_OS_KILL", "1")
+    ks = KillSwitch(tmp_path / "ks.json")
+    ks.disable()
+
+    assert ks.is_enabled() is True
+    status = ks.status()
+    assert status["enabled"] is True
+    assert status["source"] == "env"
+
+
+def test_kill_switch_disable_recovers_from_corrupt_state_file(tmp_path):
+    """Operator recovery: disable() overwrites a corrupt fail-closed state."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+
+    path = tmp_path / "ks.json"
+    path.write_text("{corrupt", encoding="utf-8")
+    ks = KillSwitch(path)
+    assert ks.is_enabled() is True
+
+    ks.disable()
+    assert ks.is_enabled() is False
+
+
 def test_kill_switch_atomic_write(tmp_path):
     """Enable/disable should not leave partial JSON on disk."""
     from hermes_cli.team_os.kill_switch import KillSwitch
