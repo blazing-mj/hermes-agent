@@ -128,6 +128,8 @@ def write_production_audit(
     quota_confidence: str,
     workspace: str,
     audit_path: Path,
+    decision: str = "allowed",
+    violations: list[str] | None = None,
 ) -> None:
     """Append a production execution audit entry to ``audit_path`` (JSONL format).
 
@@ -143,6 +145,9 @@ def write_production_audit(
         quota_confidence: The quota confidence level.
         workspace: Path of the sandbox workspace used for execution.
         audit_path: File path where the JSONL audit trail is written.
+        decision: ``"allowed"`` (default, Phase 9 success path) or ``"denied"``
+            (Phase 9B CLI gate rejection).
+        violations: Gate violation strings; included only when non-empty.
     """
     audit_path = Path(audit_path)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,7 +161,10 @@ def write_production_audit(
         "task_confidence": task_confidence,
         "quota_confidence": quota_confidence,
         "workspace": workspace,
+        "decision": decision,
     }
+    if violations:
+        entry["violations"] = list(violations)
 
     line = json.dumps(entry, sort_keys=True) + "\n"
     with audit_path.open("a", encoding="utf-8") as f:

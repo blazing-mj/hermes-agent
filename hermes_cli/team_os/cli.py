@@ -96,6 +96,25 @@ def _codex_probe_from_arg(value: str | None) -> Callable[[], bool] | None:
     raise SystemExit(f"unknown --codex-probe value: {value!r}")
 
 
+def _select_for_production_gate(tasks, *, current_shift: str):
+    """Pick the highest-priority task whose shift+status match.
+
+    Used only by the Phase 9B production CLI path so the production gate sees
+    the candidate it would dispatch, rather than having the candidate silently
+    filtered upstream (which would convert a denial into rc=0 no-eligible-task).
+    """
+    open_statuses = {"ready", "pending", "todo", "backlog"}
+    candidates = [
+        t
+        for t in tasks
+        if t.status in open_statuses and current_shift in t.shifts
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda task: (-task.priority, task.task_id))
+    return candidates[0]
+
+
 def _run_loop_runner_active(
     args,
     *,
@@ -122,35 +141,103 @@ def _run_loop_runner_active(
         print(f"sandbox boundary violation: {exc}", file=sys.stderr)
         return 2
 
+    production = bool(getattr(args, "production", False)) or bool(
+        getattr(args, "production_mode", False)
+    )
+    production_audit_arg = getattr(args, "production_audit", None) or getattr(
+        args, "audit_path", None
+    )
+    production_audit = (
+        Path(production_audit_arg).expanduser() if production_audit_arg else None
+    )
+
     tasks = load_loop_tasks(task_file)
     kill_switch_state = Path(
         getattr(args, "kill_switch_state", "~/.hermes/state/team-os-kill-switch.json")
     ).expanduser()
     kill_switch = KillSwitch(kill_switch_state)
-    decision = select_next_task(
-        tasks,
-        current_shift=getattr(args, "shift", "day"),
-        require_confidence=bool(getattr(args, "require_confidence", False)),
-        require_approval=bool(getattr(args, "require_approval", False)),
-        kill_switch=kill_switch,
-    )
-    if decision.selected_task is None:
-        print(
-            json.dumps(
-                {
-                    "status": "no-eligible-task",
-                    "dry_run": False,
-                    "skip_reasons": decision.skip_reasons,
-                },
-                indent=2,
-                sort_keys=True,
-            )
+
+    # Phase 9B: in production mode, do NOT let select_next_task pre-filter on
+    # approval/confidence/quota — those are the gate's job, and pre-filtering
+    # would silently turn a denial into rc=0 "no-eligible-task".  We select
+    # against shift+status only, then run the production gate explicitly.
+    if production:
+        candidate = _select_for_production_gate(
+            tasks, current_shift=getattr(args, "shift", "day")
         )
-        return 0
+        if candidate is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "no-eligible-task",
+                        "dry_run": False,
+                        "mode": "production",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        from .production_gate import check_production_gate, write_production_audit
+
+        gate = check_production_gate(candidate, kill_switch=kill_switch)
+        if not gate.passed:
+            if production_audit is not None:
+                write_production_audit(
+                    task_id=candidate.task_id,
+                    task_title=candidate.title,
+                    owner=owner,
+                    approval_status=candidate.approval_status,
+                    task_confidence=candidate.task_confidence,
+                    quota_confidence=candidate.quota_confidence,
+                    workspace=str(ws.root),
+                    audit_path=production_audit,
+                    decision="denied",
+                    violations=list(gate.violations),
+                )
+            print(
+                json.dumps(
+                    {
+                        "status": "production_gate_denied",
+                        "mode": "production",
+                        "violations": list(gate.violations),
+                        "task_id": candidate.task_id,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        selected_task = candidate
+    else:
+        decision = select_next_task(
+            tasks,
+            current_shift=getattr(args, "shift", "day"),
+            require_confidence=bool(getattr(args, "require_confidence", False)),
+            require_approval=bool(getattr(args, "require_approval", False)),
+            kill_switch=kill_switch,
+            production_mode=False,
+        )
+        if decision.selected_task is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "no-eligible-task",
+                        "dry_run": False,
+                        "skip_reasons": decision.skip_reasons,
+                        "mode": "sandbox",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
+        selected_task = decision.selected_task
 
     try:
         result = run_active_dispatch(
-            decision.selected_task,
+            selected_task,
             workspace=ws,
             worker_command=tuple(worker_cmd),
             heartbeat_path=Path(heartbeat_path).expanduser(),
@@ -160,14 +247,16 @@ def _run_loop_runner_active(
             heartbeat_stale_seconds=float(getattr(args, "heartbeat_stale_seconds", 15.0)),
             poll_interval=float(getattr(args, "poll_interval", 0.5)),
             kill_switch=kill_switch,
-            production_mode=bool(getattr(args, "production_mode", False)),
-            audit_path=Path(getattr(args, "audit_path")).expanduser() if getattr(args, "audit_path", None) else None,
+            production_mode=production,
+            audit_path=production_audit if production else None,
         )
     except KillSwitchActive as exc:
         print(json.dumps({"status": "halted", "reason": str(exc), "dry_run": False}, indent=2, sort_keys=True))
         return 1
 
-    rendered = json.dumps(result.to_dict(), indent=2, sort_keys=True)
+    payload = result.to_dict()
+    payload["mode"] = "production" if production else "sandbox"
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
     if output:
         write_dispatch_result(result, output)
         print(str(output))
@@ -256,6 +345,17 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         lock_path = Path(getattr(args, "lock", "~/.hermes/state/team-os-loop-runner.lock")).expanduser()
         owner = getattr(args, "owner", "team-os-loop-runner")
         active = bool(getattr(args, "active", False))
+        production = bool(getattr(args, "production", False)) or bool(
+            getattr(args, "production_mode", False)
+        )
+
+        if production and not active:
+            print(
+                "loop-runner --production requires --active "
+                "(production runs against the sandbox-bounded active dispatch path)",
+                file=sys.stderr,
+            )
+            return 2
 
         if active:
             return _run_loop_runner_active(args, task_file=task_file, output=output, lock_path=lock_path, owner=owner)
@@ -590,6 +690,25 @@ def register_cli(parent) -> None:  # noqa: ANN001
         help=(
             "Phase 9: JSONL file path for production audit trail "
             "(written only when --production-mode is set and dispatch succeeds)"
+        ),
+    )
+    loop_runner.add_argument(
+        "--production",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase 9B (AGENTS-78): opt into production-mode active dispatch.  "
+            "Requires --active.  Runs the production gate before lock + dispatch; "
+            "on denial, writes an audit row (when --production-audit is set) and "
+            "exits rc=2 without acquiring the lock or calling dispatch."
+        ),
+    )
+    loop_runner.add_argument(
+        "--production-audit",
+        default=None,
+        help=(
+            "Phase 9B: JSONL file path for production audit trail.  "
+            "Both denial rows and successful-dispatch rows are appended here when --production is set."
         ),
     )
     loop_runner.set_defaults(func=cmd_team_os)
