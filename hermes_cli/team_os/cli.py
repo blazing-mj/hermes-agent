@@ -1,0 +1,130 @@
+"""CLI for Team OS read-only Phase 1 snapshots."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from .classify import classify_observation
+from .collectors import collect_observations
+from .db import TeamOSState
+from .quota import quota_status_unknown
+
+
+def build_snapshot(
+    *,
+    linear_projects: list[str],
+    kanban_boards: list[str],
+    quota_providers: list[str],
+    limit_per_kanban_board: int | None = None,
+) -> dict[str, Any]:
+    observations = collect_observations(
+        linear_projects=linear_projects,
+        kanban_boards=kanban_boards,
+        limit_per_kanban_board=limit_per_kanban_board,
+    )
+    classified = [classify_observation(obs) for obs in observations]
+    return {
+        "dry_run": True,
+        "blocked_capabilities": [
+            "hooks",
+            "dispatch",
+            "auto_done",
+            "telegram_push",
+            "customer_infra_writes",
+        ],
+        "schema": {
+            "buckets": [
+                "verifier",
+                "hook",
+                "skill",
+                "routing",
+                "retrieval",
+                "Linear",
+                "no-op",
+                "observability",
+            ],
+            "fields": [
+                "primary_bucket",
+                "secondary_buckets",
+                "mechanism_type",
+                "confidence",
+                "source_proof",
+            ],
+        },
+        "observations": [item.to_dict() for item in classified],
+        "quota": [quota_status_unknown(provider).to_dict() for provider in quota_providers],
+    }
+
+
+def cmd_team_os(args) -> int:  # noqa: ANN001
+    command = getattr(args, "team_os_command", None) or "snapshot"
+    if command != "snapshot":
+        raise SystemExit(f"unknown team-os command: {command}")
+
+    linear_projects = list(getattr(args, "linear_project", None) or [])
+    kanban_boards = list(getattr(args, "kanban_board", None) or [])
+    quota_providers = list(getattr(args, "quota_provider", None) or ["codex", "claude-max"])
+    output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+    state_db = Path(getattr(args, "state_db", "")).expanduser() if getattr(args, "state_db", None) else None
+
+    snapshot = build_snapshot(
+        linear_projects=linear_projects,
+        kanban_boards=kanban_boards,
+        quota_providers=quota_providers,
+        limit_per_kanban_board=getattr(args, "limit_per_kanban_board", None),
+    )
+
+    if state_db:
+        classified = [
+            classify_observation(obs)
+            for obs in collect_observations(
+                linear_projects=linear_projects,
+                kanban_boards=kanban_boards,
+                limit_per_kanban_board=getattr(args, "limit_per_kanban_board", None),
+            )
+        ]
+        snapshot_id = TeamOSState(state_db).record_snapshot(classified)
+        snapshot["state_db"] = str(state_db)
+        snapshot["snapshot_id"] = snapshot_id
+
+    rendered = json.dumps(snapshot, indent=2, sort_keys=True)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
+        print(str(output))
+    else:
+        print(rendered)
+    return 0
+
+
+def register_cli(parent) -> None:  # noqa: ANN001
+    sub = parent.add_subparsers(dest="team_os_command")
+    snapshot = sub.add_parser(
+        "snapshot",
+        help="Collect read-only Linear/Kanban state and classify it in dry-run mode",
+    )
+    snapshot.add_argument(
+        "--linear-project",
+        action="append",
+        default=[],
+        help="Linear project to collect via read-only linear-agent list (repeatable)",
+    )
+    snapshot.add_argument(
+        "--kanban-board",
+        action="append",
+        default=[],
+        help="Hermes Kanban board to collect read-only (repeatable)",
+    )
+    snapshot.add_argument(
+        "--quota-provider",
+        action="append",
+        default=[],
+        help="Provider name for unknown quota stub output (repeatable)",
+    )
+    snapshot.add_argument("--limit-per-kanban-board", type=int, default=None)
+    snapshot.add_argument("--state-db", help="Optional local Team OS SQLite state DB path")
+    snapshot.add_argument("--output", help="Optional JSON output path")
+    snapshot.set_defaults(func=cmd_team_os)
+    parent.set_defaults(func=cmd_team_os)

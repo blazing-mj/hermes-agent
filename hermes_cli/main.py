@@ -11014,7 +11014,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "team-os", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets", "security",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -11479,6 +11479,23 @@ def main():
     )
     migrate_xai.set_defaults(func=cmd_migrate_xai)
     migrate_parser.set_defaults(func=cmd_migrate)
+
+    # =========================================================================
+    # team-os command — read-only AI dev team operating-system state
+    # =========================================================================
+    from hermes_cli.team_os.cli import cmd_team_os, register_cli as register_team_os_cli
+
+    team_os_parser = subparsers.add_parser(
+        "team-os",
+        help="Read-only Team OS state snapshots and dry-run classification",
+        description=(
+            "Collect Linear/Kanban state in read-only mode, classify it with the "
+            "approved Phase 1 taxonomy, and emit local JSON/state only. This "
+            "command never dispatches work, changes Linear/Kanban status, or sends Telegram messages."
+        ),
+    )
+    register_team_os_cli(team_os_parser)
+    team_os_parser.set_defaults(func=cmd_team_os)
 
     # =========================================================================
     # gateway command
