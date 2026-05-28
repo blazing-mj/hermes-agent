@@ -12,6 +12,7 @@ from typing import Any, Iterable, Sequence
 
 _ELIGIBLE_APPROVAL_STATUSES = {None, "approved", "auto-approved"}
 _BLOCKING_QUOTA_CONFIDENCE = {"unknown", "low", "unavailable", "exhausted"}
+_BLOCKING_TASK_CONFIDENCE = {"unknown", "low"}
 
 
 @dataclass(frozen=True)
@@ -89,10 +90,7 @@ class RunnerLock:
             self.path.unlink()
 
 
-_BLOCKING_TASK_CONFIDENCE = {"unknown", "low"}
-
-
-def _skip_reason(task: LoopTask, *, current_shift: str) -> str | None:
+def _skip_reason(task: LoopTask, *, current_shift: str, require_confidence: bool = False) -> str | None:
     if task.status not in {"ready", "pending", "todo", "backlog"}:
         return f"status {task.status}"
     if current_shift not in task.shifts:
@@ -105,17 +103,34 @@ def _skip_reason(task: LoopTask, *, current_shift: str) -> str | None:
     # pass-through. Only block on low/unknown when explicitly set.
     if task.task_confidence is not None and task.task_confidence in _BLOCKING_TASK_CONFIDENCE:
         return f"task confidence {task.task_confidence}"
+    if require_confidence and task.task_confidence is None:
+        return "task confidence not assessed"
     return None
 
 
-def select_next_task(tasks: Iterable[LoopTask], *, current_shift: str) -> LoopDecision:
-    """Select the next eligible task without executing or mutating anything."""
+def select_next_task(
+    tasks: Iterable[LoopTask],
+    *,
+    current_shift: str,
+    require_confidence: bool = False,
+) -> LoopDecision:
+    """Select the next eligible task without executing or mutating anything.
+
+    Args:
+        require_confidence: When True, tasks with task_confidence=None are also
+            blocked (skip reason "task confidence not assessed"). Default False
+            preserves backward compatibility where None is a pass-through.
+    """
 
     eligible: list[LoopTask] = []
     skipped: list[str] = []
     skip_reasons: dict[str, str] = {}
     for task in tasks:
-        reason = _skip_reason(task, current_shift=current_shift)
+        reason = _skip_reason(
+            task,
+            current_shift=current_shift,
+            require_confidence=require_confidence,
+        )
         if reason:
             skipped.append(task.task_id)
             skip_reasons[task.task_id] = reason
@@ -132,7 +147,6 @@ def select_next_task(tasks: Iterable[LoopTask], *, current_shift: str) -> LoopDe
         dry_run=True,
         would_spawn_worker=False,
     )
-
 
 def load_loop_tasks(path: Path) -> list[LoopTask]:
     data = json.loads(path.read_text(encoding="utf-8"))

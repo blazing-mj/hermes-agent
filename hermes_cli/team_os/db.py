@@ -271,6 +271,30 @@ class TeamOSState:
         self.init_schema()
         now = int(time.time())
         with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM task_confidence WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                row_id = int(existing["id"])
+                conn.execute(
+                    """
+                    UPDATE task_confidence
+                    SET created_at = ?, goal_id = ?, confidence = ?, reasons_json = ?, source = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        now,
+                        goal_id,
+                        confidence,
+                        json.dumps(reasons, sort_keys=True),
+                        source,
+                        row_id,
+                    ),
+                )
+                conn.commit()
+                return row_id
+
             cur = conn.execute(
                 """
                 INSERT INTO task_confidence(created_at, goal_id, task_id, confidence, reasons_json, source)

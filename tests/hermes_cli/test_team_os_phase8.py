@@ -207,6 +207,37 @@ def test_decompose_goal_single_task_heavy_labels_route_to_claude_max():
     assert tasks[0].route_hint == "claude-max"
 
 
+def test_decompose_goal_fetch_body_does_not_match_embedded_etc():
+    """Words containing an ambiguity token must not be downgraded by substring match."""
+    from hermes_cli.team_os.decomposer import decompose_goal
+
+    tasks = decompose_goal(
+        goal_id="AGENTS-75",
+        goal_title="Fetch user records",
+        goal_body="Fetch user records from the Team OS state database.",
+        labels=["type:code"],
+    )
+    assert tasks[0].confidence in {"high", "medium"}
+    ambiguous_reasons = [
+        reason for reason in tasks[0].confidence_reasons
+        if "ambiguous markers" in reason
+    ]
+    assert ambiguous_reasons == []
+
+
+def test_decompose_goal_standalone_etc_still_marks_ambiguous():
+    from hermes_cli.team_os.decomposer import decompose_goal
+
+    tasks = decompose_goal(
+        goal_id="AGENTS-75",
+        goal_title="Build unclear extras",
+        goal_body="Build schema, CLI, etc.",
+        labels=["type:code"],
+    )
+    assert tasks[0].confidence == "low"
+    assert any("etc" in reason for reason in tasks[0].confidence_reasons)
+
+
 # ---------------------------------------------------------------------------
 # decompose_goal: missing / ambiguous title
 # ---------------------------------------------------------------------------
@@ -239,6 +270,20 @@ def test_decompose_goal_ambiguous_body_produces_low_or_medium_confidence():
     assert tasks[0].confidence in {"low", "medium"}
 
 
+def test_decompose_goal_no_false_positive_on_substring():
+    """'fetch', 'almighty', 'sketch' should NOT trigger ambiguity."""
+    from hermes_cli.team_os.decomposer import decompose_goal
+
+    tasks = decompose_goal(
+        goal_id="AGENTS-75",
+        goal_title="Add confidence tracking",
+        goal_body="Fetch data from DB, sketch the algorithm, almighty goal.",
+        labels=["type:code"],
+    )
+    # Substrings containing 'etc', 'might', etc. should NOT lower confidence
+    assert tasks[0].confidence in {"high", "medium"}
+
+
 def test_decompose_goal_no_labels_produces_medium_or_low():
     from hermes_cli.team_os.decomposer import decompose_goal
 
@@ -249,6 +294,19 @@ def test_decompose_goal_no_labels_produces_medium_or_low():
         labels=[],  # no labels
     )
     assert tasks[0].confidence in {"medium", "low"}
+
+
+def test_decompose_goal_empty_body_no_labels_is_low():
+    from hermes_cli.team_os.decomposer import decompose_goal
+
+    tasks = decompose_goal(
+        goal_id="AGENTS-75",
+        goal_title="Do the thing",
+        goal_body="",
+        labels=[],
+    )
+    assert tasks[0].confidence == "low"
+    assert any("too sparse" in reason for reason in tasks[0].confidence_reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +506,23 @@ def test_select_next_none_task_confidence_passes_through():
     assert decision.selected_task_id == "legacy"
 
 
+def test_select_next_require_confidence_blocks_none_task_confidence():
+    from hermes_cli.team_os.loop_runner import LoopTask, select_next_task
+
+    tasks = [
+        LoopTask(
+            task_id="legacy",
+            title="legacy task (no decomposer)",
+            quota_confidence="high",
+            task_confidence=None,
+        ),
+    ]
+    decision = select_next_task(tasks, current_shift="day", require_confidence=True)
+    assert decision.selected_task_id is None
+    assert "legacy" in decision.skipped_task_ids
+    assert decision.skip_reasons["legacy"] == "task confidence not assessed"
+
+
 # ---------------------------------------------------------------------------
 # DB: persist_task_confidence / get_task_confidence / list_task_confidence
 # ---------------------------------------------------------------------------
@@ -536,6 +611,32 @@ def test_db_list_task_confidence_different_goal_isolated(tmp_path):
     )
     records = db.list_task_confidence("AGENTS-75")
     assert all(r["goal_id"] == "AGENTS-75" for r in records)
+
+
+def test_db_persist_task_confidence_upserts_same_task_id(tmp_path):
+    from hermes_cli.team_os.db import TeamOSState
+
+    db = TeamOSState(tmp_path / "team-os.db")
+    first_id = db.persist_task_confidence(
+        goal_id="AGENTS-75",
+        task_id="AGENTS-75-p1",
+        confidence="medium",
+        reasons=["first assessment"],
+        source="decomposer",
+    )
+    second_id = db.persist_task_confidence(
+        goal_id="AGENTS-75",
+        task_id="AGENTS-75-p1",
+        confidence="high",
+        reasons=["updated assessment"],
+        source="decomposer",
+    )
+
+    assert second_id == first_id
+    records = db.list_task_confidence("AGENTS-75")
+    assert len(records) == 1
+    assert records[0]["confidence"] == "high"
+    assert records[0]["reasons"] == ["updated assessment"]
 
 
 # ---------------------------------------------------------------------------

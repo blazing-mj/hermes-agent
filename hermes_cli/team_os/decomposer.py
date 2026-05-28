@@ -3,10 +3,10 @@
 Deterministic, offline, no LLM calls.
 
 Confidence scoring rules (conservative / fail-closed):
-    * high   — title non-empty + body non-ambiguous + labels present
-    * medium — title non-empty but missing labels, OR body is sparse
-    * low    — title present but body contains ambiguous markers
-    * unknown — title is empty or both title and body are blank
+    * high   — title non-empty + body non-ambiguous + labels present + body non-sparse
+    * medium — title non-empty with partial but assessable context
+    * low    — title present but body is empty or contains ambiguous markers
+    * unknown — title is empty
 
 Route-hint rules:
     * unknown/none confidence -> route_hint = "none"  (fail-closed)
@@ -28,10 +28,11 @@ from .schema import VALID_CONFIDENCE
 
 VALID_ROUTE_HINTS = {"claude-max", "codex", "none"}
 
-_AMBIGUOUS_TOKENS = {
-    "tbd", "unclear", "to be determined", "maybe", "possibly",
-    "not sure", "might", "could be", "etc", "?",
-}
+# Regex for whole-word ambiguity matches (avoids false positives like "fetch"→"etc").
+_AMBIGUOUS_RE = re.compile(
+    r"\b(?:tbd|unclear|to be determined|maybe|possibly|not sure|might|could be|etc)\b",
+    re.IGNORECASE,
+)
 
 _HEAVY_LABELS = {
     "type:code", "type:implementation", "type:build", "type:refactor",
@@ -110,9 +111,8 @@ def _score_confidence(
 
     reasons.append(f"title is non-empty: {title!r}")
 
-    # Check for ambiguity markers in body.
-    body_lower = body.lower()
-    ambiguous_found = [tok for tok in _AMBIGUOUS_TOKENS if tok in body_lower]
+    # Check for ambiguity markers in body (whole-word to avoid false positives).
+    ambiguous_found = _AMBIGUOUS_RE.findall(body)
     if ambiguous_found:
         reasons.append(f"body contains ambiguous markers: {ambiguous_found}")
         return "low", reasons
@@ -121,17 +121,21 @@ def _score_confidence(
     if has_labels:
         reasons.append(f"labels present: {list(labels)}")
 
+    body_is_empty = len(body) == 0
     body_is_sparse = len(body) < 20
+
+    if body_is_empty:
+        reasons.append("body is empty — too sparse to assess scope")
+        return "low", reasons
+
     if body_is_sparse:
         reasons.append("body is sparse (< 20 characters)")
 
     if has_labels and not body_is_sparse:
         return "high", reasons
-    if not has_labels or body_is_sparse:
-        if not has_labels:
-            reasons.append("no labels provided")
-        return "medium", reasons
 
+    if not has_labels:
+        reasons.append("no labels provided")
     return "medium", reasons
 
 

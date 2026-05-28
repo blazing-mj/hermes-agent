@@ -122,7 +122,11 @@ def _run_loop_runner_active(
         return 2
 
     tasks = load_loop_tasks(task_file)
-    decision = select_next_task(tasks, current_shift=getattr(args, "shift", "day"))
+    decision = select_next_task(
+        tasks,
+        current_shift=getattr(args, "shift", "day"),
+        require_confidence=bool(getattr(args, "require_confidence", False)),
+    )
     if decision.selected_task is None:
         print(
             json.dumps(
@@ -244,7 +248,11 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
 
         lock = acquire_runner_lock(lock_path, owner=owner)
         try:
-            decision = select_next_task(load_loop_tasks(task_file), current_shift=getattr(args, "shift", "day"))
+            decision = select_next_task(
+                load_loop_tasks(task_file),
+                current_shift=getattr(args, "shift", "day"),
+                require_confidence=bool(getattr(args, "require_confidence", False)),
+            )
             if output:
                 write_loop_decision(decision, output)
                 print(str(output))
@@ -449,6 +457,11 @@ def register_cli(parent) -> None:  # noqa: ANN001
     )
     loop_runner.add_argument("--tasks", required=True, help="JSON fixture list of candidate tasks")
     loop_runner.add_argument("--shift", default="day", choices=["day", "night"])
+    loop_runner.add_argument(
+        "--require-confidence",
+        action="store_true",
+        help="Strict Phase 8 gate: block tasks without explicit task_confidence",
+    )
     loop_runner.add_argument("--output", help="Optional decision JSON output path")
     loop_runner.add_argument("--lock", default="~/.hermes/state/team-os-loop-runner.lock")
     loop_runner.add_argument("--owner", default="team-os-loop-runner")
