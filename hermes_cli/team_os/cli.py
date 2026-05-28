@@ -10,6 +10,7 @@ from .approvals import build_approval_sample
 from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
+from .loop_runner import acquire_runner_lock, load_loop_tasks, select_next_task, write_loop_decision
 from .quota import quota_status_unknown
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
 
@@ -62,6 +63,22 @@ def build_snapshot(
 
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "loop-runner":
+        task_file = Path(getattr(args, "tasks")).expanduser()
+        output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+        lock_path = Path(getattr(args, "lock", "~/.hermes/state/team-os-loop-runner.lock")).expanduser()
+        owner = getattr(args, "owner", "team-os-loop-runner")
+        lock = acquire_runner_lock(lock_path, owner=owner)
+        try:
+            decision = select_next_task(load_loop_tasks(task_file), current_shift=getattr(args, "shift", "day"))
+            if output:
+                write_loop_decision(decision, output)
+                print(str(output))
+            else:
+                print(json.dumps(decision.to_dict(), indent=2, sort_keys=True))
+        finally:
+            lock.release()
+        return 0
     if command == "verification-gate":
         task_id = getattr(args, "task_id")
         changed_files = list(getattr(args, "changed_file", None) or [])
@@ -197,4 +214,15 @@ def register_cli(parent) -> None:  # noqa: ANN001
     verification_gate.add_argument("--output", help="Optional proof JSON output path")
     verification_gate.add_argument("--plan-only", action="store_true", help="Write selected commands without running them")
     verification_gate.set_defaults(func=cmd_team_os)
+
+    loop_runner = sub.add_parser(
+        "loop-runner",
+        help="Select the next task in dry-run mode without spawning a worker",
+    )
+    loop_runner.add_argument("--tasks", required=True, help="JSON fixture list of candidate tasks")
+    loop_runner.add_argument("--shift", default="day", choices=["day", "night"])
+    loop_runner.add_argument("--output", help="Optional decision JSON output path")
+    loop_runner.add_argument("--lock", default="~/.hermes/state/team-os-loop-runner.lock")
+    loop_runner.add_argument("--owner", default="team-os-loop-runner")
+    loop_runner.set_defaults(func=cmd_team_os)
     parent.set_defaults(func=cmd_team_os)
