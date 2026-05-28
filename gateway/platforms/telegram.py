@@ -2734,6 +2734,53 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_team_os_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def handle_team_os_stop(
+        self,
+        *,
+        message: Any,
+        authorized_user_ids: list[str],
+        kill_switch_path: str | None = None,
+    ) -> bool:
+        """Phase 9A: handle a /stop_team_os Telegram command.
+
+        If the sender is in ``authorized_user_ids``, enables the kill-switch
+        and sends a plain confirmation. Otherwise sends a plain rejection.
+
+        Returns:
+            True if the command was authorized and kill-switch was enabled.
+            False if the sender was not authorized.
+        """
+        from pathlib import Path as _Path
+
+        from hermes_cli.team_os.kill_switch import KillSwitch  # noqa: PLC0415
+
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        user_id = str(getattr(getattr(message, "from_user", None), "id", ""))
+
+        allowed_ids = {str(uid).strip() for uid in authorized_user_ids if str(uid).strip()}
+        authorized = "*" in allowed_ids or user_id in allowed_ids
+
+        ks_path = (
+            _Path(kill_switch_path).expanduser()
+            if kill_switch_path
+            else _Path("~/.hermes/state/team-os-kill-switch.json").expanduser()
+        )
+        ks = KillSwitch(ks_path)
+
+        if authorized:
+            ks.enable(reason=f"Telegram /stop_team_os by user {user_id}")
+            reply = "Team OS halted. Kill-switch is now enabled. No new tasks will be dispatched."
+        else:
+            reply = "Not authorized to stop Team OS."
+
+        if self._bot and chat_id:
+            try:
+                await self._bot.send_message(chat_id=int(chat_id), text=reply, parse_mode=None)
+            except Exception as e:
+                logger.warning("[%s] handle_team_os_stop send failed: %s", self.name, e)
+
+        return authorized
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -5234,6 +5281,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
+            return
+        command_text = msg.text.split()[0].split("@", 1)[0].lower()
+        if command_text in {"/stop_team_os", "/teamos_stop"}:
+            allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+            allowed_ids = [uid.strip() for uid in allowed_csv.split(",") if uid.strip()]
+            await self.handle_team_os_stop(
+                message=msg,
+                authorized_user_ids=allowed_ids,
+                kill_switch_path=os.getenv("HERMES_TEAM_OS_KILL_SWITCH_PATH"),
+            )
             return
         if not self._should_process_message(msg, is_command=True):
             return

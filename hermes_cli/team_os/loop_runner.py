@@ -8,7 +8,10 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
+
+if TYPE_CHECKING:
+    from hermes_cli.team_os.kill_switch import KillSwitch
 
 _ELIGIBLE_APPROVAL_STATUSES = {None, "approved", "auto-approved"}
 _BLOCKING_QUOTA_CONFIDENCE = {"unknown", "low", "unavailable", "exhausted"}
@@ -86,15 +89,30 @@ class RunnerLock:
         return self.path.exists()
 
     def release(self) -> None:
-        if self.path.exists() and self.path.read_text(encoding="utf-8") == self.owner:
+        if not self.path.exists():
+            return
+        try:
+            metadata = _read_lock_metadata(self.path)
+            current_owner = str(metadata.get("owner") or "")
+        except OSError:
+            return
+        if current_owner == self.owner:
             self.path.unlink()
 
 
-def _skip_reason(task: LoopTask, *, current_shift: str, require_confidence: bool = False) -> str | None:
+def _skip_reason(
+    task: LoopTask,
+    *,
+    current_shift: str,
+    require_confidence: bool = False,
+    require_approval: bool = False,
+) -> str | None:
     if task.status not in {"ready", "pending", "todo", "backlog"}:
         return f"status {task.status}"
     if current_shift not in task.shifts:
         return f"shift {current_shift} not allowed"
+    if require_approval and task.approval_status is None:
+        return "approval not recorded"
     if task.approval_status not in _ELIGIBLE_APPROVAL_STATUSES:
         return f"approval {task.approval_status}"
     if task.quota_confidence in _BLOCKING_QUOTA_CONFIDENCE:
@@ -113,6 +131,8 @@ def select_next_task(
     *,
     current_shift: str,
     require_confidence: bool = False,
+    require_approval: bool = False,
+    kill_switch: "KillSwitch | None" = None,
 ) -> LoopDecision:
     """Select the next eligible task without executing or mutating anything.
 
@@ -120,7 +140,23 @@ def select_next_task(
         require_confidence: When True, tasks with task_confidence=None are also
             blocked (skip reason "task confidence not assessed"). Default False
             preserves backward compatibility where None is a pass-through.
+        kill_switch: Optional :class:`~hermes_cli.team_os.kill_switch.KillSwitch`
+            instance.  When provided and enabled, every task is skipped with
+            reason "kill-switch enabled".
     """
+    # Phase 9A: if the kill-switch is armed, block every task immediately.
+    if kill_switch is not None and kill_switch.is_enabled():
+        all_tasks = list(tasks)
+        skipped = [t.task_id for t in all_tasks]
+        skip_reasons = {t.task_id: "kill-switch enabled" for t in all_tasks}
+        return LoopDecision(
+            selected_task_id=None,
+            selected_task=None,
+            skipped_task_ids=tuple(skipped),
+            skip_reasons=skip_reasons,
+            dry_run=True,
+            would_spawn_worker=False,
+        )
 
     eligible: list[LoopTask] = []
     skipped: list[str] = []
@@ -130,6 +166,7 @@ def select_next_task(
             task,
             current_shift=current_shift,
             require_confidence=require_confidence,
+            require_approval=require_approval,
         )
         if reason:
             skipped.append(task.task_id)
@@ -161,15 +198,76 @@ def write_loop_decision(decision: LoopDecision, output_path: Path) -> Path:
     return output_path
 
 
-def acquire_runner_lock(lock_path: Path, *, owner: str) -> RunnerLock:
+def _lock_payload(owner: str) -> str:
+    return json.dumps({"owner": owner, "pid": os.getpid(), "ts": time.time()}, sort_keys=True)
+
+
+def _read_lock_metadata(lock_path: Path) -> dict[str, Any]:
+    raw = lock_path.read_text(encoding="utf-8") if lock_path.exists() else ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"owner": raw, "pid": None, "ts": None, "legacy": True}
+    if isinstance(data, dict):
+        return data
+    return {"owner": str(data), "pid": None, "ts": None, "legacy": True}
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    try:
+        parsed = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if parsed <= 0:
+        return False
+    try:
+        os.kill(parsed, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _lock_reclaimable(metadata: dict[str, Any], *, stale_after_seconds: float | None) -> bool:
+    if not _pid_is_alive(metadata.get("pid")):
+        return True
+    if stale_after_seconds is None:
+        return False
+    try:
+        ts = float(metadata.get("ts"))
+    except (TypeError, ValueError):
+        return False
+    return (time.time() - ts) > stale_after_seconds
+
+
+def acquire_runner_lock(
+    lock_path: Path,
+    *,
+    owner: str,
+    reclaim: bool = False,
+    stale_after_seconds: float | None = None,
+) -> RunnerLock:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = lock_path.open("x", encoding="utf-8")
     except FileExistsError as exc:
-        existing_owner = lock_path.read_text(encoding="utf-8") if lock_path.exists() else "unknown"
+        metadata = _read_lock_metadata(lock_path)
+        existing_owner = str(metadata.get("owner") or "unknown")
+        if reclaim and _lock_reclaimable(metadata, stale_after_seconds=stale_after_seconds):
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            return acquire_runner_lock(
+                lock_path,
+                owner=owner,
+                reclaim=False,
+                stale_after_seconds=stale_after_seconds,
+            )
         raise RunnerAlreadyActive(f"loop runner already active: {existing_owner}") from exc
     with fd:
-        fd.write(owner)
+        fd.write(_lock_payload(owner))
     return RunnerLock(path=lock_path, owner=owner)
 
 
@@ -187,7 +285,7 @@ def acquire_runner_lock(lock_path: Path, *, owner: str) -> RunnerLock:
 # ---------------------------------------------------------------------------
 
 
-_TERMINAL_STATUSES = {"succeeded", "failed", "reclaimed", "timeout"}
+_TERMINAL_STATUSES = {"succeeded", "failed", "reclaimed", "timeout", "aborted"}
 
 
 class SandboxBoundaryViolation(RuntimeError):
@@ -306,7 +404,7 @@ def _heartbeat_mtime(path: Path) -> float | None:
 
 
 def _sandbox_worker_env(task: LoopTask, *, heartbeat_path: Path, workspace: SandboxWorkspace) -> dict[str, str]:
-    allowed_parent_keys = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "PYTHONPATH")
+    allowed_parent_keys = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL")
     env = {key: value for key, value in os.environ.items() if key in allowed_parent_keys}
     env["HERMES_HEARTBEAT_PATH"] = str(heartbeat_path)
     env["HERMES_SANDBOX_WORKSPACE"] = str(workspace.root)
@@ -325,15 +423,25 @@ def run_active_dispatch(
     max_runtime_seconds: float,
     heartbeat_stale_seconds: float,
     poll_interval: float = 0.05,
+    kill_switch: "KillSwitch | None" = None,
+    poll_hook: Callable[[], None] | None = None,
 ) -> DispatchResult:
     """Run a single sandbox worker for ``task`` while honouring the lock,
     heartbeat-staleness reclaim window, and max runtime.
 
     The worker is spawned with ``cwd`` set to the sandbox workspace root and
-    two env vars: ``HERMES_HEARTBEAT_PATH`` and ``HERMES_SANDBOX_WORKSPACE``.
-    The runner never reaches the network and never touches paths outside the
-    sandbox workspace.
+    env vars such as ``HERMES_HEARTBEAT_PATH`` and ``HERMES_SANDBOX_WORKSPACE``.
+    The runner itself does not open sockets; OS-level network isolation is an
+    operator boundary and is not enforced here.
     """
+
+    # Phase 9A: fail closed immediately if the kill-switch is armed.
+    if kill_switch is not None and kill_switch.is_enabled():
+        from hermes_cli.team_os.kill_switch import KillSwitchActive  # noqa: PLC0415
+
+        raise KillSwitchActive(
+            f"Team OS kill-switch is enabled — task {task.task_id} will not be dispatched"
+        )
 
     if not worker_command:
         raise ValueError("worker_command must be a non-empty argv sequence")
@@ -346,7 +454,12 @@ def run_active_dispatch(
         except FileNotFoundError:
             pass
 
-    lock = acquire_runner_lock(Path(lock_path), owner=owner)
+    lock = acquire_runner_lock(
+        Path(lock_path),
+        owner=owner,
+        reclaim=True,
+        stale_after_seconds=max_runtime_seconds + heartbeat_stale_seconds,
+    )
 
     started_at = time.time()
     status: str | None = None
@@ -389,6 +502,14 @@ def run_active_dispatch(
                         reason = f"worker exited with non-zero exit code {rc}"
                     break
 
+                if poll_hook is not None:
+                    poll_hook()
+
+                if kill_switch is not None and kill_switch.is_enabled():
+                    status = "aborted"
+                    reason = "kill-switch enabled during dispatch; worker terminated"
+                    break
+
                 if elapsed > max_runtime_seconds:
                     status = "timeout"
                     reason = (
@@ -419,7 +540,7 @@ def run_active_dispatch(
 
                 time.sleep(poll_interval)
         finally:
-            if status in {"timeout", "reclaimed"} or (status is None and proc.poll() is None):
+            if status in {"timeout", "reclaimed", "aborted"} or (status is None and proc.poll() is None):
                 _terminate_process(proc)
                 if exit_code is None:
                     exit_code = proc.poll()

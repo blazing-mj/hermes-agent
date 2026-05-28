@@ -24,6 +24,7 @@ from .loop_runner import (
     write_dispatch_result,
     write_loop_decision,
 )
+from .kill_switch import KillSwitch, KillSwitchActive
 from .quota import quota_status_unknown
 from .router import TaskHints, route_task
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
@@ -122,10 +123,16 @@ def _run_loop_runner_active(
         return 2
 
     tasks = load_loop_tasks(task_file)
+    kill_switch_state = Path(
+        getattr(args, "kill_switch_state", "~/.hermes/state/team-os-kill-switch.json")
+    ).expanduser()
+    kill_switch = KillSwitch(kill_switch_state)
     decision = select_next_task(
         tasks,
         current_shift=getattr(args, "shift", "day"),
         require_confidence=bool(getattr(args, "require_confidence", False)),
+        require_approval=bool(getattr(args, "require_approval", False)),
+        kill_switch=kill_switch,
     )
     if decision.selected_task is None:
         print(
@@ -141,17 +148,22 @@ def _run_loop_runner_active(
         )
         return 0
 
-    result = run_active_dispatch(
-        decision.selected_task,
-        workspace=ws,
-        worker_command=tuple(worker_cmd),
-        heartbeat_path=Path(heartbeat_path).expanduser(),
-        lock_path=lock_path,
-        owner=owner,
-        max_runtime_seconds=float(getattr(args, "max_runtime_seconds", 120.0)),
-        heartbeat_stale_seconds=float(getattr(args, "heartbeat_stale_seconds", 15.0)),
-        poll_interval=float(getattr(args, "poll_interval", 0.5)),
-    )
+    try:
+        result = run_active_dispatch(
+            decision.selected_task,
+            workspace=ws,
+            worker_command=tuple(worker_cmd),
+            heartbeat_path=Path(heartbeat_path).expanduser(),
+            lock_path=lock_path,
+            owner=owner,
+            max_runtime_seconds=float(getattr(args, "max_runtime_seconds", 120.0)),
+            heartbeat_stale_seconds=float(getattr(args, "heartbeat_stale_seconds", 15.0)),
+            poll_interval=float(getattr(args, "poll_interval", 0.5)),
+            kill_switch=kill_switch,
+        )
+    except KillSwitchActive as exc:
+        print(json.dumps({"status": "halted", "reason": str(exc), "dry_run": False}, indent=2, sort_keys=True))
+        return 1
 
     rendered = json.dumps(result.to_dict(), indent=2, sort_keys=True)
     if output:
@@ -246,12 +258,19 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         if active:
             return _run_loop_runner_active(args, task_file=task_file, output=output, lock_path=lock_path, owner=owner)
 
-        lock = acquire_runner_lock(lock_path, owner=owner)
+        lock = acquire_runner_lock(
+            lock_path,
+            owner=owner,
+            reclaim=True,
+            stale_after_seconds=float(getattr(args, "lock_stale_after_seconds", 300.0)),
+        )
         try:
             decision = select_next_task(
                 load_loop_tasks(task_file),
                 current_shift=getattr(args, "shift", "day"),
                 require_confidence=bool(getattr(args, "require_confidence", False)),
+                require_approval=bool(getattr(args, "require_approval", False)),
+                kill_switch=KillSwitch(Path(getattr(args, "kill_switch_state", "~/.hermes/state/team-os-kill-switch.json")).expanduser()),
             )
             if output:
                 write_loop_decision(decision, output)
@@ -331,6 +350,38 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         else:
             print(rendered_sample)
         return 0
+    if command == "kill-switch":
+        ks_action = getattr(args, "ks_action", "status") or "status"
+        state_file = getattr(args, "state_file", None)
+        reason = getattr(args, "reason", None) or ""
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        ks_path = (
+            Path(state_file).expanduser()
+            if state_file
+            else Path("~/.hermes/state/team-os-kill-switch.json").expanduser()
+        )
+        ks = KillSwitch(ks_path)
+        if ks_action == "enable":
+            ks.enable(reason=reason)
+            result_data: dict = ks.status()
+        elif ks_action == "disable":
+            ks.disable()
+            result_data = ks.status()
+        else:  # status
+            result_data = ks.status()
+        rendered = json.dumps(result_data, indent=2, sort_keys=True)
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0
+
     if command != "snapshot":
         raise SystemExit(f"unknown team-os command: {command}")
 
@@ -462,8 +513,24 @@ def register_cli(parent) -> None:  # noqa: ANN001
         action="store_true",
         help="Strict Phase 8 gate: block tasks without explicit task_confidence",
     )
+    loop_runner.add_argument(
+        "--require-approval",
+        action="store_true",
+        help="Strict Phase 9A gate: block tasks without explicit approval_status",
+    )
+    loop_runner.add_argument(
+        "--kill-switch-state",
+        default="~/.hermes/state/team-os-kill-switch.json",
+        help="Phase 9A kill-switch JSON state file",
+    )
     loop_runner.add_argument("--output", help="Optional decision JSON output path")
     loop_runner.add_argument("--lock", default="~/.hermes/state/team-os-loop-runner.lock")
+    loop_runner.add_argument(
+        "--lock-stale-after-seconds",
+        type=float,
+        default=300.0,
+        help="Phase 9A: reclaim loop-runner lock after this age when holder is gone/stale",
+    )
     loop_runner.add_argument("--owner", default="team-os-loop-runner")
     loop_runner.add_argument(
         "--active",
@@ -539,6 +606,7 @@ def register_cli(parent) -> None:  # noqa: ANN001
     route.set_defaults(func=cmd_team_os)
 
     _register_decompose_goal(sub)
+    _register_kill_switch(sub)
 
     parent.set_defaults(func=cmd_team_os)
 
@@ -562,3 +630,30 @@ def _register_decompose_goal(sub) -> None:  # noqa: ANN001
     decompose.add_argument("--state-db", default=None, help="Optional Team OS SQLite DB path for persistence")
     decompose.add_argument("--output", help="Optional JSON output path")
     decompose.set_defaults(func=cmd_team_os)
+
+
+def _register_kill_switch(sub) -> None:  # noqa: ANN001
+    """Register the kill-switch subcommand (Phase 9A)."""
+    ks = sub.add_parser(
+        "kill-switch",
+        help="Phase 9A: enable/disable/status the Team OS kill-switch",
+    )
+    ks.add_argument(
+        "ks_action",
+        choices=["enable", "disable", "status"],
+        nargs="?",
+        default="status",
+        help="Action: enable | disable | status (default: status)",
+    )
+    ks.add_argument(
+        "--reason",
+        default="",
+        help="Human-readable reason recorded when enabling the kill-switch",
+    )
+    ks.add_argument(
+        "--state-file",
+        default=None,
+        help="Path to the kill-switch JSON state file (default: ~/.hermes/state/team-os-kill-switch.json)",
+    )
+    ks.add_argument("--output", help="Optional JSON output path")
+    ks.set_defaults(func=cmd_team_os)
