@@ -264,6 +264,7 @@ def select_next_task(
         production_mode=production_mode,
     )
 
+
 def load_loop_tasks(path: Path) -> list[LoopTask]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
@@ -763,6 +764,8 @@ def run_active_dispatch(
         )
 
     return result
+
+
 def write_dispatch_result(result: DispatchResult, output_path: Path) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
