@@ -13,6 +13,7 @@ from .delivery import TelegramApprovalDelivery, build_delivery_from_sample
 from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
+from .decomposer import decompose_goal
 from .loop_runner import (
     SandboxBoundaryViolation,
     SandboxWorkspace,
@@ -159,6 +160,59 @@ def _run_loop_runner_active(
 
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "decompose-goal":
+        goal_id = getattr(args, "goal_id")
+        goal_title = getattr(args, "goal_title", "") or ""
+        goal_body = getattr(args, "goal_body", "") or ""
+        labels = list(getattr(args, "label", None) or [])
+        max_tasks = int(getattr(args, "max_tasks", 10) or 10)
+        state_db = (
+            Path(getattr(args, "state_db")).expanduser()
+            if getattr(args, "state_db", None)
+            else None
+        )
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+
+        tasks = decompose_goal(
+            goal_id=goal_id,
+            goal_title=goal_title,
+            goal_body=goal_body,
+            labels=labels,
+            max_tasks=max_tasks,
+        )
+
+        result: dict = {
+            "goal_id": goal_id,
+            "goal_title": goal_title,
+            "dry_run": True,
+            "tasks": [task.to_dict() for task in tasks],
+        }
+
+        if state_db:
+            db = TeamOSState(state_db)
+            for task in tasks:
+                db.persist_task_confidence(
+                    goal_id=goal_id,
+                    task_id=task.task_id,
+                    confidence=task.confidence,
+                    reasons=list(task.confidence_reasons),
+                    source="decomposer",
+                )
+            result["state_db"] = str(state_db)
+
+        rendered = json.dumps(result, indent=2, sort_keys=True)
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0
+
     if command == "route":
         hints = TaskHints(
             task_id=getattr(args, "task_id"),
@@ -471,4 +525,27 @@ def register_cli(parent) -> None:  # noqa: ANN001
     route.add_argument("--output", help="Optional decision JSON output path")
     route.set_defaults(func=cmd_team_os)
 
+    _register_decompose_goal(sub)
+
     parent.set_defaults(func=cmd_team_os)
+
+
+def _register_decompose_goal(sub) -> None:  # noqa: ANN001
+    """Register the decompose-goal subcommand (called from register_cli)."""
+    decompose = sub.add_parser(
+        "decompose-goal",
+        help="Phase 8: decompose a goal into candidate tasks with confidence scoring",
+    )
+    decompose.add_argument("goal_id", help="Linear/Kanban goal identifier, e.g. AGENTS-75")
+    decompose.add_argument("--goal-title", default="", help="Human-readable goal title")
+    decompose.add_argument("--goal-body", default="", help="Goal body / description text")
+    decompose.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Goal labels such as type:code (repeatable)",
+    )
+    decompose.add_argument("--max-tasks", type=int, default=10, help="Cap on decomposed tasks (default 10)")
+    decompose.add_argument("--state-db", default=None, help="Optional Team OS SQLite DB path for persistence")
+    decompose.add_argument("--output", help="Optional JSON output path")
+    decompose.set_defaults(func=cmd_team_os)

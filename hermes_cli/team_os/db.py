@@ -80,6 +80,19 @@ class TeamOSState:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_confidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    goal_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    reasons_json TEXT NOT NULL,
+                    source TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def record_snapshot(self, classified: list[ClassifiedObservation]) -> int:
@@ -241,3 +254,60 @@ class TeamOSState:
                 raise KeyError(f"approval request not found: {approval_id}")
             conn.commit()
         return self.get_approval_request(approval_id)
+
+    # -----------------------------------------------------------------------
+    # Phase 8 — task confidence persistence
+    # -----------------------------------------------------------------------
+
+    def persist_task_confidence(
+        self,
+        *,
+        goal_id: str,
+        task_id: str,
+        confidence: str,
+        reasons: list[str],
+        source: str = "decomposer",
+    ) -> int:
+        self.init_schema()
+        now = int(time.time())
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO task_confidence(created_at, goal_id, task_id, confidence, reasons_json, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (now, goal_id, task_id, confidence, json.dumps(reasons, sort_keys=True), source),
+            )
+            if cur.lastrowid is None:
+                raise RuntimeError("failed to create task_confidence row")
+            row_id = int(cur.lastrowid)
+            conn.commit()
+        return row_id
+
+    def get_task_confidence(self, task_id: str) -> dict[str, Any]:
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_confidence WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"task_confidence not found for task_id: {task_id!r}")
+        data = dict(row)
+        data["reasons"] = json.loads(data.pop("reasons_json"))
+        return data
+
+    def list_task_confidence(self, goal_id: str) -> list[dict[str, Any]]:
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_confidence WHERE goal_id = ? ORDER BY id ASC",
+                (goal_id,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            data = dict(row)
+            data["reasons"] = json.loads(data.pop("reasons_json"))
+            result.append(data)
+        return result
+

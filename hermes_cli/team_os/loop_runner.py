@@ -23,6 +23,7 @@ class LoopTask:
     shifts: tuple[str, ...] = ("day", "night")
     approval_status: str | None = None
     quota_confidence: str = "unknown"
+    task_confidence: str | None = None  # Phase 8: None means not yet assessed (pass-through)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LoopTask:
@@ -35,6 +36,7 @@ class LoopTask:
             shifts=tuple(str(shift) for shift in shifts_raw),
             approval_status=data.get("approval_status"),
             quota_confidence=str(data.get("quota_confidence", "unknown")),
+            task_confidence=data.get("task_confidence"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,6 +48,7 @@ class LoopTask:
             "shifts": list(self.shifts),
             "approval_status": self.approval_status,
             "quota_confidence": self.quota_confidence,
+            "task_confidence": self.task_confidence,
         }
 
 
@@ -86,6 +89,9 @@ class RunnerLock:
             self.path.unlink()
 
 
+_BLOCKING_TASK_CONFIDENCE = {"unknown", "low"}
+
+
 def _skip_reason(task: LoopTask, *, current_shift: str) -> str | None:
     if task.status not in {"ready", "pending", "todo", "backlog"}:
         return f"status {task.status}"
@@ -95,6 +101,10 @@ def _skip_reason(task: LoopTask, *, current_shift: str) -> str | None:
         return f"approval {task.approval_status}"
     if task.quota_confidence in _BLOCKING_QUOTA_CONFIDENCE:
         return f"quota confidence {task.quota_confidence}"
+    # Phase 8: task_confidence=None means "not assessed by decomposer" — backward-compatible
+    # pass-through. Only block on low/unknown when explicitly set.
+    if task.task_confidence is not None and task.task_confidence in _BLOCKING_TASK_CONFIDENCE:
+        return f"task confidence {task.task_confidence}"
     return None
 
 
