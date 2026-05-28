@@ -160,6 +160,8 @@ def _run_loop_runner_active(
             heartbeat_stale_seconds=float(getattr(args, "heartbeat_stale_seconds", 15.0)),
             poll_interval=float(getattr(args, "poll_interval", 0.5)),
             kill_switch=kill_switch,
+            production_mode=bool(getattr(args, "production_mode", False)),
+            audit_path=Path(getattr(args, "audit_path")).expanduser() if getattr(args, "audit_path", None) else None,
         )
     except KillSwitchActive as exc:
         print(json.dumps({"status": "halted", "reason": str(exc), "dry_run": False}, indent=2, sort_keys=True))
@@ -271,6 +273,7 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
                 require_confidence=bool(getattr(args, "require_confidence", False)),
                 require_approval=bool(getattr(args, "require_approval", False)),
                 kill_switch=KillSwitch(Path(getattr(args, "kill_switch_state", "~/.hermes/state/team-os-kill-switch.json")).expanduser()),
+                production_mode=bool(getattr(args, "production_mode", False)),
             )
             if output:
                 write_loop_decision(decision, output)
@@ -571,6 +574,23 @@ def register_cli(parent) -> None:  # noqa: ANN001
         type=float,
         default=0.5,
         help="Phase 6: dispatcher poll interval (seconds)",
+    )
+    loop_runner.add_argument(
+        "--production-mode",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase 9: enable production-mode gate (kill-switch disabled + explicit approval "
+            "+ high confidence required); writes audit trail when --audit-path is set"
+        ),
+    )
+    loop_runner.add_argument(
+        "--audit-path",
+        default=None,
+        help=(
+            "Phase 9: JSONL file path for production audit trail "
+            "(written only when --production-mode is set and dispatch succeeds)"
+        ),
     )
     loop_runner.set_defaults(func=cmd_team_os)
 

@@ -64,6 +64,7 @@ class LoopDecision:
     skip_reasons: dict[str, str]
     dry_run: bool = True
     would_spawn_worker: bool = False
+    production_mode: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +74,7 @@ class LoopDecision:
             "skip_reasons": dict(self.skip_reasons),
             "dry_run": self.dry_run,
             "would_spawn_worker": self.would_spawn_worker,
+            "production_mode": self.production_mode,
         }
 
 
@@ -133,6 +135,7 @@ def select_next_task(
     require_confidence: bool = False,
     require_approval: bool = False,
     kill_switch: "KillSwitch | None" = None,
+    production_mode: bool = False,
 ) -> LoopDecision:
     """Select the next eligible task without executing or mutating anything.
 
@@ -143,7 +146,14 @@ def select_next_task(
         kill_switch: Optional :class:`~hermes_cli.team_os.kill_switch.KillSwitch`
             instance.  When provided and enabled, every task is skipped with
             reason "kill-switch enabled".
+        production_mode: When True, implies require_approval=True and
+            require_confidence=True (both strict gates enforced).  The resulting
+            :class:`LoopDecision` carries ``production_mode=True``.
     """
+    # production_mode implies strict approval + confidence gates.
+    if production_mode:
+        require_approval = True
+        require_confidence = True
     # Phase 9A: if the kill-switch is armed, block every task immediately.
     if kill_switch is not None and kill_switch.is_enabled():
         all_tasks = list(tasks)
@@ -156,6 +166,7 @@ def select_next_task(
             skip_reasons=skip_reasons,
             dry_run=True,
             would_spawn_worker=False,
+            production_mode=production_mode,
         )
 
     eligible: list[LoopTask] = []
@@ -183,6 +194,7 @@ def select_next_task(
         skip_reasons=skip_reasons,
         dry_run=True,
         would_spawn_worker=False,
+        production_mode=production_mode,
     )
 
 def load_loop_tasks(path: Path) -> list[LoopTask]:
@@ -357,6 +369,7 @@ class DispatchResult:
     blocks_task: bool
     owner: str
     dry_run: bool = False
+    production_mode: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -371,6 +384,7 @@ class DispatchResult:
             "blocks_task": self.blocks_task,
             "owner": self.owner,
             "dry_run": self.dry_run,
+            "production_mode": self.production_mode,
         }
 
 
@@ -425,6 +439,8 @@ def run_active_dispatch(
     poll_interval: float = 0.05,
     kill_switch: "KillSwitch | None" = None,
     poll_hook: Callable[[], None] | None = None,
+    production_mode: bool = False,
+    audit_path: Path | None = None,
 ) -> DispatchResult:
     """Run a single sandbox worker for ``task`` while honouring the lock,
     heartbeat-staleness reclaim window, and max runtime.
@@ -433,10 +449,43 @@ def run_active_dispatch(
     env vars such as ``HERMES_HEARTBEAT_PATH`` and ``HERMES_SANDBOX_WORKSPACE``.
     The runner itself does not open sockets; OS-level network isolation is an
     operator boundary and is not enforced here.
-    """
 
-    # Phase 9A: fail closed immediately if the kill-switch is armed.
-    if kill_switch is not None and kill_switch.is_enabled():
+    Args:
+        production_mode: When True, runs the production gate before acquiring the
+            lock.  Any gate violation returns a fail-closed :class:`DispatchResult`
+            without spawning the worker or writing the lock.  On success, writes an
+            audit trail entry to ``audit_path`` (required in production mode).
+        audit_path: Path for the JSONL production audit trail.  Written only when
+            ``production_mode=True`` and the dispatch succeeds.  Ignored in sandbox
+            mode (production_mode=False).
+    """
+    # Phase 9: production-mode gate — runs before acquiring the lock.
+    if production_mode:
+        from hermes_cli.team_os.production_gate import (  # noqa: PLC0415
+            check_production_gate,
+            write_production_audit,
+        )
+
+        gate_result = check_production_gate(task, kill_switch=kill_switch)
+        if not gate_result.passed:
+            violations_text = "; ".join(gate_result.violations)
+            return DispatchResult(
+                task_id=task.task_id,
+                status="production_gate_failed",
+                exit_code=None,
+                reason=f"production gate failed: {violations_text}",
+                workspace=str(workspace.root),
+                heartbeats_observed=0,
+                started_at=time.time(),
+                ended_at=time.time(),
+                blocks_task=True,
+                owner=owner,
+                dry_run=False,
+                production_mode=True,
+            )
+
+    # Phase 9A: fail closed immediately if the kill-switch is armed (sandbox path).
+    elif kill_switch is not None and kill_switch.is_enabled():
         from hermes_cli.team_os.kill_switch import KillSwitchActive  # noqa: PLC0415
 
         raise KillSwitchActive(
@@ -553,7 +602,7 @@ def run_active_dispatch(
 
     ended_at = time.time()
     blocks_task = status != "succeeded"
-    return DispatchResult(
+    result = DispatchResult(
         task_id=task.task_id,
         status=status,
         exit_code=exit_code,
@@ -564,7 +613,25 @@ def run_active_dispatch(
         ended_at=ended_at,
         blocks_task=blocks_task,
         owner=owner,
+        production_mode=production_mode,
     )
+
+    # Phase 9: write audit trail for successful production dispatches only.
+    if production_mode and not blocks_task and audit_path is not None:
+        from hermes_cli.team_os.production_gate import write_production_audit  # noqa: PLC0415
+
+        write_production_audit(
+            task_id=task.task_id,
+            task_title=task.title,
+            owner=owner,
+            approval_status=task.approval_status,
+            task_confidence=task.task_confidence,
+            quota_confidence=task.quota_confidence,
+            workspace=str(workspace.root),
+            audit_path=audit_path,
+        )
+
+    return result
 
 
 def write_dispatch_result(result: DispatchResult, output_path: Path) -> Path:
