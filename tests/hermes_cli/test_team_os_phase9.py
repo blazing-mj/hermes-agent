@@ -141,6 +141,20 @@ def test_production_gate_fails_when_task_confidence_low(tmp_path):
     assert any("task_confidence" in v for v in result.violations)
 
 
+def test_production_gate_fails_when_task_confidence_medium(tmp_path):
+    """Production requires high task confidence; medium is not enough."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+    from hermes_cli.team_os.production_gate import check_production_gate
+
+    ks = KillSwitch(tmp_path / "ks.json")
+    task = _make_task(approval_status="approved", task_confidence="medium", quota_confidence="high")
+
+    result = check_production_gate(task, kill_switch=ks)
+
+    assert result.passed is False
+    assert any("task_confidence" in v for v in result.violations)
+
+
 def test_production_gate_fails_when_task_confidence_is_none(tmp_path):
     """task_confidence=None (not assessed) → gate fails in production mode."""
     from hermes_cli.team_os.kill_switch import KillSwitch
@@ -175,6 +189,20 @@ def test_production_gate_fails_when_quota_confidence_unknown(tmp_path):
 
     ks = KillSwitch(tmp_path / "ks.json")
     task = _make_task(approval_status="approved", task_confidence="high", quota_confidence="unknown")
+
+    result = check_production_gate(task, kill_switch=ks)
+
+    assert result.passed is False
+    assert any("quota_confidence" in v for v in result.violations)
+
+
+def test_production_gate_fails_when_quota_confidence_medium(tmp_path):
+    """Production requires high quota confidence; medium is not enough."""
+    from hermes_cli.team_os.kill_switch import KillSwitch
+    from hermes_cli.team_os.production_gate import check_production_gate
+
+    ks = KillSwitch(tmp_path / "ks.json")
+    task = _make_task(approval_status="approved", task_confidence="high", quota_confidence="medium")
 
     result = check_production_gate(task, kill_switch=ks)
 

@@ -72,6 +72,18 @@ def _low_confidence_task() -> dict:
     return t
 
 
+def _medium_task_confidence_task() -> dict:
+    t = _approved_task()
+    t["task_confidence"] = "medium"
+    return t
+
+
+def _medium_quota_confidence_task() -> dict:
+    t = _approved_task()
+    t["quota_confidence"] = "medium"
+    return t
+
+
 def _common_active_argv(
     *,
     tasks: Path,
@@ -241,6 +253,46 @@ def test_production_denied_no_approval_rc2_audit_no_lock_no_dispatch(tmp_path, m
     assert not lock.exists(), "loop-runner lock must not be acquired on denial"
 
 
+def test_production_denied_uses_default_audit_env_when_arg_omitted(tmp_path, monkeypatch):
+    from hermes_cli.team_os.cli import cmd_team_os
+    from hermes_cli.team_os import loop_runner as lr
+
+    tasks_path = _write_tasks(tmp_path / "tasks.json", [_no_approval_task()])
+    sandbox = tmp_path / "ws"
+    sandbox.mkdir()
+    audit = tmp_path / "default-audit.jsonl"
+    lock = tmp_path / "lock"
+    ks_state = tmp_path / "ks.json"
+    monkeypatch.setenv("HERMES_TEAM_OS_PRODUCTION_AUDIT", str(audit))
+    monkeypatch.setattr(
+        lr,
+        "run_active_dispatch",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("dispatch must not run on production-gate denial")
+        ),
+    )
+
+    parser = _build_parser()
+    argv = _common_active_argv(
+        tasks=tasks_path,
+        sandbox_root=tmp_path,
+        workspace=sandbox,
+        heartbeat=tmp_path / "hb",
+        lock=lock,
+        ks_state=ks_state,
+    ) + ["--production"]
+    args = parser.parse_args(argv)
+    _inject_worker_cmd(args)
+
+    rc = cmd_team_os(args)
+
+    assert rc == 2
+    assert audit.exists(), "production denials must audit even without --production-audit"
+    entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["decision"] == "denied"
+    assert not lock.exists()
+
+
 def test_production_denied_kill_switch_rc2_and_audit(tmp_path, monkeypatch):
     from hermes_cli.team_os.cli import cmd_team_os
     from hermes_cli.team_os import loop_runner as lr
@@ -324,6 +376,88 @@ def test_production_denied_low_confidence_rc2_and_audit(tmp_path, monkeypatch):
     assert audit.exists()
     entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
     assert entry.get("decision") == "denied"
+    assert not lock.exists()
+
+
+def test_production_denied_medium_task_confidence_rc2_and_audit(tmp_path, monkeypatch):
+    from hermes_cli.team_os.cli import cmd_team_os
+    from hermes_cli.team_os import loop_runner as lr
+
+    tasks_path = _write_tasks(tmp_path / "tasks.json", [_medium_task_confidence_task()])
+    sandbox = tmp_path / "ws"
+    sandbox.mkdir()
+    audit = tmp_path / "audit.jsonl"
+    lock = tmp_path / "lock"
+    ks_state = tmp_path / "ks.json"
+
+    monkeypatch.setattr(
+        lr,
+        "run_active_dispatch",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("dispatch must not be called when task_confidence is medium")
+        ),
+    )
+
+    parser = _build_parser()
+    argv = _common_active_argv(
+        tasks=tasks_path,
+        sandbox_root=tmp_path,
+        workspace=sandbox,
+        heartbeat=tmp_path / "hb",
+        lock=lock,
+        ks_state=ks_state,
+    ) + ["--production", "--production-audit", str(audit)]
+    args = parser.parse_args(argv)
+    _inject_worker_cmd(args)
+
+    rc = cmd_team_os(args)
+
+    assert rc == 2
+    assert audit.exists()
+    entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+    assert entry.get("decision") == "denied"
+    assert any("task_confidence" in v for v in entry["violations"])
+    assert not lock.exists()
+
+
+def test_production_denied_medium_quota_confidence_rc2_and_audit(tmp_path, monkeypatch):
+    from hermes_cli.team_os.cli import cmd_team_os
+    from hermes_cli.team_os import loop_runner as lr
+
+    tasks_path = _write_tasks(tmp_path / "tasks.json", [_medium_quota_confidence_task()])
+    sandbox = tmp_path / "ws"
+    sandbox.mkdir()
+    audit = tmp_path / "audit.jsonl"
+    lock = tmp_path / "lock"
+    ks_state = tmp_path / "ks.json"
+
+    monkeypatch.setattr(
+        lr,
+        "run_active_dispatch",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("dispatch must not be called when quota_confidence is medium")
+        ),
+    )
+
+    parser = _build_parser()
+    argv = _common_active_argv(
+        tasks=tasks_path,
+        sandbox_root=tmp_path,
+        workspace=sandbox,
+        heartbeat=tmp_path / "hb",
+        lock=lock,
+        ks_state=ks_state,
+    ) + ["--production", "--production-audit", str(audit)]
+    args = parser.parse_args(argv)
+    _inject_worker_cmd(args)
+
+    rc = cmd_team_os(args)
+
+    assert rc == 2
+    assert audit.exists()
+    entry = json.loads(audit.read_text(encoding="utf-8").splitlines()[0])
+    assert entry.get("decision") == "denied"
+    assert any("quota_confidence" in v for v in entry["violations"])
     assert not lock.exists()
 
 

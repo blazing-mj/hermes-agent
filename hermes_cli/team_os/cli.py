@@ -147,9 +147,15 @@ def _run_loop_runner_active(
     production_audit_arg = getattr(args, "production_audit", None) or getattr(
         args, "audit_path", None
     )
-    production_audit = (
-        Path(production_audit_arg).expanduser() if production_audit_arg else None
-    )
+    production_audit = None
+    if production:
+        from .production_gate import default_production_audit_path
+
+        production_audit = (
+            Path(production_audit_arg).expanduser()
+            if production_audit_arg
+            else default_production_audit_path()
+        )
 
     tasks = load_loop_tasks(task_file)
     kill_switch_state = Path(

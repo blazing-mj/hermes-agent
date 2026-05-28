@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,10 +31,7 @@ if TYPE_CHECKING:
 _APPROVED_STATUSES = {"approved", "auto-approved"}
 
 # Confidence levels that are acceptable for production execution.
-_HIGH_CONFIDENCE = {"high", "medium"}
-
-# Quota confidence levels that block production execution.
-_BLOCKING_QUOTA = {"unknown", "low", "unavailable", "exhausted"}
+_HIGH_CONFIDENCE = {"high"}
 
 
 class ProductionGateBlocked(RuntimeError):
@@ -69,8 +67,8 @@ def check_production_gate(
     Checks (in order, all accumulated):
       1. Kill-switch must be disabled.
       2. approval_status must be an explicitly-approved value.
-      3. task_confidence must be assessed and high/medium (not None/low/unknown).
-      4. quota_confidence must not be blocking.
+      3. task_confidence must be assessed and high (not medium/low/unknown/None).
+      4. quota_confidence must be high.
 
     Args:
         task: The :class:`~hermes_cli.team_os.loop_runner.LoopTask` to check.
@@ -107,15 +105,23 @@ def check_production_gate(
         )
 
     # 4. Quota confidence check
-    if task.quota_confidence in _BLOCKING_QUOTA:
+    if task.quota_confidence != "high":
         violations.append(
-            f"quota_confidence={task.quota_confidence!r} is not acceptable for production"
+            f"quota_confidence={task.quota_confidence!r} is not acceptable for production "
+            "(must be 'high')"
         )
 
     return ProductionGateResult(
         passed=len(violations) == 0,
         violations=tuple(violations),
     )
+
+
+def default_production_audit_path() -> Path:
+    """Return the production audit JSONL path, honoring env override."""
+    if override := os.environ.get("HERMES_TEAM_OS_PRODUCTION_AUDIT"):
+        return Path(override).expanduser()
+    return Path("~/.hermes/state/team-os-production-audit.jsonl").expanduser()
 
 
 def write_production_audit(
