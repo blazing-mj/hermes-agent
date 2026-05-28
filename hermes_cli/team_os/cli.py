@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any
@@ -11,7 +12,16 @@ from .approvals import build_approval_sample
 from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
-from .loop_runner import acquire_runner_lock, load_loop_tasks, select_next_task, write_loop_decision
+from .loop_runner import (
+    SandboxBoundaryViolation,
+    SandboxWorkspace,
+    acquire_runner_lock,
+    load_loop_tasks,
+    run_active_dispatch,
+    select_next_task,
+    write_dispatch_result,
+    write_loop_decision,
+)
 from .quota import quota_status_unknown
 from .router import TaskHints, route_task
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
@@ -83,6 +93,69 @@ def _codex_probe_from_arg(value: str | None) -> Callable[[], bool] | None:
     raise SystemExit(f"unknown --codex-probe value: {value!r}")
 
 
+def _run_loop_runner_active(
+    args,
+    *,
+    task_file: Path,
+    output: Path | None,
+    lock_path: Path,
+    owner: str,
+) -> int:  # noqa: ANN001
+    sandbox_root = getattr(args, "sandbox_root", None)
+    workspace = getattr(args, "workspace", None)
+    worker_cmd = getattr(args, "worker_cmd", None)
+    heartbeat_path = getattr(args, "heartbeat_path", None)
+    if not sandbox_root or not workspace or not worker_cmd or not heartbeat_path:
+        print(
+            "loop-runner --active requires --sandbox-root, --workspace, "
+            "--worker-cmd, and --heartbeat-path",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        ws = SandboxWorkspace.create(Path(workspace).expanduser(), allowed_prefix=Path(sandbox_root).expanduser())
+    except SandboxBoundaryViolation as exc:
+        print(f"sandbox boundary violation: {exc}", file=sys.stderr)
+        return 2
+
+    tasks = load_loop_tasks(task_file)
+    decision = select_next_task(tasks, current_shift=getattr(args, "shift", "day"))
+    if decision.selected_task is None:
+        print(
+            json.dumps(
+                {
+                    "status": "no-eligible-task",
+                    "dry_run": False,
+                    "skip_reasons": decision.skip_reasons,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    result = run_active_dispatch(
+        decision.selected_task,
+        workspace=ws,
+        worker_command=tuple(worker_cmd),
+        heartbeat_path=Path(heartbeat_path).expanduser(),
+        lock_path=lock_path,
+        owner=owner,
+        max_runtime_seconds=float(getattr(args, "max_runtime_seconds", 120.0)),
+        heartbeat_stale_seconds=float(getattr(args, "heartbeat_stale_seconds", 15.0)),
+        poll_interval=float(getattr(args, "poll_interval", 0.5)),
+    )
+
+    rendered = json.dumps(result.to_dict(), indent=2, sort_keys=True)
+    if output:
+        write_dispatch_result(result, output)
+        print(str(output))
+    else:
+        print(rendered)
+    return 0 if result.status == "succeeded" else 1
+
+
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
     if command == "route":
@@ -109,6 +182,11 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
         lock_path = Path(getattr(args, "lock", "~/.hermes/state/team-os-loop-runner.lock")).expanduser()
         owner = getattr(args, "owner", "team-os-loop-runner")
+        active = bool(getattr(args, "active", False))
+
+        if active:
+            return _run_loop_runner_active(args, task_file=task_file, output=output, lock_path=lock_path, owner=owner)
+
         lock = acquire_runner_lock(lock_path, owner=owner)
         try:
             decision = select_next_task(load_loop_tasks(task_file), current_shift=getattr(args, "shift", "day"))
@@ -265,6 +343,46 @@ def register_cli(parent) -> None:  # noqa: ANN001
     loop_runner.add_argument("--output", help="Optional decision JSON output path")
     loop_runner.add_argument("--lock", default="~/.hermes/state/team-os-loop-runner.lock")
     loop_runner.add_argument("--owner", default="team-os-loop-runner")
+    loop_runner.add_argument(
+        "--active",
+        action="store_true",
+        help="Phase 6: actively dispatch the selected task into a sandbox worker",
+    )
+    loop_runner.add_argument(
+        "--sandbox-root",
+        help="Phase 6: required prefix every workspace path must live under",
+    )
+    loop_runner.add_argument(
+        "--workspace",
+        help="Phase 6: sandbox workspace directory (must be inside --sandbox-root)",
+    )
+    loop_runner.add_argument(
+        "--worker-cmd",
+        nargs="+",
+        help="Phase 6: argv for the local sandbox worker (no real agent spawn)",
+    )
+    loop_runner.add_argument(
+        "--heartbeat-path",
+        help="Phase 6: file path the worker touches to prove liveness",
+    )
+    loop_runner.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        default=120.0,
+        help="Phase 6: hard upper bound on worker runtime (seconds)",
+    )
+    loop_runner.add_argument(
+        "--heartbeat-stale-seconds",
+        type=float,
+        default=15.0,
+        help="Phase 6: reclaim worker if heartbeat is older than this (seconds)",
+    )
+    loop_runner.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        help="Phase 6: dispatcher poll interval (seconds)",
+    )
     loop_runner.set_defaults(func=cmd_team_os)
 
     route = sub.add_parser(
