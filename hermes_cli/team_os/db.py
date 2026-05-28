@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .approvals import ApprovalStatus, ReversibilityCategory, decision_to_status
 from .schema import ClassifiedObservation
 
 
@@ -56,6 +57,26 @@ class TeamOSState:
                     reason TEXT,
                     dry_run INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    task_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    reversibility_category TEXT NOT NULL,
+                    reversibility_reason TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    decision TEXT,
+                    actor TEXT,
+                    decision_reason TEXT,
+                    modified_scope TEXT
                 )
                 """
             )
@@ -123,3 +144,100 @@ class TeamOSState:
             data["dry_run"] = bool(data["dry_run"])
             result.append(data)
         return result
+
+    def create_approval_request(
+        self,
+        *,
+        task_id: str,
+        title: str,
+        action: str,
+        reversibility_category: ReversibilityCategory,
+        reversibility_reason: str,
+        prompt: str,
+    ) -> int:
+        self.init_schema()
+        now = int(time.time())
+        category = reversibility_category.value
+        status = (
+            ApprovalStatus.PENDING
+            if reversibility_category
+            in {
+                ReversibilityCategory.DATA_MIGRATION,
+                ReversibilityCategory.CREDENTIAL_CHANGE,
+                ReversibilityCategory.EXTERNAL_SIDE_EFFECT,
+                ReversibilityCategory.MASS_DELETE,
+                ReversibilityCategory.NONE,
+            }
+            else ApprovalStatus.AUTO_APPROVED
+        )
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO approvals(
+                    created_at, updated_at, task_id, title, action,
+                    reversibility_category, reversibility_reason, prompt, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    now,
+                    task_id,
+                    title,
+                    action,
+                    category,
+                    reversibility_reason,
+                    prompt,
+                    status.value,
+                ),
+            )
+            if cur.lastrowid is None:
+                raise RuntimeError("failed to create approval request")
+            approval_id = int(cur.lastrowid)
+            conn.commit()
+        return approval_id
+
+    def get_approval_request(self, approval_id: int) -> dict[str, Any]:
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"approval request not found: {approval_id}")
+        return dict(row)
+
+    def record_approval_decision(
+        self,
+        approval_id: int,
+        *,
+        decision: str,
+        actor: str,
+        reason: str | None = None,
+        modified_scope: str | None = None,
+    ) -> dict[str, Any]:
+        self.init_schema()
+        status = decision_to_status(decision)
+        now = int(time.time())
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE approvals
+                SET updated_at = ?, status = ?, decision = ?, actor = ?,
+                    decision_reason = ?, modified_scope = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    status.value,
+                    decision,
+                    actor,
+                    reason,
+                    modified_scope,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(f"approval request not found: {approval_id}")
+            conn.commit()
+        return self.get_approval_request(approval_id)

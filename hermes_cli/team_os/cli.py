@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .approvals import build_approval_sample
 from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
@@ -60,6 +61,21 @@ def build_snapshot(
 
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "approval-sample":
+        sample = build_approval_sample(
+            task_id=getattr(args, "task_id", "AGENTS-68"),
+            title=getattr(args, "title", "Approval sample"),
+            action=getattr(args, "action", "run migration"),
+        ).to_dict()
+        rendered_sample = json.dumps(sample, indent=2, sort_keys=True)
+        output_sample = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+        if output_sample:
+            output_sample.parent.mkdir(parents=True, exist_ok=True)
+            output_sample.write_text(rendered_sample + "\n", encoding="utf-8")
+            print(str(output_sample))
+        else:
+            print(rendered_sample)
+        return 0
     if command != "snapshot":
         raise SystemExit(f"unknown team-os command: {command}")
 
@@ -127,4 +143,14 @@ def register_cli(parent) -> None:  # noqa: ANN001
     snapshot.add_argument("--state-db", help="Optional local Team OS SQLite state DB path")
     snapshot.add_argument("--output", help="Optional JSON output path")
     snapshot.set_defaults(func=cmd_team_os)
+
+    approval_sample = sub.add_parser(
+        "approval-sample",
+        help="Render one local approval prompt sample without sending it",
+    )
+    approval_sample.add_argument("--task-id", default="AGENTS-68")
+    approval_sample.add_argument("--title", default="Approval sample")
+    approval_sample.add_argument("--action", default="run database migration")
+    approval_sample.add_argument("--output", help="Optional JSON output path")
+    approval_sample.set_defaults(func=cmd_team_os)
     parent.set_defaults(func=cmd_team_os)
