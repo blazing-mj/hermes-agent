@@ -55,7 +55,13 @@ class ApprovalSample:
     task_id: str
     title: str
     action: str
+    why: str
+    why_now: str
+    what_if_no: str
     reversibility: ReversibilityAssessment
+    rollback_path: str
+    risk_if_wrong: str
+    plan_summary: tuple[str, str, str]
     prompt: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,7 +69,14 @@ class ApprovalSample:
             "task_id": self.task_id,
             "title": self.title,
             "action": self.action,
+            "what": self.action,
+            "why": self.why,
+            "why_now": self.why_now,
+            "what_if_no": self.what_if_no,
             "reversibility": self.reversibility.to_dict(),
+            "rollback_path": self.rollback_path,
+            "risk_if_wrong": self.risk_if_wrong,
+            "plan_summary": list(self.plan_summary),
             "requires_manual_approval": self.reversibility.requires_manual_approval,
             "prompt": self.prompt,
         }
@@ -127,17 +140,33 @@ def render_approval_prompt(
     task_id: str,
     title: str,
     action: str,
+    why: str,
+    why_now: str,
+    what_if_no: str,
     category: ReversibilityCategory,
     reason: str,
+    rollback_path: str,
+    risk_if_wrong: str,
+    plan_summary: tuple[str, str, str] | list[str],
 ) -> str:
-    """Render the human approval prompt before any Telegram delivery rail."""
+    """Render the full v6 human approval prompt before any Telegram delivery rail."""
+
+    if len(plan_summary) != 3:
+        raise ValueError("approval plan_summary must contain exactly 3 bullets")
 
     return "\n".join(
         [
             f"Approval needed: {task_id} — {title}",
-            f"Action: {action}",
-            f"Reversibility: {category.value}",
-            f"Reason: {reason}",
+            f"What: {action}",
+            f"Why: {why}",
+            f"Why now: {why_now}",
+            f"What if no: {what_if_no}",
+            f"Reversibility: {category.value} — {reason}; rollback: {rollback_path}",
+            f"Risk if wrong: {risk_if_wrong}",
+            "Plan summary:",
+            f"1. {plan_summary[0]}",
+            f"2. {plan_summary[1]}",
+            f"3. {plan_summary[2]}",
             "",
             "Choose one:",
             f"/approve {task_id}",
@@ -148,20 +177,58 @@ def render_approval_prompt(
     )
 
 
+def _rollback_path_for(category: ReversibilityCategory) -> str:
+    if category is ReversibilityCategory.FULL_INSTANT:
+        return "Revert the local git/checkpoint change immediately."
+    if category is ReversibilityCategory.FULL_EFFORT:
+        return "Revert the commit/worktree change and rerun affected tests."
+    if category is ReversibilityCategory.DATA_MIGRATION:
+        return "Restore the pre-change data backup or apply the paired down migration, then verify readback."
+    if category is ReversibilityCategory.CREDENTIAL_CHANGE:
+        return "Restore the previous credential value from the approved secret store and restart affected services."
+    if category is ReversibilityCategory.EXTERNAL_SIDE_EFFECT:
+        return "Stop follow-on actions and apply the service-specific undo/remediation path; external recipients may still have seen it."
+    if category is ReversibilityCategory.MASS_DELETE:
+        return "Restore from backup/trash/snapshot and verify item counts before continuing."
+    return "No reliable rollback path; cancellation before execution is the only safe reversal."
+
+
 def build_approval_sample(*, task_id: str, title: str, action: str) -> ApprovalSample:
     assessment = classify_reversibility(action)
+    why = "This action is the next gated step for the Team OS rollout and needs an explicit decision before execution."
+    why_now = "A downstream delivery rail is blocked until this approval decision is resolved with full context."
+    what_if_no = "The action will not run; the dependent phase stays blocked and the current safe state is preserved."
+    rollback_path = _rollback_path_for(assessment.category)
+    risk_if_wrong = f"If approved incorrectly, this {assessment.category.value} action could create cleanup work or block the rollout path."
+    plan_summary = (
+        "Confirm the exact scope and reversibility category",
+        "Execute only the approved action with existing safety gates",
+        "Run verifier/readback checks and record proof before closing",
+    )
     prompt = render_approval_prompt(
         task_id=task_id,
         title=title,
         action=action,
+        why=why,
+        why_now=why_now,
+        what_if_no=what_if_no,
         category=assessment.category,
         reason=assessment.reason,
+        rollback_path=rollback_path,
+        risk_if_wrong=risk_if_wrong,
+        plan_summary=plan_summary,
     )
     return ApprovalSample(
         task_id=task_id,
         title=title,
         action=action,
+        why=why,
+        why_now=why_now,
+        what_if_no=what_if_no,
         reversibility=assessment,
+        rollback_path=rollback_path,
+        risk_if_wrong=risk_if_wrong,
+        plan_summary=plan_summary,
         prompt=prompt,
     )
 
