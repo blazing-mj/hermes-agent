@@ -14,6 +14,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from agent.current_work import CurrentWork, write_current_work
 
 
 def _make_source() -> SessionSource:
@@ -144,6 +145,29 @@ async def test_known_slash_command_not_flagged_as_unknown(monkeypatch):
 
     assert result is not None
     assert "Unknown command" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_current_work_snapshot(monkeypatch):
+    """/status must render from current-work.json so it survives compaction."""
+    runner = _make_runner()
+    write_current_work(
+        CurrentWork(
+            linear_id="AGENTS-65",
+            title="Structured task comms layer",
+            phase="implementation",
+            dispatcher="Codex host",
+            eta_minutes=25,
+            last_diff_fingerprint="diff:abc123",
+        )
+    )
+
+    result = await runner._handle_status_command(_make_event("/status"))
+
+    assert "Current work:" in result
+    assert "AGENTS-65" in result
+    assert "Structured task comms layer" in result
+    assert "Last diff/progress: diff:abc123" in result
 
 
 @pytest.mark.asyncio

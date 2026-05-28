@@ -11,6 +11,7 @@ history.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,6 +21,15 @@ from utils import atomic_json_write
 
 
 _STATE_RELATIVE_PATH = Path("state") / "current-work.json"
+_LIFECYCLE_LOG_RELATIVE_PATH = Path("logs") / "lifecycle.jsonl"
+_LIFECYCLE_EVENTS = {
+    "task_start",
+    "phase_transition",
+    "dispatcher_switch",
+    "heartbeat",
+    "completion",
+    "pause",
+}
 
 
 def state_file_path() -> Path:
@@ -32,8 +42,15 @@ def state_file_path() -> Path:
     return get_hermes_home() / _STATE_RELATIVE_PATH
 
 
+def lifecycle_log_path() -> Path:
+    """Return the profile-aware task lifecycle JSONL log path."""
+
+    return get_hermes_home() / _LIFECYCLE_LOG_RELATIVE_PATH
+
+
 @dataclass(slots=True)
 class CurrentWork:
+
     """Latest active-work state.
 
     Keep this schema intentionally compact.  It is safe for newer writers to add
@@ -251,6 +268,100 @@ def check_post_compression_messages(messages: list[dict[str, Any]]) -> MismatchR
     )
 
 
+def _val(value: Any, fallback: str = "unknown") -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    return text if text else fallback
+
+
+def render_lifecycle_event(
+    event: str,
+    work: CurrentWork | None = None,
+    *,
+    elapsed_minutes: int | None = None,
+    old_dispatcher: str | None = None,
+    new_dispatcher: str | None = None,
+    reason: str | None = None,
+    verifier: str | None = None,
+    audit_rounds: int | None = None,
+    files_changed: int | None = None,
+) -> str:
+    """Render a task-aware lifecycle stamp for Telegram/local logs."""
+
+    if event not in _LIFECYCLE_EVENTS:
+        raise ValueError(f"unknown lifecycle event: {event}")
+    work = work or CurrentWork()
+    ident = _val(work.linear_id, "active task")
+    title = _val(work.title)
+    phase = _val(work.phase)
+    dispatcher = _val(work.dispatcher)
+    eta = f"{work.eta_minutes}m" if work.eta_minutes is not None else "unknown"
+
+    if event == "task_start":
+        return (
+            f"🎯 {ident} — {title}\n"
+            f"   Dispatcher: {dispatcher}\n"
+            f"   Why: {_val(reason, 'not recorded')}\n"
+            f"   Phase: {phase}\n"
+            f"   ETA: {eta}"
+        )
+    if event == "phase_transition":
+        suffix = f", ETA {eta}" if work.eta_minutes is not None else ""
+        return f"{ident} → Phase: {phase} (started{suffix})"
+    if event == "dispatcher_switch":
+        old = _val(old_dispatcher, dispatcher)
+        new = _val(new_dispatcher, dispatcher)
+        return f"{ident} → switched {old} → {new} (reason: {_val(reason, 'not recorded')})"
+    if event == "heartbeat":
+        elapsed = f", {elapsed_minutes}min elapsed" if elapsed_minutes is not None else ""
+        return f"⏳ {ident} still working — phase: {phase}{elapsed}"
+    if event == "completion":
+        elapsed = f" — {elapsed_minutes}min" if elapsed_minutes is not None else ""
+        lines = [
+            f"✅ {ident} shipped{elapsed}",
+            f"   Dispatcher used: {dispatcher}",
+            f"   Verifier: {_val(verifier, 'not recorded')}, audit rounds: {_val(audit_rounds, 'unknown')}, files: {_val(files_changed, 'unknown')} changed",
+        ]
+        return "\n".join(lines)
+    if event == "pause":
+        return f"🟡 {ident} paused — {_val(reason, 'awaiting input')}"
+    raise AssertionError("unreachable")
+
+
+def append_lifecycle_event(
+    event: str,
+    work: CurrentWork | None = None,
+    *,
+    path: Path | None = None,
+    **details: Any,
+) -> dict[str, Any]:
+    """Append one lifecycle event as JSONL and return the written record."""
+
+    if event not in _LIFECYCLE_EVENTS:
+        raise ValueError(f"unknown lifecycle event: {event}")
+    work = work or read_current_work() or CurrentWork()
+    record: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "linear_id": work.linear_id,
+        "title": work.title,
+        "phase": work.phase,
+        "dispatcher": work.dispatcher,
+        "eta_minutes": work.eta_minutes,
+        "last_diff_fingerprint": work.last_diff_fingerprint,
+        "message": render_lifecycle_event(event, work, **details),
+    }
+    for key, value in details.items():
+        if value is not None:
+            record[key] = value
+    log_path = path or lifecycle_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return record
+
+
 def render_status(work: CurrentWork | None = None) -> str:
     """Render a compact human-readable status snapshot from current-work state."""
 
@@ -259,20 +370,17 @@ def render_status(work: CurrentWork | None = None) -> str:
     if work is None:
         return "No active work recorded."
 
-    def val(value: Any, fallback: str = "unknown") -> str:
-        if value is None:
-            return fallback
-        text = str(value).strip()
-        return text if text else fallback
-
     lines = [
-        f"Active task: {val(work.linear_id)} — {val(work.title)}",
-        f"Phase: {val(work.phase)}",
-        f"Dispatcher: {val(work.dispatcher)}",
-        f"ETA: {val(work.eta_minutes)}min" if work.eta_minutes is not None else "ETA: unknown",
+        f"Active task: {_val(work.linear_id)} — {_val(work.title)}",
+        f"Phase: {_val(work.phase)}",
+        f"Dispatcher: {_val(work.dispatcher)}",
+        f"ETA: {_val(work.eta_minutes)}min" if work.eta_minutes is not None else "ETA: unknown",
         f"Queue: {', '.join(work.queue) if work.queue else 'empty'}",
-        f"Last user message: {val(work.last_user_message_verbatim, 'not recorded')}",
-        f"Last diff/progress: {val(work.last_diff_fingerprint, 'not recorded')}",
+        f"Last user message: {_val(work.last_user_message_verbatim, 'not recorded')}",
+        f"Last phase change: {_val(work.last_phase_change_at, 'not recorded')}",
+        f"Last tool call: {_val(work.last_tool_call_at, 'not recorded')}",
+        f"Last diff/progress: {_val(work.last_diff_fingerprint, 'not recorded')}",
+        "Stuck risk: not evaluated yet",
     ]
     if work.anomalies:
         lines.append("Anomalies:")

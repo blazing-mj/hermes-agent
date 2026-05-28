@@ -24,9 +24,12 @@ from agent.current_work import (
     CurrentWork,
     CurrentWorkMismatchError,
     MismatchResult,
+    append_lifecycle_event,
     check_post_compression_mismatch,
     extract_latest_user_message,
+    lifecycle_log_path,
     read_current_work,
+    render_lifecycle_event,
     render_status,
     state_file_path,
     update_current_work,
@@ -362,6 +365,80 @@ class TestRenderStatus:
         assert isinstance(rendered, str)
         # No raw 'None' tokens leaked into the human-readable output.
         assert "None" not in rendered
+
+    def test_status_includes_stuck_placeholder_and_diff_marker(self):
+        rendered = render_status(
+            CurrentWork(
+                linear_id="AGENTS-65",
+                phase="implementation",
+                last_diff_fingerprint="diff:abc123",
+            )
+        )
+        assert "Last diff/progress: diff:abc123" in rendered
+        assert "Stuck risk: not evaluated yet" in rendered
+
+
+# ── Lifecycle renderer/log ───────────────────────────────────────────────
+
+
+class TestLifecycleEvents:
+    def _work(self) -> CurrentWork:
+        return CurrentWork(
+            linear_id="AGENTS-65",
+            title="Structured task comms layer",
+            phase="implementation",
+            dispatcher="Codex host",
+            eta_minutes=25,
+            last_diff_fingerprint="diff:abc123",
+        )
+
+    @pytest.mark.parametrize(
+        ("event", "expected"),
+        [
+            ("task_start", "🎯 AGENTS-65 — Structured task comms layer"),
+            ("phase_transition", "AGENTS-65 → Phase: implementation"),
+            ("dispatcher_switch", "switched Claude → Codex"),
+            ("heartbeat", "⏳ AGENTS-65 still working"),
+            ("completion", "✅ AGENTS-65 shipped"),
+            ("pause", "🟡 AGENTS-65 paused"),
+        ],
+    )
+    def test_render_lifecycle_templates(self, event, expected):
+        rendered = render_lifecycle_event(
+            event,
+            self._work(),
+            reason="P0 foundation",
+            old_dispatcher="Claude",
+            new_dispatcher="Codex",
+            elapsed_minutes=42,
+            verifier="green",
+            audit_rounds=1,
+            files_changed=3,
+        )
+        assert expected in rendered
+        assert "AGENTS-65" in rendered
+
+    def test_append_lifecycle_event_writes_jsonl(self, tmp_path):
+        path = tmp_path / "lifecycle.jsonl"
+        record = append_lifecycle_event(
+            "heartbeat",
+            self._work(),
+            path=path,
+            elapsed_minutes=30,
+        )
+        assert record["event"] == "heartbeat"
+        assert record["linear_id"] == "AGENTS-65"
+        assert record["last_diff_fingerprint"] == "diff:abc123"
+        line = path.read_text(encoding="utf-8").strip()
+        parsed = json.loads(line)
+        assert parsed["event"] == "heartbeat"
+        assert "still working" in parsed["message"]
+
+    def test_lifecycle_log_path_under_hermes_home(self):
+        path = lifecycle_log_path()
+        assert path.name == "lifecycle.jsonl"
+        assert path.parent.name == "logs"
+        assert str(path).startswith(os.environ["HERMES_HOME"])
 
 
 # ── Compression insertion point ─────────────────────────────────────────

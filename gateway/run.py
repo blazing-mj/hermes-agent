@@ -9861,6 +9861,17 @@ class GatewayRunner:
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
 
+        try:
+            from agent.current_work import render_status as _render_current_work_status
+
+            lines.extend([
+                "",
+                "Current work:",
+                _render_current_work_status(),
+            ])
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("current-work status render failed in /status: %s", exc)
+
         # Session recap — what was this session ABOUT? Pure local compute,
         # no LLM call, no prompt-cache impact. Useful when juggling multiple
         # gateway sessions and you want a one-glance reminder of where this
