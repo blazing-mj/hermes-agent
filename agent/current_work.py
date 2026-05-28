@@ -1,0 +1,282 @@
+"""Canonical active-work state for long-running Hermes dispatch.
+
+This module owns the tiny latest-state file at
+``{HERMES_HOME}/state/current-work.json``.  It is intentionally small: the file
+is a current truth anchor, not a narrative log.  Gateway status, structured task
+updates, post-compression checks, and future stuck-task detection should all read
+from this same source instead of inferring active work from stale conversation
+history.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+import json
+from pathlib import Path
+from typing import Any, Iterable
+
+from hermes_constants import get_hermes_home
+from utils import atomic_json_write
+
+
+_STATE_RELATIVE_PATH = Path("state") / "current-work.json"
+
+
+def state_file_path() -> Path:
+    """Return the profile-aware current-work state path.
+
+    The path is resolved at call time so tests and profile-specific gateway
+    processes can set ``HERMES_HOME`` without fighting module-level globals.
+    """
+
+    return get_hermes_home() / _STATE_RELATIVE_PATH
+
+
+@dataclass(slots=True)
+class CurrentWork:
+    """Latest active-work state.
+
+    Keep this schema intentionally compact.  It is safe for newer writers to add
+    fields later because :meth:`from_dict` ignores unknown keys.
+    """
+
+    linear_id: str | None = None
+    title: str | None = None
+    phase: str | None = None
+    dispatcher: str | None = None
+    eta_minutes: int | None = None
+    last_user_message_verbatim: str | None = None
+    last_phase_change_at: str | None = None
+    last_tool_call_at: str | None = None
+    last_diff_fingerprint: str | None = None
+    queue: list[str] = field(default_factory=list)
+    anomalies: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "linear_id": self.linear_id,
+            "title": self.title,
+            "phase": self.phase,
+            "dispatcher": self.dispatcher,
+            "eta_minutes": self.eta_minutes,
+            "last_user_message_verbatim": self.last_user_message_verbatim,
+            "last_phase_change_at": self.last_phase_change_at,
+            "last_tool_call_at": self.last_tool_call_at,
+            "last_diff_fingerprint": self.last_diff_fingerprint,
+            "queue": list(self.queue),
+            "anomalies": list(self.anomalies),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "CurrentWork":
+        if not isinstance(raw, dict):
+            return cls()
+        known = {f.name for f in fields(cls)}
+        data = {k: v for k, v in raw.items() if k in known}
+        for key in ("queue", "anomalies"):
+            value = data.get(key)
+            if value is None:
+                data[key] = []
+            elif isinstance(value, list):
+                data[key] = [str(v) for v in value]
+            else:
+                data[key] = [str(value)]
+        eta = data.get("eta_minutes")
+        if eta is not None and not isinstance(eta, int):
+            try:
+                data["eta_minutes"] = int(eta)
+            except (TypeError, ValueError):
+                data["eta_minutes"] = None
+        return cls(**data)
+
+
+def read_current_work(path: Path | None = None) -> CurrentWork | None:
+    """Read current-work state, returning ``None`` if absent/corrupt.
+
+    Corrupt state should not crash the caller during recovery paths.  Callers can
+    decide whether to overwrite, render an anomaly, or escalate.
+    """
+
+    path = path or state_file_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return CurrentWork.from_dict(raw)
+
+
+def write_current_work(work: CurrentWork, path: Path | None = None) -> None:
+    """Persist current-work state atomically."""
+
+    atomic_json_write(path or state_file_path(), work.to_dict(), indent=2)
+
+
+def update_current_work(path: Path | None = None, **updates: Any) -> CurrentWork:
+    """Merge fields into current-work state and persist the result."""
+
+    current = read_current_work(path) or CurrentWork()
+    data = current.to_dict()
+    known = {f.name for f in fields(CurrentWork)}
+    for key, value in updates.items():
+        if key in known:
+            data[key] = value
+    updated = CurrentWork.from_dict(data)
+    write_current_work(updated, path)
+    return updated
+
+
+def _text_from_content_parts(parts: Iterable[Any]) -> tuple[str, bool]:
+    """Return text from content parts plus whether a real text part existed."""
+
+    text_parts: list[str] = []
+    saw_text = False
+    for part in parts:
+        if isinstance(part, str):
+            if part:
+                saw_text = True
+                text_parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "tool_result":
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text:
+            saw_text = True
+            text_parts.append(text)
+    return "\n".join(text_parts).strip(), saw_text
+
+
+def extract_latest_user_message(messages: list[dict[str, Any]] | None) -> str | None:
+    """Extract the latest real user text from an OpenAI-style message list.
+
+    Tool-result-only user messages are skipped because some adapters encode tool
+    results as ``role=user``; those must not overwrite MJ's latest instruction.
+    """
+
+    if not messages:
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            stripped = content.strip()
+            return stripped or None
+        if isinstance(content, list):
+            text, saw_text = _text_from_content_parts(content)
+            if saw_text:
+                return text or None
+            continue
+        if content is not None:
+            text = str(content).strip()
+            if text:
+                return text
+    return None
+
+
+class CurrentWorkMismatchError(RuntimeError):
+    """Raised when post-compression state disagrees with live user intent."""
+
+    def __init__(self, result: "MismatchResult") -> None:
+        self.result = result
+        super().__init__(result.reason)
+
+
+@dataclass(slots=True)
+class MismatchResult:
+    """Result of comparing persisted active-work state to live user intent."""
+
+    matched: bool
+    should_halt: bool
+    reason: str = ""
+    stale_message: str | None = None
+    latest_message: str | None = None
+    work: CurrentWork | None = None
+
+
+def _norm_message(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.strip()
+
+
+def check_post_compression_mismatch(
+    *,
+    latest_user_message: str | None,
+    work: CurrentWork | None = None,
+) -> MismatchResult:
+    """Compare active-work state with the latest user message after compaction.
+
+    Missing state or missing comparable messages should not halt: false positives
+    would be worse than no guard on fresh sessions.  A mismatch means the compacted
+    handoff may be stale relative to MJ's latest instruction, so callers should
+    stop continuation and surface status/escalation.
+    """
+
+    work = work if work is not None else read_current_work()
+    if work is None:
+        return MismatchResult(matched=True, should_halt=False, reason="no current-work state")
+
+    stale = _norm_message(work.last_user_message_verbatim)
+    latest = _norm_message(latest_user_message)
+    if not stale:
+        return MismatchResult(matched=True, should_halt=False, reason="current-work has no recorded user message", work=work)
+    if not latest:
+        return MismatchResult(matched=True, should_halt=False, reason="no latest user message available", stale_message=stale, work=work)
+    if stale == latest:
+        return MismatchResult(matched=True, should_halt=False, reason="current-work matches latest user message", stale_message=stale, latest_message=latest, work=work)
+
+    ident = work.linear_id or "active work"
+    return MismatchResult(
+        matched=False,
+        should_halt=True,
+        reason=(
+            f"current-work mismatch for {ident}: persisted last user message "
+            "differs from latest live user message; stop stale continuation and surface /status."
+        ),
+        stale_message=stale,
+        latest_message=latest,
+        work=work,
+    )
+
+
+def check_post_compression_messages(messages: list[dict[str, Any]]) -> MismatchResult:
+    """Convenience wrapper for compression/session-hygiene callers."""
+
+    return check_post_compression_mismatch(
+        latest_user_message=extract_latest_user_message(messages)
+    )
+
+
+def render_status(work: CurrentWork | None = None) -> str:
+    """Render a compact human-readable status snapshot from current-work state."""
+
+    if work is None:
+        work = read_current_work()
+    if work is None:
+        return "No active work recorded."
+
+    def val(value: Any, fallback: str = "unknown") -> str:
+        if value is None:
+            return fallback
+        text = str(value).strip()
+        return text if text else fallback
+
+    lines = [
+        f"Active task: {val(work.linear_id)} — {val(work.title)}",
+        f"Phase: {val(work.phase)}",
+        f"Dispatcher: {val(work.dispatcher)}",
+        f"ETA: {val(work.eta_minutes)}min" if work.eta_minutes is not None else "ETA: unknown",
+        f"Queue: {', '.join(work.queue) if work.queue else 'empty'}",
+        f"Last user message: {val(work.last_user_message_verbatim, 'not recorded')}",
+        f"Last diff/progress: {val(work.last_diff_fingerprint, 'not recorded')}",
+    ]
+    if work.anomalies:
+        lines.append("Anomalies:")
+        lines.extend(f"- {item}" for item in work.anomalies)
+    else:
+        lines.append("Anomalies: none")
+    return "\n".join(lines)

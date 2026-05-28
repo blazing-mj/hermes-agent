@@ -36,6 +36,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+from agent.current_work import (
+    CurrentWorkMismatchError,
+    check_post_compression_messages,
+    render_status,
+)
 from agent.model_metadata import estimate_request_tokens_rough
 
 logger = logging.getLogger(__name__)
@@ -320,7 +325,7 @@ def compress_context(
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
 
     # If compression aborted (aux LLM failed to produce a usable summary)
-    # the compressor returns the input messages unchanged.  Surface the
+    # the compressor returns the input messages unchanged. Surface the
     # error to the user, skip the session-rotation work entirely (no
     # session has logically ended), and let auto-compress callers detect
     # the no-op via len(returned) == len(input).
@@ -337,6 +342,27 @@ def compress_context(
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
         return messages, _existing_sp
+
+    # AGENTS-66: compression is the danger point where a stale handoff can
+    # dominate the next turn. Compare canonical current-work state against the
+    # latest live user message before the caller continues with compressed
+    # history. A mismatch raises to stop stale continuation; gateway/CLI callers
+    # surface the exception instead of silently doing old work.
+    try:
+        _cw_result = check_post_compression_messages(compressed)
+        setattr(agent, "_current_work_mismatch", _cw_result if _cw_result.should_halt else None)
+        if _cw_result.should_halt:
+            _status = render_status(_cw_result.work)
+            _message = f"⚠ Current-work mismatch after compression — stopping stale continuation.\n{_status}"
+            try:
+                agent._emit_warning(_message)
+            except Exception:
+                logger.warning(_message)
+            raise CurrentWorkMismatchError(_cw_result)
+    except CurrentWorkMismatchError:
+        raise
+    except Exception as _cw_err:
+        logger.debug("current-work post-compression guard skipped: %s", _cw_err)
 
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
     if summary_error:
