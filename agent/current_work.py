@@ -54,7 +54,7 @@ class CurrentWork:
     """Latest active-work state.
 
     Keep this schema intentionally compact.  It is safe for newer writers to add
-    fields later because :meth:`from_dict` ignores unknown keys.
+    fields because ``from_dict`` ignores unknown keys.
     """
 
     linear_id: str | None = None
@@ -66,22 +66,20 @@ class CurrentWork:
     last_phase_change_at: str | None = None
     last_tool_call_at: str | None = None
     last_diff_fingerprint: str | None = None
+    last_heartbeat_at: str | None = None
+    heartbeat_phase: str | None = None
+    heartbeat_diff_fingerprint: str | None = None
+    heartbeat_streak: int = 0
+    stuck_signal_at: str | None = None
+    stuck_reason: str | None = None
     queue: list[str] = field(default_factory=list)
     anomalies: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "linear_id": self.linear_id,
-            "title": self.title,
-            "phase": self.phase,
-            "dispatcher": self.dispatcher,
-            "eta_minutes": self.eta_minutes,
-            "last_user_message_verbatim": self.last_user_message_verbatim,
-            "last_phase_change_at": self.last_phase_change_at,
-            "last_tool_call_at": self.last_tool_call_at,
-            "last_diff_fingerprint": self.last_diff_fingerprint,
-            "queue": list(self.queue),
-            "anomalies": list(self.anomalies),
+            field_def.name: list(value) if isinstance(value, list) else value
+            for field_def in fields(self)
+            if (value := getattr(self, field_def.name)) is not None
         }
 
     @classmethod
@@ -194,6 +192,17 @@ def extract_latest_user_message(messages: list[dict[str, Any]] | None) -> str | 
     return None
 
 
+@dataclass(slots=True)
+class StuckCheckResult:
+    """Outcome from recording one active-work heartbeat."""
+
+    stuck: bool
+    streak: int
+    phase: str | None
+    last_diff_fingerprint: str | None
+    message: str | None = None
+
+
 class CurrentWorkMismatchError(RuntimeError):
     """Raised when post-compression state disagrees with live user intent."""
 
@@ -265,6 +274,56 @@ def check_post_compression_messages(messages: list[dict[str, Any]]) -> MismatchR
 
     return check_post_compression_mismatch(
         latest_user_message=extract_latest_user_message(messages)
+    )
+
+
+def record_heartbeat(work: CurrentWork | None = None, *, now: str | None = None) -> StuckCheckResult:
+    """Record one 30-minute heartbeat and detect unchanged phase+diff streaks.
+
+    Detection deliberately uses only ``CurrentWork.phase`` and
+    ``CurrentWork.last_diff_fingerprint`` as MJ requested.  The extra heartbeat
+    fields store comparison state; they are not an alternate progress signal.
+    """
+
+    work = work or read_current_work() or CurrentWork()
+    now = now or datetime.now(timezone.utc).isoformat()
+    same_phase = work.phase == work.heartbeat_phase
+    same_diff = work.last_diff_fingerprint == work.heartbeat_diff_fingerprint
+    has_baseline = bool(work.heartbeat_phase or work.heartbeat_diff_fingerprint)
+    if has_baseline and same_phase and same_diff:
+        streak = max(1, int(work.heartbeat_streak or 1)) + 1
+    else:
+        streak = 1
+        work.stuck_signal_at = None
+        work.stuck_reason = None
+
+    work.last_heartbeat_at = now
+    work.heartbeat_phase = work.phase
+    work.heartbeat_diff_fingerprint = work.last_diff_fingerprint
+    work.heartbeat_streak = streak
+
+    stuck = streak >= 2 and has_baseline and same_phase and same_diff
+    message = None
+    if stuck:
+        ident = _val(work.linear_id, "Active task")
+        message = f"⚠️ {ident} may be stuck — same phase 60min, no diff progress"
+        work.stuck_signal_at = now
+        work.stuck_reason = message
+        if message not in work.anomalies:
+            work.anomalies.append(message)
+    write_current_work(work)
+    append_lifecycle_event(
+        "heartbeat",
+        work,
+        elapsed_minutes=30 * streak,
+        stuck_signal=stuck,
+    )
+    return StuckCheckResult(
+        stuck=stuck,
+        streak=streak,
+        phase=work.phase,
+        last_diff_fingerprint=work.last_diff_fingerprint,
+        message=message,
     )
 
 
@@ -341,6 +400,19 @@ def append_lifecycle_event(
     if event not in _LIFECYCLE_EVENTS:
         raise ValueError(f"unknown lifecycle event: {event}")
     work = work or read_current_work() or CurrentWork()
+    render_details = {
+        key: details[key]
+        for key in (
+            "elapsed_minutes",
+            "old_dispatcher",
+            "new_dispatcher",
+            "reason",
+            "verifier",
+            "audit_rounds",
+            "files_changed",
+        )
+        if key in details
+    }
     record: dict[str, Any] = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "event": event,
@@ -350,7 +422,7 @@ def append_lifecycle_event(
         "dispatcher": work.dispatcher,
         "eta_minutes": work.eta_minutes,
         "last_diff_fingerprint": work.last_diff_fingerprint,
-        "message": render_lifecycle_event(event, work, **details),
+        "message": render_lifecycle_event(event, work, **render_details),
     }
     for key, value in details.items():
         if value is not None:
@@ -380,7 +452,9 @@ def render_status(work: CurrentWork | None = None) -> str:
         f"Last phase change: {_val(work.last_phase_change_at, 'not recorded')}",
         f"Last tool call: {_val(work.last_tool_call_at, 'not recorded')}",
         f"Last diff/progress: {_val(work.last_diff_fingerprint, 'not recorded')}",
-        "Stuck risk: not evaluated yet",
+        f"Last heartbeat: {_val(work.last_heartbeat_at, 'not recorded')}",
+        f"Heartbeat streak: {work.heartbeat_streak}",
+        f"Stuck risk: {work.stuck_reason or 'clear'}",
     ]
     if work.anomalies:
         lines.append("Anomalies:")

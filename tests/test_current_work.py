@@ -24,11 +24,13 @@ from agent.current_work import (
     CurrentWork,
     CurrentWorkMismatchError,
     MismatchResult,
+    StuckCheckResult,
     append_lifecycle_event,
     check_post_compression_mismatch,
     extract_latest_user_message,
     lifecycle_log_path,
     read_current_work,
+    record_heartbeat,
     render_lifecycle_event,
     render_status,
     state_file_path,
@@ -375,7 +377,7 @@ class TestRenderStatus:
             )
         )
         assert "Last diff/progress: diff:abc123" in rendered
-        assert "Stuck risk: not evaluated yet" in rendered
+        assert "Stuck risk: clear" in rendered
 
 
 # ── Lifecycle renderer/log ───────────────────────────────────────────────
@@ -439,6 +441,87 @@ class TestLifecycleEvents:
         assert path.name == "lifecycle.jsonl"
         assert path.parent.name == "logs"
         assert str(path).startswith(os.environ["HERMES_HOME"])
+
+
+# ── Stuck detection ─────────────────────────────────────────────────────
+
+
+class TestStuckDetection:
+    def test_two_same_phase_same_diff_heartbeats_trigger_warning(self):
+        write_current_work(
+            CurrentWork(
+                linear_id="AGENTS-67",
+                phase="implementation",
+                last_diff_fingerprint="diff:abc123",
+            )
+        )
+        first = record_heartbeat(now="2026-05-28T18:00:00Z")
+        second = record_heartbeat(now="2026-05-28T18:30:00Z")
+
+        assert isinstance(second, StuckCheckResult)
+        assert first.stuck is False
+        assert second.stuck is True
+        assert second.streak == 2
+        assert second.message == (
+            "⚠️ AGENTS-67 may be stuck — same phase 60min, no diff progress"
+        )
+        work = read_current_work()
+        assert work is not None
+        assert work.stuck_reason == second.message
+        assert second.message in work.anomalies
+
+    def test_changed_diff_fingerprint_resets_stuck_counter(self):
+        write_current_work(
+            CurrentWork(
+                linear_id="AGENTS-67",
+                phase="implementation",
+                last_diff_fingerprint="diff:abc123",
+            )
+        )
+        record_heartbeat(now="2026-05-28T18:00:00Z")
+        updated = update_current_work(last_diff_fingerprint="diff:def456")
+        second = record_heartbeat(updated, now="2026-05-28T18:30:00Z")
+
+        assert second.stuck is False
+        assert second.streak == 1
+        work = read_current_work()
+        assert work is not None
+        assert work.stuck_reason is None
+        assert work.heartbeat_diff_fingerprint == "diff:def456"
+
+    def test_phase_transition_resets_stuck_counter(self):
+        write_current_work(
+            CurrentWork(
+                linear_id="AGENTS-67",
+                phase="implementation",
+                last_diff_fingerprint="diff:abc123",
+            )
+        )
+        record_heartbeat(now="2026-05-28T18:00:00Z")
+        updated = update_current_work(phase="verification")
+        second = record_heartbeat(updated, now="2026-05-28T18:30:00Z")
+
+        assert second.stuck is False
+        assert second.streak == 1
+        work = read_current_work()
+        assert work is not None
+        assert work.heartbeat_phase == "verification"
+
+    def test_heartbeat_appends_lifecycle_log_with_stuck_flag(self):
+        write_current_work(
+            CurrentWork(
+                linear_id="AGENTS-67",
+                phase="implementation",
+                last_diff_fingerprint="diff:abc123",
+            )
+        )
+        record_heartbeat(now="2026-05-28T18:00:00Z")
+        record_heartbeat(now="2026-05-28T18:30:00Z")
+        lines = lifecycle_log_path().read_text(encoding="utf-8").splitlines()
+        heartbeat = json.loads(lines[-1])
+        assert heartbeat["event"] == "heartbeat"
+        assert heartbeat["stuck_signal"] is True
+        assert heartbeat["last_diff_fingerprint"] == "diff:abc123"
 
 
 # ── Compression insertion point ─────────────────────────────────────────
