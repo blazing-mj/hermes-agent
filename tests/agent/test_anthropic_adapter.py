@@ -29,6 +29,15 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def no_real_claude_code_keychain(monkeypatch):
+    """Unit tests in this file use temp credential files/env; never read MJ's real Keychain."""
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -388,6 +397,48 @@ class TestRefreshOauthToken:
         assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
         assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
 
+    def test_keychain_refresh_writes_full_payload_to_keychain_not_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        creds = {
+            "accessToken": "old-token",
+            "refreshToken": "refresh-123",
+            "expiresAt": int(time.time() * 1000) - 3600_000,
+            "source": "macos_keychain",
+            "claudeAiOauth": {
+                "accessToken": "old-token",
+                "refreshToken": "refresh-123",
+                "expiresAt": int(time.time() * 1000) - 3600_000,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "max",
+            },
+        }
+
+        refreshed = {
+            "access_token": "new-token-abc",
+            "refresh_token": "new-refresh-456",
+            "expires_at_ms": 9999999999999,
+        }
+
+        with patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value=refreshed), \
+             patch("agent.anthropic_adapter._write_claude_code_credentials") as mock_file_write, \
+             patch("agent.anthropic_adapter._write_claude_code_credentials_to_keychain", create=True) as mock_keychain_write:
+            result = _refresh_oauth_token(creds)
+
+        assert result == "new-token-abc"
+        mock_file_write.assert_not_called()
+        mock_keychain_write.assert_called_once()
+        payload = mock_keychain_write.call_args.args[0]
+        oauth = payload["claudeAiOauth"]
+        assert oauth["accessToken"] == "new-token-abc"
+        assert oauth["refreshToken"] == "new-refresh-456"
+        assert oauth["expiresAt"] == 9999999999999
+        assert oauth["scopes"] == ["user:profile", "user:inference"]
+        assert oauth["subscriptionType"] == "max"
+        assert oauth["rateLimitTier"] == "max"
+        assert not (tmp_path / ".claude" / ".credentials.json").exists()
+
     def test_failed_refresh_returns_none(self):
         creds = {
             "accessToken": "old",
@@ -438,6 +489,33 @@ class TestWriteClaudeCodeCredentials:
         assert cred_file.exists()
         mode = _stat.S_IMODE(cred_file.stat().st_mode)
         assert mode == 0o600, f"creds file mode {oct(mode)} != 0o600 — TOCTOU race regressed"
+
+    def test_preserves_claude_code_max_metadata(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        cred_dir = tmp_path / ".claude"
+        cred_dir.mkdir()
+        cred_file = cred_dir / ".credentials.json"
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "old-tok",
+                "refreshToken": "old-ref",
+                "expiresAt": 1,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "max",
+            }
+        }))
+
+        _write_claude_code_credentials("new-tok", "new-ref", 99999)
+
+        data = json.loads(cred_file.read_text())
+        oauth = data["claudeAiOauth"]
+        assert oauth["accessToken"] == "new-tok"
+        assert oauth["refreshToken"] == "new-ref"
+        assert oauth["expiresAt"] == 99999
+        assert oauth["scopes"] == ["user:profile", "user:inference"]
+        assert oauth["subscriptionType"] == "max"
+        assert oauth["rateLimitTier"] == "max"
 
 
 class TestResolveWithRefresh:

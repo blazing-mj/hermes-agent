@@ -784,6 +784,16 @@ class CredentialPool:
             return None
 
         try:
+            pre_refresh_claude_code_creds = None
+            if self.provider == "anthropic" and entry.source == "claude_code":
+                try:
+                    from agent.anthropic_adapter import read_claude_code_credentials
+                    candidate = read_claude_code_credentials()
+                    if isinstance(candidate, dict) and candidate.get("refreshToken") == entry.refresh_token:
+                        pre_refresh_claude_code_creds = candidate
+                except Exception as sync_exc:
+                    logger.debug("Failed to read Claude Code credentials before pool refresh: %s", sync_exc)
+
             if self.provider == "anthropic":
                 from agent.anthropic_adapter import refresh_anthropic_oauth_pure
 
@@ -797,19 +807,18 @@ class CredentialPool:
                     refresh_token=refreshed["refresh_token"],
                     expires_at_ms=refreshed["expires_at_ms"],
                 )
-                # Keep ~/.claude/.credentials.json in sync so that the
-                # fallback path (resolve_anthropic_token) and other profiles
-                # see the latest tokens.
-                if entry.source == "claude_code":
+                # Keep the canonical Claude Code credential store in sync so
+                # fallback paths and other profiles see the latest tokens.  On
+                # macOS this means Keychain, not a degraded .credentials.json.
+                if entry.source == "claude_code" and pre_refresh_claude_code_creds:
                     try:
-                        from agent.anthropic_adapter import _write_claude_code_credentials
-                        _write_claude_code_credentials(
-                            refreshed["access_token"],
-                            refreshed["refresh_token"],
-                            refreshed["expires_at_ms"],
+                        from agent.anthropic_adapter import _persist_refreshed_claude_code_credentials
+                        _persist_refreshed_claude_code_credentials(
+                            pre_refresh_claude_code_creds,
+                            refreshed,
                         )
                     except Exception as wexc:
-                        logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
+                        logger.debug("Failed to write refreshed Claude Code credentials: %s", wexc)
             elif self.provider == "openai-codex":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another Hermes
@@ -889,14 +898,15 @@ class CredentialPool:
                         self._replace_entry(synced, updated)
                         self._persist()
                         try:
-                            from agent.anthropic_adapter import _write_claude_code_credentials
-                            _write_claude_code_credentials(
-                                refreshed["access_token"],
-                                refreshed["refresh_token"],
-                                refreshed["expires_at_ms"],
-                            )
+                            from agent.anthropic_adapter import _persist_refreshed_claude_code_credentials, read_claude_code_credentials
+                            retry_creds = read_claude_code_credentials()
+                            if isinstance(retry_creds, dict) and retry_creds.get("refreshToken") == synced.refresh_token:
+                                _persist_refreshed_claude_code_credentials(
+                                    retry_creds,
+                                    refreshed,
+                                )
                         except Exception as wexc:
-                            logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
+                            logger.debug("Failed to write refreshed Claude Code credentials (retry path): %s", wexc)
                         return updated
                     except Exception as retry_exc:
                         logger.debug("Retry refresh also failed: %s", retry_exc)

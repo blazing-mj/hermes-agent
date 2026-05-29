@@ -1057,6 +1057,59 @@ def test_load_pool_removes_stale_file_backed_singleton_entry(tmp_path, monkeypat
     assert auth_payload["credential_pool"]["anthropic"] == []
 
 
+def test_claude_code_pool_refresh_persists_to_canonical_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"anthropic": []}})
+
+    from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="claude-code",
+        label="claude-code",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="claude_code",
+        access_token="old-access",
+        refresh_token="old-refresh",
+        expires_at_ms=int(time.time() * 1000) - 60_000,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    canonical_creds = {
+        "source": "macos_keychain",
+        "accessToken": "old-access",
+        "refreshToken": "old-refresh",
+        "expiresAt": entry.expires_at_ms,
+        "claudeAiOauth": {
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": entry.expires_at_ms,
+            "scopes": ["user:profile", "user:inference"],
+            "subscriptionType": "max",
+        },
+    }
+    refreshed = {
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+        "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+    }
+    persisted = []
+
+    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: canonical_creds)
+    monkeypatch.setattr("agent.anthropic_adapter.refresh_anthropic_oauth_pure", lambda *a, **k: refreshed)
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._persist_refreshed_claude_code_credentials",
+        lambda creds, data: persisted.append((creds, data)),
+    )
+
+    updated = pool._refresh_entry(entry, force=False)
+
+    assert updated is not None
+    assert updated.access_token == "new-access"
+    assert updated.refresh_token == "new-refresh"
+    assert persisted == [(canonical_creds, refreshed)]
+
+
 def test_load_pool_migrates_nous_provider_state_preserves_tls(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(

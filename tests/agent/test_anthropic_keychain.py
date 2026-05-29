@@ -7,7 +7,9 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from agent.anthropic_adapter import (
+    _claude_code_keychain_account,
     _read_claude_code_credentials_from_keychain,
+    _write_claude_code_credentials_to_keychain,
     read_claude_code_credentials,
 )
 
@@ -73,15 +75,17 @@ class TestReadClaudeCodeCredentialsFromKeychain:
     def test_parses_valid_keychain_entry(self):
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
              patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            oauth_payload = {
+                "accessToken": "kc-access-token-abc",
+                "refreshToken": "kc-refresh-token-xyz",
+                "expiresAt": 9999999999999,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "max",
+            }
             mock_run.return_value = MagicMock(
                 returncode=0,
-                stdout=json.dumps({
-                    "claudeAiOauth": {
-                        "accessToken": "kc-access-token-abc",
-                        "refreshToken": "kc-refresh-token-xyz",
-                        "expiresAt": 9999999999999,
-                    }
-                }),
+                stdout=json.dumps({"claudeAiOauth": oauth_payload}),
                 stderr="",
             )
             creds = _read_claude_code_credentials_from_keychain()
@@ -90,6 +94,11 @@ class TestReadClaudeCodeCredentialsFromKeychain:
             assert creds["refreshToken"] == "kc-refresh-token-xyz"
             assert creds["expiresAt"] == 9999999999999
             assert creds["source"] == "macos_keychain"
+            # Preserve Claude Code metadata so a refresh can write a full
+            # Keychain payload instead of degrading Max auth into a bare token.
+            assert creds["claudeAiOauth"]["scopes"] == ["user:profile", "user:inference"]
+            assert creds["claudeAiOauth"]["subscriptionType"] == "max"
+            assert creds["claudeAiOauth"]["rateLimitTier"] == "max"
 
 
 class TestReadClaudeCodeCredentialsPriority:
@@ -163,3 +172,65 @@ class TestReadClaudeCodeCredentialsPriority:
             creds = read_claude_code_credentials()
 
         assert creds is None
+
+
+class TestWriteClaudeCodeCredentialsToKeychain:
+    def test_extracts_existing_keychain_account(self):
+        with patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='    "acct"<blob>="mj@blazeragency.com"\n',
+                stderr="",
+            )
+
+            assert _claude_code_keychain_account() == "mj@blazeragency.com"
+
+    def test_account_regex_miss_returns_none_not_user(self, monkeypatch):
+        monkeypatch.setenv("USER", "alfred")
+        with patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='    "acct"<blob>=<NULL>\n', stderr="")
+
+            assert _claude_code_keychain_account() is None
+
+    def test_writes_full_payload_with_existing_account(self):
+        payload = {
+            "claudeAiOauth": {
+                "accessToken": "new-access",
+                "refreshToken": "new-refresh",
+                "expiresAt": 9999999999999,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "max",
+            }
+        }
+
+        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
+             patch("agent.anthropic_adapter._claude_code_keychain_account", return_value="mj@blazeragency.com"), \
+             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            _write_claude_code_credentials_to_keychain(payload)
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:4] == ["security", "add-generic-password", "-U", "-s"]
+        assert "Claude Code-credentials" in cmd
+        assert "-a" in cmd
+        assert cmd[cmd.index("-a") + 1] == "mj@blazeragency.com"
+        secret = cmd[cmd.index("-w") + 1]
+        written = json.loads(secret)
+        oauth = written["claudeAiOauth"]
+        assert oauth["accessToken"] == "new-access"
+        assert oauth["refreshToken"] == "new-refresh"
+        assert oauth["subscriptionType"] == "max"
+        assert oauth["scopes"] == ["user:profile", "user:inference"]
+
+    def test_omits_account_when_existing_account_is_unknown(self):
+        with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \
+             patch("agent.anthropic_adapter._claude_code_keychain_account", return_value=None), \
+             patch("agent.anthropic_adapter.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            _write_claude_code_credentials_to_keychain({"claudeAiOauth": {"accessToken": "tok"}})
+
+        cmd = mock_run.call_args.args[0]
+        assert "-a" not in cmd

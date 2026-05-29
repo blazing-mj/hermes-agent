@@ -849,6 +849,11 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
                 "refreshToken": oauth_data.get("refreshToken", ""),
                 "expiresAt": oauth_data.get("expiresAt", 0),
                 "source": "macos_keychain",
+                # Preserve the full claudeAiOauth payload (scopes,
+                # subscriptionType, rateLimitTier, …) so a later refresh can
+                # write a complete Keychain payload instead of degrading Max
+                # auth into a bare token.
+                "claudeAiOauth": oauth_data,
             }
 
     return None
@@ -887,6 +892,9 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
                         "refreshToken": oauth_data.get("refreshToken", ""),
                         "expiresAt": oauth_data.get("expiresAt", 0),
                         "source": "claude_code_credentials_file",
+                        # Carry the full payload so refresh preserves scopes,
+                        # subscriptionType, rateLimitTier and other fields.
+                        "claudeAiOauth": oauth_data,
                     }
         except (json.JSONDecodeError, OSError, IOError) as e:
             logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
@@ -987,6 +995,84 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
     raise ValueError("Anthropic token refresh failed")
 
 
+def _claude_code_keychain_account() -> Optional[str]:
+    """Best-effort read of the existing Claude Code Keychain account name."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return os.environ.get("USER", "")
+
+    if result.returncode == 0:
+        import re
+        match = re.search(r'"acct"<blob>="([^"]*)"', result.stdout or "")
+        if match:
+            return match.group(1)
+        # The item exists, but its account could not be parsed. Do not guess
+        # `$USER`, because `security add-generic-password -U` matches on
+        # service+account and a wrong account can create a duplicate item.
+        return None
+    return os.environ.get("USER", "")
+
+
+def _write_claude_code_credentials_to_keychain(payload: Dict[str, Any]) -> None:
+    """Write the full Claude Code OAuth payload back to the macOS Keychain.
+
+    macOS Claude Code (>=2.1.114) treats the Keychain entry
+    "Claude Code-credentials" as canonical.  We update it in place so a
+    refreshed token — and its full Max metadata (scopes, subscriptionType,
+    rateLimitTier) — stays authoritative, rather than degrading into a
+    stripped ~/.claude/.credentials.json file.
+
+    *payload* is the complete ``{"claudeAiOauth": {...}}`` structure.
+    """
+    if platform.system() != "Darwin":
+        return
+
+    try:
+        secret = json.dumps(payload)
+        account = _claude_code_keychain_account()
+        cmd = [
+            "security", "add-generic-password",
+            "-U",
+            "-s", "Claude Code-credentials",
+            "-w", secret,
+        ]
+        if account:
+            cmd.extend(["-a", account])
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            logger.debug("Keychain: failed to write refreshed credentials: %s", result.stderr.strip())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.debug("Keychain: failed to write refreshed credentials: %s", e)
+
+
+def _persist_refreshed_claude_code_credentials(creds: Dict[str, Any], refreshed: Dict[str, Any]) -> None:
+    """Persist refreshed Claude Code OAuth tokens without degrading metadata."""
+    if creds.get("source") == "macos_keychain":
+        oauth_data = dict(creds.get("claudeAiOauth") or {})
+        oauth_data["accessToken"] = refreshed["access_token"]
+        oauth_data["refreshToken"] = refreshed["refresh_token"]
+        oauth_data["expiresAt"] = refreshed["expires_at_ms"]
+        _write_claude_code_credentials_to_keychain({"claudeAiOauth": oauth_data})
+        return
+
+    _write_claude_code_credentials(
+        refreshed["access_token"],
+        refreshed["refresh_token"],
+        refreshed["expires_at_ms"],
+    )
+
+
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     """Attempt to refresh an expired Claude Code OAuth token."""
     refresh_token = creds.get("refreshToken", "")
@@ -996,11 +1082,8 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
 
     try:
         refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
+
+        _persist_refreshed_claude_code_credentials(creds, refreshed)
         logger.debug("Successfully refreshed Claude Code OAuth token")
         return refreshed["access_token"]
     except Exception as e:
@@ -1029,17 +1112,16 @@ def _write_claude_code_credentials(
         if cred_path.exists():
             existing = json.loads(cred_path.read_text(encoding="utf-8"))
 
-        oauth_data: Dict[str, Any] = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
+        # Start from the existing payload so Max metadata (scopes,
+        # subscriptionType, rateLimitTier and any other fields) survives a
+        # token refresh, then overwrite only the rotated token fields.
+        prev_oauth = existing.get("claudeAiOauth")
+        oauth_data: Dict[str, Any] = dict(prev_oauth) if isinstance(prev_oauth, dict) else {}
+        oauth_data["accessToken"] = access_token
+        oauth_data["refreshToken"] = refresh_token
+        oauth_data["expiresAt"] = expires_at_ms
         if scopes is not None:
             oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-            # Preserve previously-stored scopes when the refresh response
-            # does not include a scope field.
-            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
 
         existing["claudeAiOauth"] = oauth_data
 
