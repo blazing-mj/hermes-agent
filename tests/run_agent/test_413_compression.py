@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import SUMMARY_PREFIX
+from agent.current_work import CurrentWorkMismatchError, MismatchResult
 from run_agent import AIAgent
 import run_agent
 
@@ -164,6 +165,45 @@ class TestHTTP413Compression:
         # If 413 were treated as generic 4xx, result would have "failed": True
         assert result.get("failed") is not True
         assert result["completed"] is True
+
+    def test_current_work_mismatch_during_compression_is_terminal(self, agent):
+        """A stale current-work guard must stop the turn, not retry compression.
+
+        Regression: CurrentWorkMismatchError raised from a compression attempt was
+        swallowed by the broad per-API-call exception handler. The next loop
+        iteration retried the model call and could re-enter compression, producing
+        repeated "Compacting context" / "Current-work mismatch" messages.
+        """
+        err_413 = _make_413_error()
+        ok_resp = _mock_response(content="should not be reached", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_413, ok_resp]
+
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.side_effect = CurrentWorkMismatchError(
+                MismatchResult(
+                    matched=False,
+                    should_halt=True,
+                    reason="current-work mismatch sentinel",
+                )
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        mock_compress.assert_called_once()
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["completed"] is False
+        assert result.get("failed") is True
+        assert result["error"] == "current-work mismatch sentinel"
+        assert result["final_response"] == "current-work mismatch sentinel"
 
     def test_413_error_message_detection(self, agent):
         """413 detected via error message string (no status_code attr)."""

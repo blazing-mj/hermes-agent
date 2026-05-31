@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from agent.anthropic_adapter import _is_oauth_token
 from agent.auxiliary_client import set_runtime_main
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.current_work import CurrentWorkMismatchError
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
@@ -576,7 +577,32 @@ def run_conversation(
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
-    
+
+    def _return_current_work_mismatch(exc: CurrentWorkMismatchError) -> Dict[str, Any]:
+        """Stop stale continuation exactly once; do not retry compression."""
+        final = str(exc)
+        messages.append({"role": "assistant", "content": final})
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "Failed to persist current-work mismatch terminal response",
+                exc_info=True,
+            )
+        try:
+            agent._cleanup_task_resources(effective_task_id)
+        except Exception:
+            logger.debug("cleanup after current-work mismatch failed", exc_info=True)
+        return {
+            "final_response": final,
+            "messages": messages,
+            "api_calls": getattr(agent, "_api_call_count", 0) or 0,
+            "completed": False,
+            "failed": True,
+            "error": final,
+            "current_work_mismatch": True,
+        }
+
     if not agent.quiet_mode:
         _print_preview = _summarize_user_message_for_log(user_message)
         agent._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
@@ -640,10 +666,13 @@ def run_conversation(
                 if _cmp_should_skip(agent):
                     break
                 _orig_len = len(messages)
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
+                try:
+                    messages, active_system_prompt = agent._compress_context(
+                        messages, system_message, approx_tokens=_preflight_tokens,
+                        task_id=effective_task_id,
+                    )
+                except CurrentWorkMismatchError as exc:
+                    return _return_current_work_mismatch(exc)
                 # Re-estimate after compression so the no-progress check
                 # below can compare pre/post tokens — and the loop's
                 # threshold-clearing decision uses fresh data.
@@ -2664,11 +2693,14 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
-                        messages, active_system_prompt = agent._compress_context(
-                            messages, system_message,
-                            approx_tokens=approx_tokens,
-                            task_id=effective_task_id,
-                        )
+                        try:
+                            messages, active_system_prompt = agent._compress_context(
+                                messages, system_message,
+                                approx_tokens=approx_tokens,
+                                task_id=effective_task_id,
+                            )
+                        except CurrentWorkMismatchError as exc:
+                            return _return_current_work_mismatch(exc)
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
                         # messages to the new session, not skipping them.
@@ -2838,10 +2870,13 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens,
+                            task_id=effective_task_id,
+                        )
+                    except CurrentWorkMismatchError as exc:
+                        return _return_current_work_mismatch(exc)
                     # Compression created a new session — clear history
                     # so _flush_messages_to_session_db writes compressed
                     # messages to the new session, not skipping them.
@@ -2994,10 +3029,13 @@ def run_conversation(
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     original_len = len(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens,
+                            task_id=effective_task_id,
+                        )
+                    except CurrentWorkMismatchError as exc:
+                        return _return_current_work_mismatch(exc)
                     # Compression created a new session — clear history
                     # so _flush_messages_to_session_db writes compressed
                     # messages to the new session, not skipping them.
@@ -3919,11 +3957,14 @@ def run_conversation(
                     and _compressor.should_compress(_real_tokens)
                 ):
                     agent._safe_print("  ⟳ compacting context…")
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
-                        task_id=effective_task_id,
-                    )
+                    try:
+                        messages, active_system_prompt = agent._compress_context(
+                            messages, system_message,
+                            approx_tokens=agent.context_compressor.last_prompt_tokens,
+                            task_id=effective_task_id,
+                        )
+                    except CurrentWorkMismatchError as exc:
+                        return _return_current_work_mismatch(exc)
                     # Compression created a new session — clear history so
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
