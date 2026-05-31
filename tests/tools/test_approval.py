@@ -13,6 +13,7 @@ from tools.approval import (
     _get_approval_mode,
     _smart_approve,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -44,6 +45,74 @@ class TestSmartApproval:
         assert mock_call.call_args.kwargs["task"] == "approval"
         assert mock_call.call_args.kwargs["temperature"] == 0
         assert mock_call.call_args.kwargs["max_tokens"] == 16
+
+    def test_smart_deny_escalates_to_user_approval_instead_of_terminal_block(self):
+        decisions = []
+
+        def approve_once(command, description, **kwargs):
+            decisions.append((command, description, kwargs))
+            return "once"
+
+        with mock_patch("tools.approval._get_approval_mode", return_value="smart"), \
+             mock_patch("tools.approval._smart_approve", return_value="deny"), \
+             mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
+            result = check_all_command_guards(
+                "hermes gateway restart", "local", approval_callback=approve_once
+            )
+
+        assert result["approved"] is True
+        assert result.get("user_approved") is True
+        assert len(decisions) == 1
+        assert decisions[0][0] == "hermes gateway restart"
+        assert "smart approval assessed this as high risk" in decisions[0][1]
+        assert decisions[0][2].get("allow_permanent") is False
+
+    def test_smart_deny_always_choice_is_capped_at_session_scope(self):
+        session_key = "smart-deny-session-cap"
+        pattern_key = detect_dangerous_command("hermes gateway restart")[1]
+        approval_module._session_approved.pop(session_key, None)
+        approval_module._permanent_approved.discard(pattern_key)
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            with mock_patch("tools.approval._get_approval_mode", return_value="smart"), \
+                 mock_patch("tools.approval._smart_approve", return_value="deny"), \
+                 mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
+                result = check_all_command_guards(
+                    "hermes gateway restart",
+                    "local",
+                    approval_callback=lambda *a, **k: "always",
+                )
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module._session_approved.pop(session_key, None)
+            approval_module._permanent_approved.discard(pattern_key)
+
+        assert result["approved"] is True
+        assert pattern_key not in approval_module._permanent_approved
+
+    def test_gateway_always_resolution_downgrades_when_permanent_not_allowed(self):
+        session_key = "smart-deny-gateway-cap"
+        entry = approval_module._ApprovalEntry({"allow_permanent": False})
+        approval_module._gateway_queues[session_key] = [entry]
+        try:
+            count = approval_module.resolve_gateway_approval(session_key, "always")
+        finally:
+            approval_module._gateway_queues.pop(session_key, None)
+
+        assert count == 1
+        assert entry.result == "session"
+        assert entry.event.is_set()
+
+    def test_hardline_command_still_blocks_before_smart_or_user_approval(self):
+        with mock_patch("tools.approval._get_approval_mode", return_value="smart"), \
+             mock_patch("tools.approval._smart_approve", return_value="deny"), \
+             mock_patch.dict("os.environ", {"HERMES_INTERACTIVE": "1"}, clear=False):
+            result = check_all_command_guards(
+                "rm -rf /", "local", approval_callback=lambda *a, **k: "once"
+            )
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
 
 
 class TestDetectDangerousRm:

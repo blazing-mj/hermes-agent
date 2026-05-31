@@ -568,7 +568,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
-        entry.result = choice
+        effective_choice = choice
+        if choice == "always" and entry.data.get("allow_permanent") is False:
+            effective_choice = "session"
+        entry.result = effective_choice
         entry.event.set()
     return len(targets)
 
@@ -1159,6 +1162,7 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
+    smart_denied_high_risk = False
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
@@ -1172,14 +1176,27 @@ def check_all_command_guards(command: str, env_type: str,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
         elif verdict == "deny":
-            combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-            return {
-                "approved": False,
-                "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
-                           "The command was assessed as genuinely dangerous. Do NOT retry.",
-                "smart_denied": True,
-            }
-        # verdict == "escalate" → fall through to manual prompt
+            smart_denied_high_risk = True
+            # Smart approval is a reviewer, not an irreversible authority.
+            # Hardline commands above remain unconditionally blocked, but a
+            # non-hardline smart DENY should escalate to explicit user approval
+            # instead of trapping the agent in a "Do NOT retry" dead end.  This
+            # lets a present operator approve controlled high-impact actions
+            # such as a gateway restart while preserving the safety prompt.
+            warnings = [
+                (
+                    key,
+                    f"{desc} (smart approval assessed this as high risk; explicit user approval required)",
+                    is_tirith,
+                )
+                for key, desc, is_tirith in warnings
+            ]
+            logger.info(
+                "Smart approval escalated high-risk command to user approval: %s (%s)",
+                command[:120],
+                combined_desc_for_llm,
+            )
+        # verdict == "escalate" or smart deny → fall through to manual prompt
 
     # --- Phase 3: Approval ---
 
@@ -1188,6 +1205,7 @@ def check_all_command_guards(command: str, env_type: str,
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
+    permanent_approval_allowed = not (has_tirith or smart_denied_high_risk)
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous
@@ -1207,6 +1225,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
+                "allow_permanent": permanent_approval_allowed,
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:
@@ -1339,9 +1358,16 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
 
-            # User approved — persist based on scope (same logic as CLI)
+            # User approved — persist based on scope (same logic as CLI).
+            # High-risk smart denials may be approved by a present operator,
+            # but never promoted to permanent broad allowlists; treat an
+            # "always" click as session-scoped in that case.
             for key, _, is_tirith in warnings:
-                if choice == "session" or (choice == "always" and is_tirith):
+                if (
+                    choice == "session"
+                    or (choice == "always" and not permanent_approval_allowed)
+                    or (choice == "always" and is_tirith)
+                ):
                     approve_session(session_key, key)
                 elif choice == "always":
                     approve_session(session_key, key)
@@ -1385,7 +1411,7 @@ def check_all_command_guards(command: str, env_type: str,
         surface="cli",
     )
     choice = prompt_dangerous_approval(command, combined_desc,
-                                       allow_permanent=not has_tirith,
+                                       allow_permanent=permanent_approval_allowed,
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -1417,8 +1443,12 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Persist approval for each warning individually
     for key, _, is_tirith in warnings:
-        if choice == "session" or (choice == "always" and is_tirith):
-            # tirith: session only (no permanent broad allowlisting)
+        if (
+            choice == "session"
+            or (choice == "always" and not permanent_approval_allowed)
+            or (choice == "always" and is_tirith)
+        ):
+            # tirith/smart-high-risk: session only (no permanent broad allowlisting)
             approve_session(session_key, key)
         elif choice == "always":
             # dangerous patterns: permanent allowed
