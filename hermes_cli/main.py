@@ -11658,6 +11658,16 @@ def main():
         help="Target the Linux system-level gateway service",
     )
 
+    # gateway watchdog
+    gateway_watchdog = gateway_subparsers.add_parser(
+        "watchdog", help="Manage the macOS launchd-domain watchdog"
+    )
+    gateway_watchdog_sub = gateway_watchdog.add_subparsers(dest="gateway_watchdog_command")
+    gateway_watchdog_install = gateway_watchdog_sub.add_parser("install", help="Install gateway launchd watchdog")
+    gateway_watchdog_install.add_argument("--force", action="store_true", help="Force reinstall")
+    gateway_watchdog_sub.add_parser("uninstall", help="Uninstall gateway launchd watchdog")
+    gateway_watchdog_sub.add_parser("check", help="Run one watchdog check now")
+
     # gateway list
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 

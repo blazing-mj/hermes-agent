@@ -2899,6 +2899,271 @@ def launchd_plist_is_current() -> bool:
     return _normalize_launchd_plist_for_comparison(installed) == _normalize_launchd_plist_for_comparison(expected)
 
 
+# ---------------------------------------------------------------------------
+# Launchd domain-membership verification and atomic bootstrap helpers
+# ---------------------------------------------------------------------------
+
+def _launchd_verify_loaded(label: str, domain: str, *, retries: int = 3, retry_delay: float = 0.5) -> bool:
+    """Return True when *label* is present in *domain* according to launchctl print.
+
+    `launchctl print` exits non-zero when the service is absent from the domain,
+    which is more reliable than `launchctl list` (which only covers legacy flat
+    lists and can return stale data).
+    """
+    import time as _time
+
+    for attempt in range(max(1, retries)):
+        if attempt > 0:
+            _time.sleep(retry_delay)
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    return False
+
+
+def _launchd_bootstrap_and_verify(
+    plist_path: Path,
+    label: str,
+    domain: str,
+    *,
+    retries: int = 3,
+    retry_delay: float = 1.0,
+) -> bool:
+    """Bootstrap *plist_path* into *domain* and verify *label* is loaded.
+
+    Retries up to *retries* times with *retry_delay* seconds between attempts.
+    Returns True once verification succeeds, False if all retries are exhausted.
+    """
+    import time as _time
+
+    for attempt in range(max(1, retries)):
+        if attempt > 0:
+            _time.sleep(retry_delay)
+            logger.debug("launchd bootstrap retry %d/%d for %s", attempt + 1, retries, label)
+        try:
+            subprocess.run(
+                ["launchctl", "bootstrap", domain, str(plist_path)],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning("launchd bootstrap attempt %d failed: %s", attempt + 1, exc)
+            continue
+        if _launchd_verify_loaded(label, domain, retries=2, retry_delay=0.5):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Self-restart churn guard
+# ---------------------------------------------------------------------------
+
+class _LaunchdRestartGuard:
+    """Persist launchd restart timestamps and refuse rapid churn.
+
+    Timestamps are stored in a JSON file so the guard survives across
+    separate `hermes gateway restart` invocations and watchdog cycles.
+
+    Args:
+        state_path: Path to the JSON state file.
+        max_restarts: Maximum allowed restarts within *window_seconds*.
+        window_seconds: Rolling window length in seconds.
+    """
+
+    def __init__(
+        self,
+        state_path: Path,
+        *,
+        max_restarts: int = 5,
+        window_seconds: float = 600.0,
+    ) -> None:
+        self._path = state_path
+        self._max = max_restarts
+        self._window = window_seconds
+
+    def _load(self) -> list:
+        import json as _json
+
+        try:
+            data = _json.loads(self._path.read_text(encoding="utf-8"))
+            return [float(ts) for ts in (data.get("restarts") or [])]
+        except (OSError, ValueError, KeyError, TypeError):
+            return []
+
+    def _save(self, timestamps: list) -> None:
+        import json as _json
+
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                _json.dumps({"restarts": timestamps}), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def check_and_record(self) -> bool:
+        """Return True (and record) when a restart is within limits; False otherwise.
+
+        Prunes timestamps outside the rolling window before checking. Returns
+        False without recording when the count would exceed *max_restarts*.
+        """
+        import time as _time
+
+        wall_now = _time.time()
+        cutoff = wall_now - self._window
+        timestamps = [t for t in self._load() if t >= cutoff]
+
+        if len(timestamps) >= self._max:
+            return False
+
+        timestamps.append(wall_now)
+        self._save(timestamps)
+        return True
+
+    def restart_count_in_window(self) -> int:
+        """Return how many restarts have been recorded in the current window."""
+        import time as _time
+
+        wall_now = _time.time()
+        cutoff = wall_now - self._window
+        return sum(1 for t in self._load() if t >= cutoff)
+
+
+def _launchd_restart_guard() -> "_LaunchdRestartGuard":
+    """Return the default restart guard scoped to the current HERMES_HOME."""
+    state_path = get_hermes_home() / "state" / "gateway-restart-guard.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    return _LaunchdRestartGuard(
+        state_path, max_restarts=5, window_seconds=600.0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Watchdog label / plist helpers
+# ---------------------------------------------------------------------------
+
+def get_launchd_watchdog_label() -> str:
+    """Return the launchd watchdog service label, scoped per profile."""
+    suffix = _profile_suffix()
+    return f"ai.hermes.gateway.watchdog-{suffix}" if suffix else "ai.hermes.gateway.watchdog"
+
+
+def get_launchd_watchdog_plist_path() -> Path:
+    """Return the launchd watchdog plist path, scoped per profile."""
+    suffix = _profile_suffix()
+    name = f"ai.hermes.gateway.watchdog-{suffix}" if suffix else "ai.hermes.gateway.watchdog"
+    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+
+
+def generate_launchd_watchdog_plist() -> str:
+    """Generate the launchd plist for the gateway watchdog daemon."""
+    python_path = get_python_path()
+    working_dir = str(PROJECT_ROOT)
+    hermes_home = str(get_hermes_home().resolve())
+    log_dir = get_hermes_home() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    label = get_launchd_watchdog_label()
+    watchdog_script = str(PROJECT_ROOT / "scripts" / "hermes-gateway-watchdog")
+
+    detected_venv = _detect_venv_dir()
+    venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
+    priority_dirs = _build_service_path_dirs()
+    sane_path = ":".join(
+        dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
+    )
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python_path}</string>
+        <string>{watchdog_script}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{sane_path}</string>
+        <key>VIRTUAL_ENV</key>
+        <string>{venv_dir}</string>
+        <key>HERMES_HOME</key>
+        <string>{hermes_home}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>StandardOutPath</key>
+    <string>{log_dir}/gateway-watchdog.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/gateway-watchdog.log</string>
+</dict>
+</plist>
+"""
+
+
+def launchd_install_watchdog(force: bool = False) -> None:
+    """Install the gateway watchdog as a launchd agent (macOS only)."""
+    watchdog_script = PROJECT_ROOT / "scripts" / "hermes-gateway-watchdog"
+    if not watchdog_script.exists():
+        print_error(f"Watchdog script not found: {watchdog_script}")
+        return
+
+    plist_path = get_launchd_watchdog_plist_path()
+    label = get_launchd_watchdog_label()
+    domain = _launchd_domain()
+
+    if plist_path.exists() and not force:
+        print(f"Watchdog already installed at: {plist_path}")
+        print("Use --force to reinstall")
+        return
+
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(generate_launchd_watchdog_plist(), encoding="utf-8")
+
+    loaded = _launchd_bootstrap_and_verify(plist_path, label, domain, retries=3)
+    if loaded:
+        print(f"✓ Watchdog installed and loaded ({label})")
+    else:
+        print_warning(f"Watchdog plist written but could not verify it loaded in {domain}.")
+        print_info(f"  Try manually: launchctl bootstrap {domain} {plist_path}")
+
+
+def launchd_uninstall_watchdog() -> None:
+    """Uninstall the gateway watchdog launchd agent (macOS only)."""
+    plist_path = get_launchd_watchdog_plist_path()
+    label = get_launchd_watchdog_label()
+    domain = _launchd_domain()
+
+    subprocess.run(
+        ["launchctl", "bootout", f"{domain}/{label}"],
+        check=False, capture_output=True, timeout=90,
+    )
+
+    if plist_path.exists():
+        plist_path.unlink()
+        print(f"✓ Removed {plist_path}")
+
+    print("✓ Watchdog uninstalled")
+
+
 def refresh_launchd_plist_if_needed() -> bool:
     """Rewrite the installed launchd plist when the generated definition has changed.
 
@@ -2912,9 +3177,14 @@ def refresh_launchd_plist_if_needed() -> bool:
 
     plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
     label = get_launchd_label()
-    # Bootout/bootstrap so launchd picks up the new definition
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
-    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=False, timeout=30)
+    domain = _launchd_domain()
+    # Bootout/bootstrap is only for definition refreshes.  Verify the job is
+    # back in the gui/<uid> domain before returning so this path cannot strand
+    # the gateway in launchd error 501.
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=False, timeout=90)
+    if not _launchd_bootstrap_and_verify(plist_path, label, domain, retries=3):
+        raise subprocess.CalledProcessError(113, ["launchctl", "bootstrap", domain, str(plist_path)])
+    subprocess.run(["launchctl", "kickstart", f"{domain}/{label}"], check=False, timeout=30)
     print("↻ Updated gateway launchd service definition to match the current Hermes install")
     return True
 
@@ -2936,7 +3206,13 @@ def launchd_install(force: bool = False):
     print(f"Installing launchd service to: {plist_path}")
     plist_path.write_text(generate_launchd_plist())
     
-    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+    if not _launchd_bootstrap_and_verify(plist_path, get_launchd_label(), _launchd_domain(), retries=3):
+        raise subprocess.CalledProcessError(113, ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)])
+
+    # Default-profile safety net: launchd KeepAlive cannot recover a job that
+    # has been removed from the domain, so install an independent watchdog.
+    if not _profile_suffix():
+        launchd_install_watchdog(force=force)
     
     print()
     print("✓ Service installed and loaded!")
@@ -2949,13 +3225,13 @@ def launchd_install(force: bool = False):
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
-    
+    if not _profile_suffix():
+        launchd_uninstall_watchdog()
+    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, capture_output=True, timeout=90)
     if plist_path.exists():
         plist_path.unlink()
-        print(f"✓ Removed {plist_path}")
-    
     print("✓ Service uninstalled")
+
 
 def launchd_start():
     plist_path = get_launchd_plist_path()
@@ -2966,7 +3242,8 @@ def launchd_start():
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        if not _launchd_bootstrap_and_verify(plist_path, label, _launchd_domain(), retries=3):
+            raise subprocess.CalledProcessError(113, ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)])
         subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
         print("✓ Service started")
         return
@@ -2978,7 +3255,8 @@ def launchd_start():
         if e.returncode not in {3, 113}:
             raise
         print("↻ launchd job was unloaded; reloading service definition")
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        if not _launchd_bootstrap_and_verify(plist_path, label, _launchd_domain(), retries=3):
+            raise subprocess.CalledProcessError(113, ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)])
         subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
     print("✓ Service started")
 
@@ -3052,6 +3330,14 @@ def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
+    guard = _launchd_restart_guard()
+    if not guard.check_and_record():
+        count = guard.restart_count_in_window()
+        print_warning(
+            f"Gateway restart guard blocked churn: {count} restarts already recorded in the last 10 minutes."
+        )
+        print_info("  Not restarting; investigate gateway-restart.log and gateway-exit-diag.log first.")
+        return
     from gateway.status import get_running_pid
 
     try:
@@ -3073,10 +3359,11 @@ def launchd_restart():
     except subprocess.CalledProcessError as e:
         if e.returncode not in {3, 113}:
             raise
-        # Job not loaded — bootstrap and start fresh
+        # Job not loaded — bootstrap and start fresh, then verify domain membership.
         print("↻ launchd job was unloaded; reloading")
         plist_path = get_launchd_plist_path()
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
+        if not _launchd_bootstrap_and_verify(plist_path, label, _launchd_domain(), retries=3):
+            raise subprocess.CalledProcessError(113, ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)])
         subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service restarted")
 
@@ -5024,6 +5311,103 @@ def gateway_setup():
 
 
 # =============================================================================
+# revive-all: manual recovery for down gateways across all profiles
+# =============================================================================
+
+def _cmd_gateway_revive_all(args):
+    """Revive all profile gateways that are not currently running."""
+    import time
+    from hermes_cli.profiles import list_profiles, _check_gateway_running
+    from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+    print("Reviving gateways across all profiles…")
+
+    profiles = list_profiles()
+    if not profiles:
+        print("  (no profiles found)")
+        return
+
+    results = []
+    for prof in profiles:
+        profile_home = prof.path
+        running = _check_gateway_running(profile_home)
+
+        if running:
+            pid_display = ""
+            try:
+                from gateway.status import get_running_pid
+                pid = get_running_pid(profile_home / "gateway.pid", cleanup_stale=False)
+                if pid is not None:
+                    pid_display = f"pid={pid}"
+            except Exception:
+                pass
+            label = f"✓ already running ({pid_display})" if pid_display else "✓ already running"
+            print(f"  {prof.name:<12} {label}")
+            results.append(True)
+        else:
+            print(f"  {prof.name:<12} ▲ launching…", end="", flush=True)
+
+            launch_env = os.environ.copy()
+            if not prof.is_default:
+                launch_env["HERMES_HOME"] = str(profile_home)
+
+            log_dir = profile_home / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file_path = log_dir / "gateway.log"
+
+            cmd = _gateway_run_args_for_profile(prof.name)
+            start_t = time.monotonic()
+            launch_ok = True
+            try:
+                with open(log_file_path, "a", encoding="utf-8") as _lf:
+                    subprocess.Popen(
+                        cmd,
+                        stdout=_lf,
+                        stderr=_lf,
+                        env=launch_env,
+                        **windows_detach_popen_kwargs(),
+                    )
+            except OSError as e:
+                print(f" ✗ failed to launch: {e}")
+                results.append(False)
+                launch_ok = False
+
+            if not launch_ok:
+                continue
+
+            time.sleep(3)
+            elapsed = time.monotonic() - start_t
+
+            now_running = _check_gateway_running(profile_home)
+            if now_running:
+                pid_display = ""
+                try:
+                    from gateway.status import get_running_pid
+                    pid = get_running_pid(profile_home / "gateway.pid", cleanup_stale=False)
+                    if pid is not None:
+                        pid_display = f"pid={pid}"
+                except Exception:
+                    pass
+                if pid_display:
+                    print(f" ✓ up ({pid_display}, took {elapsed:.1f}s)")
+                else:
+                    print(f" ✓ up (took {elapsed:.1f}s)")
+                results.append(True)
+            else:
+                log_display = str(log_file_path).replace(str(Path.home()), "~")
+                print(f" ✗ failed to start (see {log_display})")
+                results.append(False)
+
+    healthy = sum(results)
+    total = len(results)
+    print()
+    print(f"Result: {healthy}/{total} healthy")
+
+    if healthy < total:
+        sys.exit(1)
+
+
+# =============================================================================
 # Main Command Handler
 # =============================================================================
 
@@ -5681,6 +6065,21 @@ def _gateway_command_inner(args):
 
         # Show other profiles' gateway status for multi-profile awareness
         _print_other_profiles_gateway_status()
+
+    elif subcmd == "watchdog":
+        if not is_macos():
+            print("Gateway launchd watchdog is only supported on macOS.")
+            return
+        action = getattr(args, "gateway_watchdog_command", None) or "check"
+        if action == "install":
+            launchd_install_watchdog(force=getattr(args, "force", False))
+        elif action == "uninstall":
+            launchd_uninstall_watchdog()
+        elif action == "check":
+            from hermes_cli.gateway_watchdog import main as watchdog_main
+            rc = watchdog_main([])
+            if rc:
+                raise SystemExit(rc)
 
     elif subcmd == "list":
         _gateway_list()

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Launchd-domain watchdog entrypoint for the Hermes gateway."""
+from hermes_cli.gateway_watchdog import main
+import sys
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -749,6 +749,49 @@ from hermes_constants import get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
+
+def _gateway_service_restart_guard_allows(*, max_restarts: int = 5, window_seconds: float = 600.0) -> bool:
+    """Fail closed when service self-restarts churn too often.
+
+    This guards the exit-75 path: launchd KeepAlive should handle occasional
+    intentional restarts, but repeated service restarts in a short window mean
+    the gateway is thrashing and should alert instead of churning silently.
+    """
+    import json as _json
+    import time as _time
+
+    state_path = _hermes_home / "state" / "gateway-service-restart-guard.json"
+    now = _time.time()
+    cutoff = now - window_seconds
+    try:
+        data = _json.loads(state_path.read_text(encoding="utf-8"))
+        timestamps = [float(ts) for ts in data.get("restarts", []) if float(ts) >= cutoff]
+    except Exception:
+        timestamps = []
+
+    if len(timestamps) >= max_restarts:
+        logger.error(
+            "Gateway self-restart guard blocked churn: %s restarts in %.0fs",
+            len(timestamps), window_seconds,
+        )
+        try:
+            from hermes_cli.gateway_watchdog import _send_telegram_alert
+            _send_telegram_alert(
+                "🔴 Hermes default gateway self-restart guard blocked restart churn. "
+                "Investigate gateway-restart.log and gateway-exit-diag.log."
+            )
+        except Exception:
+            pass
+        return False
+
+    timestamps.append(now)
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(_json.dumps({"restarts": timestamps}), encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
@@ -6217,8 +6260,12 @@ class GatewayRunner:
                 self._increment_restart_failure_counts(set(active_agents.keys()))
 
             if self._restart_requested and self._restart_via_service:
-                self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
-                self._exit_reason = self._exit_reason or "Gateway restart requested"
+                if _gateway_service_restart_guard_allows():
+                    self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
+                    self._exit_reason = self._exit_reason or "Gateway restart requested"
+                else:
+                    self._exit_code = 1
+                    self._exit_reason = "Gateway self-restart guard blocked restart churn"
 
             self._draining = False
             self._update_runtime_status("stopped", self._exit_reason)

@@ -75,6 +75,7 @@ class TestSystemdServiceRefresh:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         gateway_cli.systemd_start()
 
@@ -105,6 +106,7 @@ class TestSystemdServiceRefresh:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         gateway_cli.systemd_restart()
 
@@ -523,6 +525,7 @@ class TestLaunchdServiceRecovery:
         assert calls == [
             ["launchctl", "kickstart", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
+            ["launchctl", "print", target],
             ["launchctl", "kickstart", target],
         ]
 
@@ -551,6 +554,7 @@ class TestLaunchdServiceRecovery:
         assert calls == [
             ["launchctl", "kickstart", target],
             ["launchctl", "bootstrap", domain, str(plist_path)],
+            ["launchctl", "print", target],
             ["launchctl", "kickstart", target],
         ]
 
@@ -679,6 +683,24 @@ class TestLaunchdServiceRecovery:
         assert "not loaded" in output.lower()
 
 
+    def test_launchd_restart_guard_blocks_churn(self, tmp_path, monkeypatch, capsys):
+        guard = gateway_cli._LaunchdRestartGuard(tmp_path / "guard.json", max_restarts=2, window_seconds=60)
+        monkeypatch.setattr(gateway_cli, "_launchd_restart_guard", lambda: guard)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        gateway_cli.launchd_restart()
+        gateway_cli.launchd_restart()
+        gateway_cli.launchd_restart()
+
+        output = capsys.readouterr().out.lower()
+        assert "blocked churn" in output
+
+
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
@@ -742,6 +764,7 @@ class TestGatewaySystemServiceRouting:
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(
@@ -788,6 +811,7 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
         monkeypatch.setattr(
@@ -849,6 +873,7 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
         monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         def fake_run_systemctl(args, **kwargs):
             calls.append(args)
@@ -882,6 +907,7 @@ class TestGatewaySystemServiceRouting:
             lambda: {"restart_requested": True, "gateway_state": "stopped"},
         )
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
 
         calls = []
         started = {"value": False}
