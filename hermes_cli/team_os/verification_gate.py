@@ -8,7 +8,10 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from .kill_switch import KillSwitch
 
 _RUNTIME_SMOKE_FILES = (
     "tests/test_current_work.py",
@@ -128,7 +131,29 @@ def build_verification_plan(
     return VerificationPlan(task_id=task_id, commands=tuple(commands), requires_full_smoke=requires_full_smoke)
 
 
-def run_verification_plan(plan: VerificationPlan, *, cwd: Path | None = None) -> VerificationReport:
+def run_verification_plan(
+    plan: VerificationPlan,
+    *,
+    cwd: Path | None = None,
+    kill_switch: KillSwitch | None = None,
+) -> VerificationReport:
+    if kill_switch is not None:
+        ks_status = kill_switch.status()
+        if ks_status.get("enabled") is True:
+            return VerificationReport(
+                task_id=plan.task_id,
+                status=VerificationStatus.FAILED,
+                can_close=False,
+                commands=(
+                    CommandResult(
+                        name="kill-switch",
+                        argv=(),
+                        exit_code=2,
+                        output=json.dumps(ks_status),
+                    ),
+                ),
+                proof_artifact=None,
+            )
     results: list[CommandResult] = []
     for command in plan.commands:
         completed = subprocess.run(  # noqa: S603

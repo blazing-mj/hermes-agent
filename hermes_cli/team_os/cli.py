@@ -29,6 +29,8 @@ from .quota import quota_status_unknown
 from .router import TaskHints, route_task
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
 
+DEFAULT_KILL_SWITCH_STATE = "~/.hermes/state/team-os-kill-switch.json"
+
 
 def build_snapshot(
     *,
@@ -404,7 +406,10 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
             else:
                 print(rendered_plan)
             return 0
-        report = run_verification_plan(plan, cwd=Path.cwd())
+        # Keep a defensive fallback for direct cmd_team_os callers that bypass argparse.
+        ks_state = getattr(args, "kill_switch_state", None) or DEFAULT_KILL_SWITCH_STATE
+        kill_switch = KillSwitch(Path(ks_state))
+        report = run_verification_plan(plan, cwd=Path.cwd(), kill_switch=kill_switch)
         if output:
             write_proof_artifact(report, output)
             print(str(output))
@@ -490,6 +495,53 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         else:
             print(rendered)
         return 0
+
+    if command == "render-template":
+        from .contracts import render_template  # noqa: PLC0415
+        role = getattr(args, "role", None)
+        try:
+            template = render_template(role)
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}, indent=2), file=sys.stderr)
+            return 1
+        rendered = json.dumps(template, indent=2, sort_keys=True)
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0
+
+    if command == "check-contract":
+        from .contracts import check_contract  # noqa: PLC0415
+        contract_file_str = getattr(args, "contract_file")
+        contract_path = Path(contract_file_str).expanduser()
+        try:
+            data = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(json.dumps({"error": str(exc), "valid": False}, indent=2), file=sys.stderr)
+            return 1
+        errors = check_contract(data)
+        result_data: dict = {"valid": not errors, "errors": errors}
+        rendered = json.dumps(result_data, indent=2, sort_keys=True)
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0 if not errors else 1
 
     if command != "snapshot":
         raise SystemExit(f"unknown team-os command: {command}")
@@ -609,6 +661,11 @@ def register_cli(parent) -> None:  # noqa: ANN001
     )
     verification_gate.add_argument("--output", help="Optional proof JSON output path")
     verification_gate.add_argument("--plan-only", action="store_true", help="Write selected commands without running them")
+    verification_gate.add_argument(
+        "--kill-switch-state",
+        default=DEFAULT_KILL_SWITCH_STATE,
+        help="Kill-switch JSON state file; missing == disabled, corrupt == fail closed",
+    )
     verification_gate.set_defaults(func=cmd_team_os)
 
     loop_runner = sub.add_parser(
@@ -629,7 +686,7 @@ def register_cli(parent) -> None:  # noqa: ANN001
     )
     loop_runner.add_argument(
         "--kill-switch-state",
-        default="~/.hermes/state/team-os-kill-switch.json",
+        default=DEFAULT_KILL_SWITCH_STATE,
         help="Phase 9A kill-switch JSON state file",
     )
     loop_runner.add_argument("--output", help="Optional decision JSON output path")
@@ -752,6 +809,7 @@ def register_cli(parent) -> None:  # noqa: ANN001
 
     _register_decompose_goal(sub)
     _register_kill_switch(sub)
+    _register_contracts(sub)
 
     parent.set_defaults(func=cmd_team_os)
 
@@ -802,3 +860,29 @@ def _register_kill_switch(sub) -> None:  # noqa: ANN001
     )
     ks.add_argument("--output", help="Optional JSON output path")
     ks.set_defaults(func=cmd_team_os)
+
+
+def _register_contracts(sub) -> None:  # noqa: ANN001
+    """Register render-template and check-contract subcommands (Phase 11 AGENTS-137)."""
+    render_tpl = sub.add_parser(
+        "render-template",
+        help="Phase 11: render a deterministic planner/worker/validator handoff template",
+    )
+    render_tpl.add_argument(
+        "role",
+        choices=["planner", "worker", "validator"],
+        help="Agent role: planner | worker | validator",
+    )
+    render_tpl.add_argument("--output", help="Optional JSON output path")
+    render_tpl.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
+
+    check_contract = sub.add_parser(
+        "check-contract",
+        help="Phase 11: validate a validation contract JSON file against the required schema",
+    )
+    check_contract.add_argument(
+        "contract_file",
+        help="Path to the contract JSON file to validate",
+    )
+    check_contract.add_argument("--output", help="Optional JSON output path")
+    check_contract.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
