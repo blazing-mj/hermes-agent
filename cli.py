@@ -14872,6 +14872,7 @@ def main(
     q: str = None,
     image: str = None,
     toolsets: str = None,
+    no_tools: bool = False,
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
     provider: str = None,
@@ -14978,7 +14979,11 @@ def main(
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
     toolsets_list = None
-    if toolsets:
+    if no_tools and toolsets:
+        raise ValueError("--no-tools cannot be combined with --toolsets")
+    if no_tools:
+        toolsets_list = []
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):

@@ -1822,6 +1822,7 @@ def cmd_chat(args):
         "model": args.model,
         "provider": getattr(args, "provider", None),
         "toolsets": args.toolsets,
+        "no_tools": getattr(args, "no_tools", False),
         "skills": getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
@@ -14289,6 +14290,7 @@ Examples:
                 model=getattr(args, "model", None),
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
+                no_tools=getattr(args, "no_tools", False),
             )
         )
 

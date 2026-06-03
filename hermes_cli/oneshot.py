@@ -127,6 +127,7 @@ def run_oneshot(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    no_tools: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -137,6 +138,8 @@ def run_oneshot(
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
         toolsets: Optional comma-separated string or iterable of toolsets.
+        no_tools: When true, pass an explicit empty toolset list and do not
+            fall back to CLI-configured default tools.
 
     Returns the exit code.  Caller should sys.exit() with the return.
     """
@@ -160,11 +163,19 @@ def run_oneshot(
         )
         return 2
 
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
+    if no_tools and _normalize_toolsets(toolsets) is not None:
+        sys.stderr.write("hermes -z: --no-tools cannot be combined with --toolsets.\n")
         return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+
+    if no_tools:
+        explicit_toolsets = []
+        use_config_toolsets = False
+    else:
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
@@ -296,7 +307,12 @@ def _run_agent(
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
+    # An explicit empty list is a real zero-tool contract. Do not normalize it
+    # to None, because None means "fall back to CLI-configured defaults" below.
+    if isinstance(toolsets, (list, tuple)) and len(toolsets) == 0:
+        toolsets_list = []
+    else:
+        toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 

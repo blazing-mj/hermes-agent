@@ -139,6 +139,16 @@ def build_top_level_parser():
         default=None,
         help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
     )
+    _inherited_flag(
+        parser,
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable all tools for this invocation. Applies to -z/--oneshot; "
+            "for chat it is forwarded to the chat command. Cannot be combined with --toolsets."
+        ),
+    )
     parser.add_argument(
         "--resume",
         "-r",
@@ -249,6 +259,13 @@ def build_top_level_parser():
     )
     chat_parser.add_argument(
         "-t", "--toolsets", help="Comma-separated toolsets to enable"
+    )
+    _inherited_flag(
+        chat_parser,
+        "--no-tools",
+        action="store_true",
+        default=False,
+        help="Disable all tools for this chat invocation. Cannot be combined with --toolsets.",
     )
     _inherited_flag(
         chat_parser,
