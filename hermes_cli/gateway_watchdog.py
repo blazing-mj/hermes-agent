@@ -1,14 +1,15 @@
-"""macOS launchd-domain watchdog for the Hermes gateway.
+"""macOS launchd watchdog for the Hermes gateway.
 
-This intentionally runs outside the gateway process.  Its job is not to
-observe crashes (launchd KeepAlive handles those), but to recover the rarer
-failure where the launchd job is removed from the gui/<uid> domain entirely.
+This intentionally runs outside the gateway process.  It recovers both the
+rare failure where the launchd job is removed from the gui/<uid> domain and the
+silent failure where the job is still loaded but no gateway process is live.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -143,8 +144,48 @@ def _run(cmd: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 
 def is_gateway_loaded(run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run) -> bool:
+    return read_gateway_launchd_status(run).loaded
+
+
+def read_gateway_launchd_status(
+    run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run,
+) -> "LaunchdGatewayStatus":
     result = run(["launchctl", "print", f"{_domain()}/{DEFAULT_LABEL}"])
-    return result.returncode == 0
+    if result.returncode != 0:
+        return LaunchdGatewayStatus(loaded=False, state=None, pid=None)
+    return LaunchdGatewayStatus.from_launchctl_print(result.stdout or "")
+
+
+class LaunchdGatewayStatus:
+    """Small parsed view of `launchctl print` for watchdog decisions."""
+
+    def __init__(self, *, loaded: bool, state: str | None, pid: int | None) -> None:
+        self.loaded = loaded
+        self.state = state
+        self.pid = pid
+
+    @classmethod
+    def from_launchctl_print(cls, output: str) -> "LaunchdGatewayStatus":
+        state_match = re.search(r"^\s*state\s*=\s*(.+?)\s*$", output, re.MULTILINE)
+        pid_match = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", output, re.MULTILINE)
+        pid = int(pid_match.group(1)) if pid_match else None
+        state = state_match.group(1).strip() if state_match else None
+        return cls(loaded=True, state=state, pid=pid)
+
+    @property
+    def live(self) -> bool:
+        if not self.loaded:
+            return False
+        if self.state is None and self.pid is None:
+            # `launchctl print` succeeded but the text shape was not recognized.
+            # Treat that as healthy so macOS output-format drift cannot cause a
+            # destructive bootout/bootstrap loop on an otherwise loaded gateway.
+            return True
+        return self.state == "running" and self.pid is not None
+
+    @property
+    def summary(self) -> str:
+        return f"loaded={self.loaded} state={self.state or 'unknown'} pid={self.pid or 'none'}"
 
 
 def recover_gateway(run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run) -> bool:
@@ -157,24 +198,34 @@ def recover_gateway(run: Callable[[Sequence[str]], subprocess.CompletedProcess[s
     run(["launchctl", "bootout", f"{domain}/{DEFAULT_LABEL}"])
     run(["launchctl", "bootstrap", domain, str(plist)])
     run(["launchctl", "kickstart", f"{domain}/{DEFAULT_LABEL}"])
-    return is_gateway_loaded(run)
+    for attempt in range(5):
+        if attempt:
+            time.sleep(0.2)
+        if read_gateway_launchd_status(run).live:
+            return True
+    return False
 
 
 def check_once(*, alert: bool = True, run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run) -> int:
     """Return 0 when healthy/recovered, 2 when recovery failed."""
-    if is_gateway_loaded(run):
+    status = read_gateway_launchd_status(run)
+    if status.live:
         return 0
 
-    _log(f"domain missing: {_domain()}/{DEFAULT_LABEL}; attempting bootstrap")
+    if status.loaded:
+        _log(f"loaded but not live: {_domain()}/{DEFAULT_LABEL} {status.summary}; attempting bootstrap")
+    else:
+        _log(f"domain missing: {_domain()}/{DEFAULT_LABEL}; attempting bootstrap")
+
     recovered = recover_gateway(run)
     if recovered:
-        msg = "⚠️ Hermes default gateway was missing from launchd; watchdog re-bootstrapped it."
-        _log("recovered default gateway launchd domain membership")
+        msg = "⚠️ Hermes default gateway was not live in launchd; watchdog re-bootstrapped it."
+        _log("recovered default gateway launchd liveness")
         if alert:
             _send_telegram_alert(msg)
         return 0
 
-    msg = "🔴 Hermes default gateway launchd watchdog failed to re-bootstrap ai.hermes.gateway."
+    msg = "🔴 Hermes default gateway launchd watchdog failed to re-bootstrap a live ai.hermes.gateway."
     _log("recovery failed")
     if alert:
         _send_telegram_alert(msg)
