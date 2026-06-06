@@ -14,6 +14,7 @@ from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
 from .decomposer import decompose_goal
+from .planner_runner import plan_goal
 from .loop_runner import (
     SandboxBoundaryViolation,
     SandboxWorkspace,
@@ -275,6 +276,33 @@ def _run_loop_runner_active(
 
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "plan-goal":
+        goal_id = getattr(args, "goal_id")
+        goal_title = getattr(args, "goal_title", "") or ""
+        goal_body = getattr(args, "goal_body", "") or ""
+        labels = list(getattr(args, "label", None) or [])
+        max_tasks = int(getattr(args, "max_tasks", 10) or 10)
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        result = plan_goal(
+            goal_id=goal_id,
+            goal_title=goal_title,
+            goal_body=goal_body,
+            labels=labels,
+            max_tasks=max_tasks,
+        )
+        rendered = json.dumps(result, indent=2, sort_keys=True)
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0 if result["planner_review"]["verdict"] == "PASS" else 1
+
     if command == "decompose-goal":
         goal_id = getattr(args, "goal_id")
         goal_title = getattr(args, "goal_title", "") or ""
@@ -807,11 +835,35 @@ def register_cli(parent) -> None:  # noqa: ANN001
     route.add_argument("--output", help="Optional decision JSON output path")
     route.set_defaults(func=cmd_team_os)
 
+    _register_plan_goal(sub)
     _register_decompose_goal(sub)
     _register_kill_switch(sub)
     _register_contracts(sub)
 
     parent.set_defaults(func=cmd_team_os)
+
+
+def _register_plan_goal(sub) -> None:  # noqa: ANN001
+    """Register the dry-run Planner-runner subcommand (AGENTS-170)."""
+    plan = sub.add_parser(
+        "plan-goal",
+        help=(
+            "Plan one goal into reviewable subtasks + validation contracts; "
+            "runs an intent-preservation review without feeding the loop"
+        ),
+    )
+    plan.add_argument("goal_id", help="Linear/Kanban goal identifier, e.g. AGENTS-170")
+    plan.add_argument("--goal-title", default="", help="Human-readable goal title")
+    plan.add_argument("--goal-body", default="", help="Goal body / description text")
+    plan.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Goal label for confidence/routing context (repeatable)",
+    )
+    plan.add_argument("--max-tasks", type=int, default=10, help="Cap on planned tasks (default 10)")
+    plan.add_argument("--output", help="Optional JSON output path")
+    plan.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
 
 
 def _register_decompose_goal(sub) -> None:  # noqa: ANN001
