@@ -28,6 +28,8 @@ from agent.auxiliary_client import (
     _resolve_auto,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
+    _try_openrouter,
+    _try_nous,
 )
 
 
@@ -92,6 +94,35 @@ class TestNormalizeAuxProvider:
     def test_maps_github_copilot_acp_aliases(self):
         assert _normalize_aux_provider("github-copilot-acp") == "copilot-acp"
         assert _normalize_aux_provider("copilot-acp-agent") == "copilot-acp"
+
+
+class TestAuxiliaryUnavailableProviderCooldown:
+    def test_missing_openrouter_auth_is_suppressed_for_an_hour(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.setattr(aux, "_select_pool_entry", lambda _provider: (False, None))
+        start = 1000.0
+        monkeypatch.setattr(aux.time, "time", lambda: start)
+
+        assert _try_openrouter() == (None, None)
+        assert aux._aux_unhealthy_until["openrouter"] - start == 3600
+
+    def test_missing_nous_auth_is_suppressed_for_an_hour(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        start = 1000.0
+        monkeypatch.setattr(aux.time, "time", lambda: start)
+        monkeypatch.setattr(aux, "_read_nous_auth", lambda: None)
+        monkeypatch.setattr(aux, "_resolve_nous_runtime_api", lambda force_refresh=False: None)
+        monkeypatch.setattr(
+            "agent.nous_rate_guard.nous_rate_limit_remaining",
+            lambda: None,
+            raising=False,
+        )
+
+        assert _try_nous() == (None, None)
+        assert aux._aux_unhealthy_until["nous"] - start == 3600
 
 
 class TestReadCodexAccessToken:

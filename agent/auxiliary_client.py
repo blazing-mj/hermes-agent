@@ -1494,7 +1494,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
     if pool_present:
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if not or_key:
-            _mark_provider_unhealthy("openrouter", ttl=60)
+            _mark_provider_unhealthy("openrouter", ttl=_AUX_UNAVAILABLE_TTL_SECONDS)
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
@@ -1503,7 +1503,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        _mark_provider_unhealthy("openrouter", ttl=_AUX_UNAVAILABLE_TTL_SECONDS)
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
@@ -1547,7 +1547,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
             "Auxiliary Nous client unavailable: no Nous authentication found "
             "(run: hermes auth)."
         )
-        _mark_provider_unhealthy("nous", ttl=60)
+        _mark_provider_unhealthy("nous", ttl=_AUX_UNAVAILABLE_TTL_SECONDS)
         return None, None
     if runtime is None and nous:
         # Runtime credential mint failed but stored Nous auth is still present.
@@ -2138,6 +2138,7 @@ def _get_provider_chain() -> List[tuple]:
 # the user might be running two profiles with different OpenRouter keys.
 
 _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
+_AUX_UNAVAILABLE_TTL_SECONDS = 3600  # 1 hour for missing/unconfigured credentials
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
 

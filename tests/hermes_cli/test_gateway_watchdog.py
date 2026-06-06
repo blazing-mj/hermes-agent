@@ -184,7 +184,7 @@ def test_watchdog_recovers_loaded_running_without_pid(monkeypatch, tmp_path):
     assert any(cmd[:2] == ["launchctl", "bootstrap"] for cmd in calls)
 
 
-def test_watchdog_returns_failure_when_recovery_leaves_loaded_but_not_running(monkeypatch, tmp_path):
+def test_watchdog_retries_recovery_sequence_within_same_cycle(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(gateway_watchdog.time, "sleep", lambda _seconds: None)
     launch_agents = tmp_path / "Library" / "LaunchAgents"
@@ -192,12 +192,44 @@ def test_watchdog_returns_failure_when_recovery_leaves_loaded_but_not_running(mo
     (launch_agents / "ai.hermes.gateway.plist").write_text("plist", encoding="utf-8")
     monkeypatch.setattr(gateway_watchdog, "_account_home", lambda: tmp_path)
 
+    calls = []
+    recovery_round = {"count": 0}
+
     def fake_run(cmd):
-        if list(cmd)[:2] == ["launchctl", "print"]:
+        cmd = list(cmd)
+        calls.append(cmd)
+        if cmd[:2] == ["launchctl", "bootstrap"]:
+            recovery_round["count"] += 1
+            return _result(0)
+        if cmd[:2] == ["launchctl", "print"]:
+            if recovery_round["count"] >= 2:
+                return _print_result(state="running", pid=2468)
+            return _print_result(state="not running", pid=None)
+        return _result(0)
+
+    assert gateway_watchdog.check_once(alert=False, run=fake_run) == 0
+    assert len([cmd for cmd in calls if cmd[:2] == ["launchctl", "bootstrap"]]) == 2
+
+
+def test_watchdog_returns_failure_when_all_recovery_rounds_leave_gateway_not_running(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_watchdog.time, "sleep", lambda _seconds: None)
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    (launch_agents / "ai.hermes.gateway.plist").write_text("plist", encoding="utf-8")
+    monkeypatch.setattr(gateway_watchdog, "_account_home", lambda: tmp_path)
+
+    calls = []
+
+    def fake_run(cmd):
+        cmd = list(cmd)
+        calls.append(cmd)
+        if cmd[:2] == ["launchctl", "print"]:
             return _print_result(state="not running", pid=None)
         return _result(0)
 
     assert gateway_watchdog.check_once(alert=False, run=fake_run) == 2
+    assert len([cmd for cmd in calls if cmd[:2] == ["launchctl", "bootstrap"]]) == gateway_watchdog.DEFAULT_RECOVERY_ROUNDS
 
 
 def test_watchdog_returns_failure_when_recovery_cannot_load(monkeypatch, tmp_path):

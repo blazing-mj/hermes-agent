@@ -441,6 +441,26 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _gateway_turn_wall_clock_timeout() -> Optional[float]:
+    """Return the per-turn wall-clock timeout in seconds.
+
+    ``agent.gateway_timeout`` is intentionally inactivity-based: active tool/API
+    loops can run forever as long as activity keeps flowing. Gateway turns need a
+    separate hard wall-clock guard so a marathon turn aborts itself before the
+    watchdog's stuck-busy backstop has to restart the whole gateway.
+    """
+    raw = _float_env("HERMES_AGENT_WALL_CLOCK_TIMEOUT", 600)
+    return raw if raw > 0 else None
+
+
+def _gateway_turn_wall_clock_expired(start_time: float, *, now: Optional[float] = None) -> bool:
+    timeout = _gateway_turn_wall_clock_timeout()
+    if timeout is None:
+        return False
+    current = time.time() if now is None else now
+    return (current - start_time) >= timeout
+
+
 def _is_fresh_gateway_interruption(
     value: Any,
     *,
@@ -826,8 +846,13 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         return
 
     agent_cfg = cfg.get("agent", {})
-    if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
-        os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+    if isinstance(agent_cfg, dict):
+        if "max_turns" in agent_cfg:
+            os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+        if "gateway_wall_clock_timeout" in agent_cfg:
+            os.environ["HERMES_AGENT_WALL_CLOCK_TIMEOUT"] = str(
+                agent_cfg["gateway_wall_clock_timeout"]
+            )
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -949,6 +974,8 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
             if "gateway_timeout_warning" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
+            if "gateway_wall_clock_timeout" in _agent_cfg:
+                os.environ["HERMES_AGENT_WALL_CLOCK_TIMEOUT"] = str(_agent_cfg["gateway_wall_clock_timeout"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
             if "restart_drain_timeout" in _agent_cfg:
@@ -17766,12 +17793,14 @@ class GatewayRunner:
             _agent_timeout = _agent_timeout_raw if _agent_timeout_raw > 0 else None
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
+            _wall_clock_timeout = _gateway_turn_wall_clock_timeout()
             _warning_fired = False
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(run_sync)
             )
 
             _inactivity_timeout = False
+            _wall_clock_timeout_fired = False
             _POLL_INTERVAL = 5.0
 
             if _agent_timeout is None:
@@ -17784,6 +17813,9 @@ class GatewayRunner:
                     )
                     if done:
                         response = _executor_task.result()
+                        break
+                    if _wall_clock_timeout is not None and _gateway_turn_wall_clock_expired(_notify_start):
+                        _wall_clock_timeout_fired = True
                         break
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
@@ -17814,6 +17846,9 @@ class GatewayRunner:
                     )
                     if done:
                         response = _executor_task.result()
+                        break
+                    if _wall_clock_timeout is not None and _gateway_turn_wall_clock_expired(_notify_start):
+                        _wall_clock_timeout_fired = True
                         break
                     # Agent still running — check inactivity.
                     _agent_ref = agent_holder[0]
@@ -17864,7 +17899,66 @@ class GatewayRunner:
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
 
-            if _inactivity_timeout:
+            if _wall_clock_timeout_fired:
+                _timed_out_agent = agent_holder[0]
+                _activity = {}
+                if _timed_out_agent and hasattr(_timed_out_agent, "get_activity_summary"):
+                    try:
+                        _activity = _timed_out_agent.get_activity_summary()
+                    except Exception:
+                        pass
+
+                _last_desc = _activity.get("last_activity_desc", "unknown")
+                _cur_tool = _activity.get("current_tool")
+                _iter_n = _activity.get("api_call_count", 0)
+                _iter_max = _activity.get("max_iterations", 0)
+                _elapsed_secs = max(0.0, time.time() - _notify_start)
+
+                logger.error(
+                    "Agent turn exceeded wall-clock deadline %.0fs after %.0fs in session %s "
+                    "| last_activity=%s | iteration=%s/%s | tool=%s",
+                    _wall_clock_timeout or 0,
+                    _elapsed_secs,
+                    session_key,
+                    _last_desc,
+                    _iter_n,
+                    _iter_max,
+                    _cur_tool or "none",
+                )
+
+                if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
+                    _timed_out_agent.interrupt("Execution timed out (wall-clock)")
+                _executor_task.cancel()
+
+                _deadline_mins = int((_wall_clock_timeout or 0) // 60) or 1
+                _elapsed_mins = int(_elapsed_secs // 60) or 1
+                _diag_lines = [
+                    f"⏱️ Agent turn hit the {_deadline_mins} min wall-clock deadline "
+                    f"after {_elapsed_mins} min."
+                ]
+                if _cur_tool:
+                    _diag_lines.append(
+                        f"Current tool: `{_cur_tool}` (iteration {_iter_n}/{_iter_max})."
+                    )
+                else:
+                    _diag_lines.append(
+                        f"Last activity: {_last_desc} (iteration {_iter_n}/{_iter_max})."
+                    )
+                _diag_lines.append(
+                    "This prevents marathon gateway turns from hanging until the watchdog restart backstop. "
+                    "Try again with a narrower slice, or set HERMES_AGENT_WALL_CLOCK_TIMEOUT=0 to disable."
+                )
+
+                response = {
+                    "final_response": "\n".join(_diag_lines),
+                    "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
+                    "api_calls": _iter_n,
+                    "tools": tools_holder[0] or [],
+                    "history_offset": 0,
+                    "failed": True,
+                }
+
+            elif _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
                 _activity = {}

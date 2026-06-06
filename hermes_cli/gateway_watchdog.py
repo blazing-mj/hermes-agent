@@ -24,6 +24,8 @@ DEFAULT_PLIST = "ai.hermes.gateway.plist"
 LOG_NAME = "gateway-domain-watchdog.log"
 ALERT_COOLDOWN_SECONDS = 30 * 60
 DEFAULT_STUCK_BUSY_SECONDS = 20 * 60
+DEFAULT_RECOVERY_ROUNDS = 3
+DEFAULT_RECOVERY_PROBE_ATTEMPTS = 5
 
 
 
@@ -254,14 +256,18 @@ def recover_gateway(run: Callable[[Sequence[str]], subprocess.CompletedProcess[s
         return False
 
     domain = _domain()
-    run(["launchctl", "bootout", f"{domain}/{DEFAULT_LABEL}"])
-    run(["launchctl", "bootstrap", domain, str(plist)])
-    run(["launchctl", "kickstart", f"{domain}/{DEFAULT_LABEL}"])
-    for attempt in range(5):
-        if attempt:
-            time.sleep(0.2)
-        if read_gateway_launchd_status(run).live:
-            return True
+    for round_idx in range(DEFAULT_RECOVERY_ROUNDS):
+        if round_idx:
+            _log(f"recovery round {round_idx + 1}/{DEFAULT_RECOVERY_ROUNDS}: retrying bootstrap in-cycle")
+            time.sleep(1.0)
+        run(["launchctl", "bootout", f"{domain}/{DEFAULT_LABEL}"])
+        run(["launchctl", "bootstrap", domain, str(plist)])
+        run(["launchctl", "kickstart", f"{domain}/{DEFAULT_LABEL}"])
+        for attempt in range(DEFAULT_RECOVERY_PROBE_ATTEMPTS):
+            if attempt:
+                time.sleep(0.2)
+            if read_gateway_launchd_status(run).live:
+                return True
     return False
 
 

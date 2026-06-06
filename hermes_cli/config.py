@@ -673,6 +673,11 @@ DEFAULT_CONFIG = {
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
+        # Hard wall-clock timeout for one gateway turn (seconds).
+        # Unlike gateway_timeout, this fires even when the agent is active,
+        # preventing marathon tool/API loops from reaching watchdog recovery.
+        # 0 = unlimited.
+        "gateway_wall_clock_timeout": 600,
         # Maximum time (seconds) the gateway will block an agent waiting for
         # a clarify-tool response from the user.  Hit this and the agent
         # unblocks with "[user did not respond within Xm]" so it can adapt
