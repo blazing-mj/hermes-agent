@@ -93,6 +93,27 @@ class TeamOSState:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    queued_at INTEGER,
+                    dispatching_at INTEGER,
+                    completed_at INTEGER,
+                    last_error TEXT,
+                    escalation_required INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(event_type, source_id)
+                )
+                """
+            )
             conn.commit()
 
     def record_snapshot(self, classified: list[ClassifiedObservation]) -> int:
@@ -334,4 +355,199 @@ class TeamOSState:
             data["reasons"] = json.loads(data.pop("reasons_json"))
             result.append(data)
         return result
+
+    # -----------------------------------------------------------------------
+    # Stage 4 — durable outbox
+    # -----------------------------------------------------------------------
+
+    def enqueue_event(
+        self,
+        event_type: str,
+        source_id: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Backward-compatible alias for ``queue_for_dispatch``."""
+        return self.queue_for_dispatch(
+            event_type=event_type,
+            source_id=source_id,
+            source=source,
+            payload=payload,
+        )
+
+    def queue_for_dispatch(
+        self,
+        *,
+        event_type: str,
+        source_id: str,
+        source: str,
+        payload: dict[str, Any],
+    ) -> int:
+        """Durably queue one source event, idempotent by ``(event_type, source_id)``.
+
+        The returned row is never duplicated across poll cycles.  Terminal and
+        in-flight rows are kept as idempotency tombstones; retries after an
+        ``abandoned`` row require an explicit future approval path, not silent
+        redrive.
+        """
+        self.init_schema()
+        now = int(time.time())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO outbox(
+                    created_at, updated_at, event_type, source_id, source,
+                    payload_json, state, queued_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
+                """,
+                (
+                    now,
+                    now,
+                    event_type,
+                    source_id,
+                    source,
+                    json.dumps(payload, sort_keys=True),
+                    now,
+                ),
+            )
+            existing = conn.execute(
+                "SELECT id FROM outbox WHERE event_type = ? AND source_id = ?",
+                (event_type, source_id),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("failed to create or fetch outbox row")
+            row_id = int(existing["id"])
+            conn.commit()
+        return row_id
+
+    def list_outbox_events(self, *, states: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Return outbox events ordered by id, optionally filtered by state."""
+        self.init_schema()
+        query = "SELECT * FROM outbox"
+        params: tuple[Any, ...] = ()
+        if states:
+            placeholders = ", ".join("?" for _ in states)
+            query += f" WHERE state IN ({placeholders})"
+            params = tuple(states)
+        query += " ORDER BY id ASC"
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._decode_outbox_row(row) for row in rows]
+
+    def list_pending_events(self) -> list[dict[str, Any]]:
+        """Backward-compatible name: return queued events."""
+        return self.list_outbox_events(states=("queued",))
+
+    def get_outbox_event(self, event_id: int) -> dict[str, Any]:
+        """Fetch a single outbox event by id."""
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM outbox WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"outbox event not found: {event_id}")
+        return self._decode_outbox_row(row)
+
+    def get_outbox_event_by_source(self, event_type: str, source_id: str) -> dict[str, Any] | None:
+        """Fetch an outbox event by its idempotency key."""
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM outbox WHERE event_type = ? AND source_id = ?",
+                (event_type, source_id),
+            ).fetchone()
+        return None if row is None else self._decode_outbox_row(row)
+
+    def mark_event_dispatching(self, event_id: int) -> None:
+        """Mark an event dispatching before any worker side effect starts."""
+        self._transition_outbox_event(event_id, "dispatching", increment_attempt=True)
+
+    def mark_event_mj_review(self, event_id: int, *, reason: str) -> None:
+        """Hold an event for MJ review before any dispatch attempt."""
+        self._transition_outbox_event(event_id, "mj_review", reason=reason, escalate=True)
+
+    def mark_event_succeeded(self, event_id: int) -> None:
+        """Mark an outbox event succeeded."""
+        self._transition_outbox_event(event_id, "succeeded")
+
+    def mark_event_processed(self, event_id: int) -> None:
+        """Backward-compatible alias for success."""
+        self.mark_event_succeeded(event_id)
+
+    def mark_event_failed(self, event_id: int, *, reason: str = "") -> None:
+        """Mark an outbox event failed with an optional reason."""
+        self._transition_outbox_event(event_id, "failed", reason=reason)
+
+    def reconcile_in_flight(self, *, reason: str = "reconcile-on-restart") -> list[dict[str, Any]]:
+        """Mark any in-flight dispatches abandoned and requiring MJ review.
+
+        Reconciliation is deliberately fail-closed: a previously ``dispatching``
+        row is not silently queued again because the worker may have performed
+        an external side effect before the daemon died.
+        """
+        self.init_schema()
+        now = int(time.time())
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE state = 'dispatching' ORDER BY id ASC"
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE outbox
+                    SET state = 'abandoned', updated_at = ?, completed_at = ?,
+                        last_error = ?, escalation_required = 1
+                    WHERE id = ?
+                    """,
+                    (now, now, reason, int(row["id"])),
+                )
+            conn.commit()
+        return [self.get_outbox_event(int(row["id"])) for row in rows]
+
+    def _transition_outbox_event(
+        self,
+        event_id: int,
+        state: str,
+        *,
+        reason: str = "",
+        increment_attempt: bool = False,
+        escalate: bool = False,
+    ) -> None:
+        now = int(time.time())
+        completed = now if state in {"succeeded", "failed", "abandoned"} else None
+        dispatching = now if state == "dispatching" else None
+        escalation = 1 if state == "abandoned" or escalate else 0
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE outbox
+                SET state = ?, updated_at = ?,
+                    attempt_count = attempt_count + ?,
+                    dispatching_at = COALESCE(?, dispatching_at),
+                    completed_at = COALESCE(?, completed_at),
+                    last_error = NULLIF(?, ''),
+                    escalation_required = CASE WHEN ? = 1 THEN 1 ELSE escalation_required END
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    now,
+                    1 if increment_attempt else 0,
+                    dispatching,
+                    completed,
+                    reason,
+                    escalation,
+                    event_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise KeyError(f"outbox event not found: {event_id}")
+            conn.commit()
+
+    @staticmethod
+    def _decode_outbox_row(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["payload"] = json.loads(data.pop("payload_json"))
+        data["escalation_required"] = bool(data.get("escalation_required", 0))
+        data["status"] = data["state"]  # compatibility for older callers/tests
+        return data
 

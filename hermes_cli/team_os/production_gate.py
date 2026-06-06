@@ -61,6 +61,8 @@ def check_production_gate(
     task: "LoopTask",
     *,
     kill_switch: "KillSwitch | None",
+    gateway_health_probe: Any | None = None,
+    require_gateway_health: bool = False,
 ) -> ProductionGateResult:
     """Run all production-mode checks against ``task``.
 
@@ -69,6 +71,7 @@ def check_production_gate(
       2. approval_status must be an explicitly-approved value.
       3. task_confidence must be assessed and high (not medium/low/unknown/None).
       4. quota_confidence must be high.
+      5. When required, gateway/runtime health must be explicitly healthy.
 
     Args:
         task: The :class:`~hermes_cli.team_os.loop_runner.LoopTask` to check.
@@ -110,6 +113,17 @@ def check_production_gate(
             f"quota_confidence={task.quota_confidence!r} is not acceptable for production "
             "(must be 'high')"
         )
+
+    # 5. Gateway/runtime health check (Stage 4 Cortex production path)
+    if require_gateway_health:
+        if gateway_health_probe is None:
+            violations.append("gateway health probe is required for production dispatch")
+        else:
+            probe_result = gateway_health_probe()
+            healthy = bool(getattr(probe_result, "healthy", probe_result))
+            if not healthy:
+                message = getattr(probe_result, "message", "gateway/runtime unhealthy")
+                violations.append(f"gateway/runtime unhealthy — dispatch paused: {message}")
 
     return ProductionGateResult(
         passed=len(violations) == 0,
@@ -175,6 +189,70 @@ def write_production_audit(
     line = json.dumps(entry, sort_keys=True) + "\n"
     with audit_path.open("a", encoding="utf-8") as f:
         f.write(line)
+
+
+@dataclass(frozen=True)
+class GatewayHealthResult:
+    """Result of a gateway health probe.
+
+    Attributes:
+        healthy: True only when every check passes.
+        checks: Mapping of check name → bool.
+        message: Human-readable summary.
+    """
+
+    healthy: bool
+    checks: dict[str, bool]
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "healthy": self.healthy,
+            "checks": dict(self.checks),
+            "message": self.message,
+        }
+
+
+def check_gateway_health(
+    *,
+    kill_switch: "KillSwitch | None",
+) -> GatewayHealthResult:
+    """Probe gateway readiness for cortex orchestration.
+
+    Checks:
+      1. kill_switch must be provided and disabled.
+
+    A missing kill_switch is treated as an unhealthy (unguarded) gateway
+    because production orchestration requires an active kill-switch guard.
+
+    Args:
+        kill_switch: The :class:`~hermes_cli.team_os.kill_switch.KillSwitch`
+            instance to probe, or ``None`` if unavailable.
+
+    Returns:
+        :class:`GatewayHealthResult` — healthy only when all checks pass.
+    """
+    checks: dict[str, bool] = {}
+
+    if kill_switch is None:
+        checks["kill_switch"] = False
+        return GatewayHealthResult(
+            healthy=False,
+            checks=checks,
+            message="kill-switch not provided — gateway is unguarded",
+        )
+
+    ks_ok = not kill_switch.is_enabled()
+    checks["kill_switch"] = ks_ok
+
+    healthy = all(checks.values())
+    if healthy:
+        message = "gateway healthy"
+    else:
+        failed = [k for k, v in checks.items() if not v]
+        message = f"gateway unhealthy — failed checks: {', '.join(failed)}"
+
+    return GatewayHealthResult(healthy=healthy, checks=checks, message=message)
 
 
 def _utc_iso() -> str:

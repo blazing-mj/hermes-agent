@@ -278,6 +278,46 @@ def _run_loop_runner_active(
 
 def cmd_team_os(args) -> int:  # noqa: ANN001
     command = getattr(args, "team_os_command", None) or "snapshot"
+    if command == "cortex":
+        from .collectors import collect_linear_project  # noqa: PLC0415
+        from .cortex import CortexConfig, run_cortex  # noqa: PLC0415
+
+        state_db_arg = getattr(args, "state_db", None) or "~/.hermes/state/team-os-cortex.db"
+        state = TeamOSState(Path(state_db_arg).expanduser())
+        linear_projects_arg = list(getattr(args, "linear_project", None) or [])
+
+        def _collector():
+            observations = []
+            for project in linear_projects_arg:
+                observations.extend(collect_linear_project(project))
+            return observations
+
+        active = bool(getattr(args, "active", False))
+        dry_run = not bool(getattr(args, "live_dispatch", False))
+        # CLI surface is intentionally fail-closed for Stage 4: no live dispatch
+        # function is wired here, so even --active --live-dispatch pauses unless
+        # future MJ-approved code supplies an explicit dispatcher.
+        cortex_result = run_cortex(
+            state,
+            CortexConfig(
+                active=active,
+                dry_run=dry_run,
+                max_dispatch_per_cycle=int(getattr(args, "max_dispatch_per_cycle", 1)),
+            ),
+            collector=_collector if linear_projects_arg else None,
+            gateway_health_probe=(lambda: False),
+            dispatch=None,
+        )
+        rendered = json.dumps(cortex_result.to_dict(), indent=2, sort_keys=True)
+        output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+        if output:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output))
+        else:
+            print(rendered)
+        return 0
+
     if command == "plan-goal":
         goal_id = getattr(args, "goal_id")
         goal_title = getattr(args, "goal_title", "") or ""
@@ -657,6 +697,23 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
 
 def register_cli(parent) -> None:  # noqa: ANN001
     sub = parent.add_subparsers(dest="team_os_command")
+    cortex = sub.add_parser(
+        "cortex",
+        help="Stage 4 gated Cortex Linear poll router (dry-run by default; no live dispatch)",
+    )
+    cortex.add_argument("--linear-project", action="append", default=[])
+    cortex.add_argument("--state-db", default="~/.hermes/state/team-os-cortex.db")
+    cortex.add_argument("--output", help="Optional JSON output path")
+    cortex.add_argument("--active", action="store_true", default=False)
+    cortex.add_argument(
+        "--live-dispatch",
+        action="store_true",
+        default=False,
+        help="Future MJ-approved opt-in; Stage 4 CLI still has no dispatcher wired",
+    )
+    cortex.add_argument("--max-dispatch-per-cycle", type=int, default=1)
+    cortex.set_defaults(func=cmd_team_os)
+
     snapshot = sub.add_parser(
         "snapshot",
         help="Collect read-only Linear/Kanban state and classify it in dry-run mode",

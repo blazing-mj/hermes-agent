@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stage 4 Team OS Cortex launcher. Safe default: dry-run only.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${HERMES_PYTHON:-$HOME/.hermes/hermes-agent/venv/bin/python}"
+STATE_DB="${HERMES_TEAM_OS_CORTEX_DB:-$HOME/.hermes/state/team-os-cortex.db}"
+
+cd "$ROOT"
+exec "$PYTHON_BIN" -m hermes_cli.main team-os cortex --state-db "$STATE_DB" "$@"
