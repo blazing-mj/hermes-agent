@@ -136,7 +136,7 @@ def test_validate_planner_output_bounces_auto_dispatch_or_auto_done_flags():
     assert any("auto-done" in err.lower() for err in review["errors"])
 
 
-def test_plan_goal_contract_commands_are_non_empty_verifier_plans():
+def test_plan_goal_contract_commands_are_non_empty_required_commands():
     from hermes_cli.team_os.planner_runner import plan_goal
 
     run = plan_goal(**_goal())
@@ -144,7 +144,89 @@ def test_plan_goal_contract_commands_are_non_empty_verifier_plans():
     for planned in run["tasks"]:
         contract = planned["validation_contract"]
         assert contract["commands"]
-        assert contract["commands"] == planned["verifier_plan"]
+        assert contract["commands"] == contract["required_commands"]
+
+
+def test_grounded_contracts_include_worker_ready_specific_scope_and_proof():
+    from hermes_cli.team_os.planner_runner import plan_goal
+
+    run = plan_goal(
+        goal_id="AGENTS-148",
+        goal_title="Prevent placeholder media paths from being treated as sendable attachments",
+        goal_body=(
+            "Step 1: Locate the Telegram/gateway media attachment parsing path and add a deterministic guard for placeholder paths.\n"
+            "Step 2: Add regression tests proving placeholder strings are dropped while real existing media paths still send.\n"
+            "Step 3: Update the user-facing error/proof message so discarded placeholders are visible in logs without sending files."
+        ),
+        labels=["system:hermes", "type:bug"],
+    )
+
+    assert run["planner_review"]["verdict"] == "PASS"
+    assert len(run["tasks"]) == 3
+    seen_acceptance = set()
+    for task in run["tasks"]:
+        contract = task["validation_contract"]
+        assert contract["problem"].startswith("Prevent placeholder media paths")
+        assert contract["files_to_touch"]
+        assert contract["areas"]
+        assert contract["implementation_scope"]
+        assert contract["acceptance_criteria"]
+        assert contract["proof_required"]
+        assert contract["required_commands"]
+        assert contract["commands"] == contract["required_commands"]
+        assert any("pytest" in cmd for cmd in contract["required_commands"])
+        assert any(task["description"][:32] in item for item in contract["acceptance_criteria"])
+        seen_acceptance.add(tuple(contract["acceptance_criteria"]))
+
+    assert len(seen_acceptance) == len(run["tasks"])
+
+
+def test_status_note_phase_is_excluded_from_worker_tasks():
+    from hermes_cli.team_os.planner_runner import plan_goal
+
+    run = plan_goal(
+        goal_id="AGENTS-170",
+        goal_title="Ground Planner-runner output for Worker handoff",
+        goal_body=(
+            "Step 1: Add grounded contracts with files, scope, acceptance criteria, and proof commands.\n"
+            "Step 2: Re-prove on a normal non-self Linear goal.\n"
+            "Step 3: Keep status hygiene accurate: AGENTS-167 is Done and PAT rotation remains pending."
+        ),
+        labels=["system:hermes", "type:rail"],
+    )
+
+    assert [task["task_id"] for task in run["tasks"]] == ["AGENTS-170-p1", "AGENTS-170-p2"]
+    assert run["excluded_items"] == [
+        {
+            "task_id": "AGENTS-170-p3",
+            "reason": "status-note-not-worker-task",
+            "description": "Keep status hygiene accurate: AGENTS-167 is Done and PAT rotation remains pending.",
+        }
+    ]
+
+
+def test_sectioned_real_issue_body_produces_worker_subtasks_not_single_blob():
+    from hermes_cli.team_os.planner_runner import plan_goal
+
+    run = plan_goal(
+        goal_id="AGENTS-161",
+        goal_title="Gateway watchdog should detect stale active-agent hung state",
+        goal_body=(
+            "Follow-up from AGENTS-160. Current safe fix guards active_agents > 0 to avoid killing busy gateways.\n\n"
+            "Desired hardening: compare ~/.hermes/gateway_state.json updated_at/mtime against a larger stuck-busy threshold. "
+            "If active_agents > 0 and heartbeat has not advanced for N minutes, classify as stuck-busy and escalate/recover via a stricter policy.\n\n"
+            "Acceptance proof: RED/GREEN tests for recent-active suppress, stale-active detect/escalate, normal healthy reset, "
+            "and live-safe scheduled watchdog proof that does not kill a healthy active gateway."
+        ),
+        labels=["system:hermes", "type:ops"],
+    )
+
+    assert [task["task_id"] for task in run["tasks"]] == ["AGENTS-161-p1", "AGENTS-161-p2"]
+    assert "stuck-busy threshold" in run["tasks"][0]["description"]
+    assert "RED/GREEN tests" in run["tasks"][1]["description"]
+    assert all(task["worker_ready"] is True for task in run["tasks"])
+    assert "hermes_cli/gateway_watchdog.py" in run["tasks"][0]["validation_contract"]["files_to_touch"]
+    assert "tests/hermes_cli/test_gateway_watchdog.py" in run["tasks"][1]["validation_contract"]["files_to_touch"]
 
 
 def test_plan_goal_cli_writes_reviewable_output_without_loop_feed(tmp_path):

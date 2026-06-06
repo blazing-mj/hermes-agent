@@ -11,7 +11,7 @@ import re
 from typing import Any, Sequence
 
 from .contracts import check_contract
-from .decomposer import decompose_goal
+from .decomposer import CandidateTask, decompose_goal
 
 _STOPWORDS = frozenset(
     {
@@ -54,6 +54,104 @@ def _intent_tokens(*parts: str) -> set[str]:
     return tokens
 
 
+def _is_status_note(description: str) -> bool:
+    text = description.lower()
+    status_markers = (
+        "status hygiene",
+        "is done",
+        "already done",
+        "remaining pending",
+        "drop it from pending",
+        "pat rotation",
+        "bitwarden",
+    )
+    worker_markers = (
+        "add ",
+        "implement",
+        "wire",
+        "fix",
+        "test",
+        "prove",
+        "update ",
+        "locate",
+        "regression",
+    )
+    return any(marker in text for marker in status_markers) and not any(
+        marker in text for marker in worker_markers
+    )
+
+
+def _infer_files_and_areas(goal_title: str, description: str) -> tuple[list[str], list[str]]:
+    text = f"{goal_title} {description}".lower()
+    files: list[str] = []
+    areas: list[str] = []
+    if "watchdog" in text or "gateway_state" in text or "active_agents" in text or "stuck-busy" in text:
+        areas.extend(["Hermes gateway watchdog", "gateway runtime status heartbeat"])
+        files.extend([
+            "hermes_cli/gateway_watchdog.py",
+            "scripts/hermes-gateway-watchdog",
+            "gateway/status.py",
+            "tests/hermes_cli/test_gateway_watchdog.py",
+        ])
+    elif "telegram" in text or "gateway" in text or "media" in text or "attachment" in text:
+        areas.extend(["gateway media attachment handling", "Telegram delivery path"])
+        files.extend([
+            "gateway/",
+            "gateway/platforms/telegram*",
+            "tests/gateway/ or tests/hermes_cli/ focused regression",
+        ])
+    if "team os" in text or "planner" in text or "contract" in text:
+        areas.extend(["Team OS planner-runner", "validation contract generation"])
+        files.extend([
+            "hermes_cli/team_os/planner_runner.py",
+            "hermes_cli/team_os/cli.py",
+            "tests/hermes_cli/test_team_os_planner_runner.py",
+        ])
+    if "test" in text or "regression" in text or "pytest" in text:
+        areas.append("focused automated tests")
+        files.append("tests/")
+    if "user-facing" in text or "message" in text or "log" in text:
+        areas.append("user-facing/log proof surface")
+    if not files:
+        files.append("discover exact files with search_files before editing")
+    if not areas:
+        areas.append("source-code area named by the task description")
+    return _dedupe(files), _dedupe(areas)
+
+
+def _dedupe(items: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _required_commands(goal_id: str, goal_title: str, description: str) -> list[str]:
+    text = f"{goal_title} {description}".lower()
+    commands = [
+        "python3.13 -m pytest -o addopts='' tests/hermes_cli/test_team_os_planner_runner.py -q",
+    ]
+    if "watchdog" in text or "gateway_state" in text or "active_agents" in text or "stuck-busy" in text:
+        commands.append(
+            "python3.13 -m pytest -o addopts='' tests/hermes_cli/test_gateway_watchdog.py -q"
+        )
+    if "gateway" in text or "telegram" in text or "media" in text or "attachment" in text:
+        commands.append(
+            "python3.13 -m pytest -o addopts='' tests/gateway tests/hermes_cli -k 'media or attachment or telegram or watchdog' -q"
+        )
+    if "team os" in text or "planner" in text or "contract" in text:
+        commands.append(
+            "python3.13 -m pytest -o addopts='' tests/hermes_cli/test_team_os_planner_runner.py tests/hermes_cli/test_team_os_phase11_contracts.py -q"
+        )
+    commands.append(
+        "python3.13 -m py_compile hermes_cli/team_os/planner_runner.py hermes_cli/team_os/cli.py"
+    )
+    return _dedupe(commands)
+
+
 def _build_validation_contract(
     *,
     goal_id: str,
@@ -61,9 +159,33 @@ def _build_validation_contract(
     task: Any,
 ) -> dict[str, Any]:
     title = goal_title or goal_id
+    files, areas = _infer_files_and_areas(goal_title, task.description)
+    commands = _required_commands(goal_id, goal_title, task.description)
+    acceptance_criteria = [
+        f"Worker completes this exact subtask: {task.description}",
+        f"Implementation stays within declared files/areas: {', '.join(files)}",
+        "Focused regression test fails before the fix and passes after the fix when applicable",
+        "Worker handoff includes changed files, command output, and proof artifact path",
+    ]
     return {
         "role": "planner-output",
         "source_ticket": goal_id,
+        "problem": title,
+        "areas": areas,
+        "files_to_touch": files,
+        "implementation_scope": [
+            f"Solve only subtask {task.task_id}: {task.description}",
+            "Do prerequisite discovery with search/read tools before editing files",
+            "Keep changes in the isolated development worktree until review/merge approval",
+        ],
+        "acceptance_criteria": acceptance_criteria,
+        "proof_required": [
+            "RED/GREEN focused test output or explicit reason RED is not applicable",
+            "Focused pytest/compile command output with exit code",
+            "git diff --stat plus changed-path summary",
+            "Validator review against this contract before Done",
+        ],
+        "required_commands": commands,
         "intended_behavior": (
             f"Preserve source goal intent for {goal_id} ({title}) while completing "
             f"planner subtask {task.task_id}: {task.description}"
@@ -72,21 +194,24 @@ def _build_validation_contract(
             "Do not feed this Planner output into the loop before human review",
             "Do not auto-dispatch Developer/Worker execution from this output",
             "Do not auto-Done the Linear issue from this output",
-            "Do not expand scope beyond the source goal intent",
+            "Do not expand scope beyond the source goal intent or this subtask contract",
         ],
         "assertions": [
             f"Intent preserved from source goal {goal_id}: {title}",
-            f"Subtask remains tied to planner description: {task.description}",
-            "Validator must check source-goal intent preservation, not only schema validity",
+            f"Subtask-specific acceptance criteria are satisfied: {acceptance_criteria[0]}",
+            f"Worker touched only allowed files/areas: {', '.join(files)}",
+            f"Required proof commands were run: {'; '.join(commands)}",
             "Human approval is recorded before any loop feed or downstream Worker execution",
         ],
-        "commands": list(task.verifier_plan),
+        "commands": commands,
         "behavior_check_required": True,
         "risk": "low",
         "human_gate_required": True,
         "bounce_conditions": [
             "Planner contract no longer preserves the source goal intent",
             "Validation contract schema fails",
+            "Grounding fields are missing or boilerplate-only",
+            "Acceptance criteria or proof commands do not match the subtask",
             "Human gate is not required",
             "Output attempts to auto-dispatch, feed the loop, or auto-Done",
             "Subtask confidence is low or unknown for a runnable Worker task",
@@ -156,6 +281,38 @@ def validate_planner_output(
         if contract.get("human_gate_required") is not True:
             errors.append(f"{prefix}: human_gate_required must stay true")
 
+        grounding_fields = (
+            "problem",
+            "areas",
+            "files_to_touch",
+            "implementation_scope",
+            "acceptance_criteria",
+            "proof_required",
+            "required_commands",
+        )
+        for field in grounding_fields:
+            value = contract.get(field)
+            if field == "problem":
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(f"{prefix}: grounding field {field!r} is missing or empty")
+            elif not isinstance(value, list) or not value or not all(
+                isinstance(item, str) and item.strip() for item in value
+            ):
+                errors.append(f"{prefix}: grounding field {field!r} must be a non-empty string list")
+
+        required_commands = contract.get("required_commands")
+        if isinstance(required_commands, list) and contract.get("commands") != required_commands:
+            errors.append(f"{prefix}: contract commands must match required_commands")
+
+        acceptance = contract.get("acceptance_criteria")
+        task_description = str(planned.get("description", ""))
+        if isinstance(acceptance, list) and task_description:
+            task_anchor = task_description[:32]
+            if not any(task_anchor in item for item in acceptance if isinstance(item, str)):
+                errors.append(
+                    f"{prefix}: acceptance criteria must reference the specific subtask description"
+                )
+
         task_text = " ".join(
             [
                 str(planned.get("title", "")),
@@ -205,6 +362,54 @@ def validate_planner_output(
     }
 
 
+def _derive_section_tasks(
+    *,
+    goal_id: str,
+    goal_title: str,
+    goal_body: str,
+    base_task: CandidateTask,
+) -> list[CandidateTask] | None:
+    """Split common Linear issue sections into Worker-ready planner subtasks."""
+    patterns = [
+        ("Desired hardening", r"Desired hardening:\s*(.*?)(?=\n\s*\n\s*Acceptance proof:|\Z)"),
+        ("Acceptance proof", r"Acceptance proof:\s*(.*?)(?=\n\s*\n\s*[A-Z][A-Za-z ]+:|\Z)"),
+        ("Recommended route", r"Recommended route:\s*(.*?)(?=\n\s*\n\s*Proof needed before Done:|\Z)"),
+        ("Proof needed", r"Proof needed before Done:\s*(.*?)(?=\n\s*\n\s*[A-Z][A-Za-z ]+:|\Z)"),
+    ]
+    descriptions: list[str] = []
+    for label, pattern in patterns:
+        match = re.search(pattern, goal_body, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            text = " ".join(match.group(1).split())
+            if text:
+                descriptions.append(f"{label}: {text}")
+
+    if len(descriptions) < 2:
+        return None
+
+    tasks: list[CandidateTask] = []
+    for idx, description in enumerate(descriptions, start=1):
+        task_id = f"{goal_id}-p{idx}"
+        prereqs = (tasks[-1].task_id,) if tasks else ()
+        tasks.append(
+            CandidateTask(
+                task_id=task_id,
+                title=f"{goal_title or goal_id} — section {idx}",
+                description=description,
+                confidence=base_task.confidence,
+                confidence_reasons=base_task.confidence_reasons,
+                prerequisites=prereqs,
+                approval_required=base_task.approval_required,
+                reversibility_category=base_task.reversibility_category,
+                reversibility_reason=base_task.reversibility_reason,
+                route_hint=base_task.route_hint,
+                verifier_plan=base_task.verifier_plan,
+                dry_run=True,
+            )
+        )
+    return tasks
+
+
 def plan_goal(
     *,
     goal_id: str,
@@ -221,9 +426,29 @@ def plan_goal(
         labels=labels,
         max_tasks=max_tasks,
     )
+    if len(tasks) == 1:
+        section_tasks = _derive_section_tasks(
+            goal_id=goal_id,
+            goal_title=goal_title,
+            goal_body=goal_body,
+            base_task=tasks[0],
+        )
+        if section_tasks is not None:
+            tasks = section_tasks[:max_tasks]
     planned_tasks: list[dict[str, Any]] = []
+    excluded_items: list[dict[str, str]] = []
     for task in tasks:
+        if _is_status_note(task.description):
+            excluded_items.append(
+                {
+                    "task_id": task.task_id,
+                    "reason": "status-note-not-worker-task",
+                    "description": task.description,
+                }
+            )
+            continue
         task_data = task.to_dict()
+        task_data["worker_ready"] = True
         task_data["validation_contract"] = _build_validation_contract(
             goal_id=goal_id,
             goal_title=goal_title,
@@ -252,6 +477,7 @@ def plan_goal(
         "human_review_required": True,
         "auto_dispatch_allowed": False,
         "auto_done_allowed": False,
+        "excluded_items": excluded_items,
         "tasks": planned_tasks,
         "planner_review": review,
     }
