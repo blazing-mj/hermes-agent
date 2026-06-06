@@ -23,6 +23,8 @@ DEFAULT_LABEL = "ai.hermes.gateway"
 DEFAULT_PLIST = "ai.hermes.gateway.plist"
 LOG_NAME = "gateway-domain-watchdog.log"
 ALERT_COOLDOWN_SECONDS = 30 * 60
+DEFAULT_STUCK_BUSY_SECONDS = 20 * 60
+
 
 
 def _account_home() -> Path:
@@ -52,6 +54,63 @@ def _log(message: str) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with (log_dir / LOG_NAME).open("a", encoding="utf-8") as f:
         f.write(f"{ts} {message}\n")
+
+
+def _runtime_status_path() -> Path:
+    return _hermes_home() / "gateway_state.json"
+
+
+def _parse_status_timestamp(value: object) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        from datetime import datetime
+
+        return datetime.fromisoformat(raw).timestamp()
+    except Exception:
+        return None
+
+
+def _read_runtime_status(path: Path | None = None) -> dict[str, object]:
+    path = path or _runtime_status_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+    return {}
+
+
+def _runtime_status_age_seconds(path: Path, status: dict[str, object], now: float) -> float | None:
+    ts = _parse_status_timestamp(status.get("updated_at"))
+    if ts is not None:
+        return max(0.0, now - ts)
+    try:
+        return max(0.0, now - path.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def _is_stuck_busy_runtime_status(*, now: float | None = None, threshold_seconds: float = DEFAULT_STUCK_BUSY_SECONDS) -> tuple[bool, str]:
+    path = _runtime_status_path()
+    status = _read_runtime_status(path)
+    try:
+        active_agents = int(status.get("active_agents") or 0)
+    except Exception:
+        active_agents = 0
+    if active_agents <= 0:
+        return False, "idle"
+    now = time.time() if now is None else now
+    age = _runtime_status_age_seconds(path, status, now)
+    if age is None:
+        return False, "active status age unknown"
+    if age >= threshold_seconds:
+        return True, f"stuck-busy active_agents={active_agents} heartbeat_age={age:.0f}s threshold={threshold_seconds:.0f}s"
+    return False, f"active heartbeat recent age={age:.0f}s threshold={threshold_seconds:.0f}s"
 
 
 def _load_env(path: Path) -> dict[str, str]:
@@ -209,18 +268,24 @@ def recover_gateway(run: Callable[[Sequence[str]], subprocess.CompletedProcess[s
 def check_once(*, alert: bool = True, run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run) -> int:
     """Return 0 when healthy/recovered, 2 when recovery failed."""
     status = read_gateway_launchd_status(run)
+    recovery_reason: str | None = None
     if status.live:
-        return 0
-
-    if status.loaded:
-        _log(f"loaded but not live: {_domain()}/{DEFAULT_LABEL} {status.summary}; attempting bootstrap")
+        stuck_busy, reason = _is_stuck_busy_runtime_status()
+        if not stuck_busy:
+            return 0
+        recovery_reason = reason
+        _log(f"{reason}; attempting bootstrap")
+    elif status.loaded:
+        recovery_reason = f"loaded but not live: {_domain()}/{DEFAULT_LABEL} {status.summary}"
+        _log(f"{recovery_reason}; attempting bootstrap")
     else:
-        _log(f"domain missing: {_domain()}/{DEFAULT_LABEL}; attempting bootstrap")
+        recovery_reason = f"domain missing: {_domain()}/{DEFAULT_LABEL}"
+        _log(f"{recovery_reason}; attempting bootstrap")
 
     recovered = recover_gateway(run)
     if recovered:
         msg = "⚠️ Hermes default gateway was not live in launchd; watchdog re-bootstrapped it."
-        _log("recovered default gateway launchd liveness")
+        _log(f"recovered default gateway launchd liveness ({recovery_reason})")
         if alert:
             _send_telegram_alert(msg)
         return 0

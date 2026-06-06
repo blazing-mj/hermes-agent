@@ -1745,6 +1745,7 @@ class GatewayRunner:
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    _runtime_status_heartbeat_interval: float = 30.0
     _exit_code: Optional[int] = None
     _draining: bool = False
     _restart_requested: bool = False
@@ -2773,6 +2774,21 @@ class GatewayRunner:
             )
         except Exception:
             pass
+
+
+    async def _runtime_status_heartbeat(self, interval: float | None = None) -> None:
+        """Periodically refresh gateway_state.json while in-flight agents are active.
+
+        The external launchd watchdog uses a stale `gateway_state.json` with
+        `active_agents > 0` as evidence of a wedged turn.  This heartbeat keeps
+        legitimate long-running requests from looking stale merely because no
+        turn boundary has completed yet.
+        """
+        interval = self._runtime_status_heartbeat_interval if interval is None else interval
+        while self._running:
+            if self._running_agent_count() > 0:
+                self._update_runtime_status("running")
+            await asyncio.sleep(interval)
 
     def _update_platform_runtime_status(
         self,
@@ -4467,6 +4483,10 @@ class GatewayRunner:
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+
+        runtime_status_task = asyncio.create_task(self._runtime_status_heartbeat())
+        self._background_tasks.add(runtime_status_task)
+        runtime_status_task.add_done_callback(self._background_tasks.discard)
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
