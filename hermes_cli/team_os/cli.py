@@ -29,6 +29,7 @@ from .kill_switch import KillSwitch, KillSwitchActive
 from .quota import quota_status_unknown
 from .router import TaskHints, route_task
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
+from .validator_runner import run_validator, write_result as write_validator_result
 
 DEFAULT_KILL_SWITCH_STATE = "~/.hermes/state/team-os-kill-switch.json"
 
@@ -419,6 +420,19 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
         finally:
             lock.release()
         return 0
+    if command == "validate-handoff":
+        result = run_validator(
+            contract_path=Path(getattr(args, "contract")).expanduser(),
+            handoff_path=Path(getattr(args, "handoff")).expanduser(),
+            state_path=Path(getattr(args, "state", "~/.hermes/state/team-os-validator-bounces.json")).expanduser(),
+            review_cmd=tuple(getattr(args, "review_cmd", None) or ()),
+        )
+        output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
+        write_validator_result(result, output)
+        if result.get("verdict") == "PASS":
+            return 0
+        return 3 if result.get("escalate_mj") else 1
+
     if command == "verification-gate":
         task_id = getattr(args, "task_id")
         changed_files = list(getattr(args, "changed_file", None) or [])
@@ -834,6 +848,28 @@ def register_cli(parent) -> None:  # noqa: ANN001
     )
     route.add_argument("--output", help="Optional decision JSON output path")
     route.set_defaults(func=cmd_team_os)
+
+    validate = sub.add_parser(
+        "validate-handoff",
+        help=(
+            "Stage 2: run a cold Validator review of one Worker handoff against "
+            "one validation contract; no dispatch and no auto-Done"
+        ),
+    )
+    validate.add_argument("--contract", required=True, help="Validation contract JSON path")
+    validate.add_argument("--handoff", required=True, help="Worker handoff JSON path")
+    validate.add_argument(
+        "--state",
+        default="~/.hermes/state/team-os-validator-bounces.json",
+        help="Bounce-count state JSON path",
+    )
+    validate.add_argument("--output", help="Optional result JSON path")
+    validate.add_argument(
+        "--review-cmd",
+        nargs="+",
+        help="Optional cold-review command argv; receives TEAM_OS_VALIDATOR_PROMPT path",
+    )
+    validate.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
 
     _register_plan_goal(sub)
     _register_decompose_goal(sub)
