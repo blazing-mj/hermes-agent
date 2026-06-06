@@ -3497,6 +3497,39 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
+    def _kill_tool_subprocesses(self, phase: str) -> None:
+        """Kill tool subprocesses + tear down terminal envs + browsers.
+
+        Used by shutdown cleanup and by per-turn hard-deadline aborts.  A
+        cancelled asyncio task does not stop the worker thread running a
+        blocking tool call; this sweep reclaims registered terminal
+        subprocesses, terminal environments, and browser daemons immediately
+        so a wall-clock timeout does not leak orphaned tool children.
+
+        All steps are best-effort; exceptions are swallowed so one subsystem's
+        failure doesn't block the rest.
+        """
+        try:
+            from tools.process_registry import process_registry
+            _killed = process_registry.kill_all()
+            if _killed:
+                logger.info(
+                    "Tool cleanup (%s): killed %d tool subprocess(es)",
+                    phase, _killed,
+                )
+        except Exception as _e:
+            logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
+        try:
+            from tools.terminal_tool import cleanup_all_environments
+            cleanup_all_environments()
+        except Exception as _e:
+            logger.debug("cleanup_all_environments (%s) error: %s", phase, _e)
+        try:
+            from tools.browser_tool import cleanup_all_browsers
+            cleanup_all_browsers()
+        except Exception as _e:
+            logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
+
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
@@ -6046,40 +6079,6 @@ class GatewayRunner:
             return
 
         async def _stop_impl() -> None:
-            def _kill_tool_subprocesses(phase: str) -> None:
-                """Kill tool subprocesses + tear down terminal envs + browsers.
-
-                Called twice in the shutdown path: once eagerly after a
-                drain timeout forces agent interrupt (so we reclaim bash/
-                sleep children before systemd TimeoutStopSec escalates to
-                SIGKILL on the cgroup — #8202), and once as a final
-                catch-all at the end of _stop_impl() for the graceful
-                path or anything respawned mid-teardown.
-
-                All steps are best-effort; exceptions are swallowed so
-                one subsystem's failure doesn't block the rest.
-                """
-                try:
-                    from tools.process_registry import process_registry
-                    _killed = process_registry.kill_all()
-                    if _killed:
-                        logger.info(
-                            "Shutdown (%s): killed %d tool subprocess(es)",
-                            phase, _killed,
-                        )
-                except Exception as _e:
-                    logger.debug("process_registry.kill_all (%s) error: %s", phase, _e)
-                try:
-                    from tools.terminal_tool import cleanup_all_environments
-                    cleanup_all_environments()
-                except Exception as _e:
-                    logger.debug("cleanup_all_environments (%s) error: %s", phase, _e)
-                try:
-                    from tools.browser_tool import cleanup_all_browsers
-                    cleanup_all_browsers()
-                except Exception as _e:
-                    logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
-
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -6201,7 +6200,7 @@ class GatewayRunner:
                 # children left behind by an interrupted terminal tool get
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
-                _kill_tool_subprocesses("post-interrupt")
+                self._kill_tool_subprocesses("post-interrupt")
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
                     _phase_elapsed(),
@@ -6279,7 +6278,7 @@ class GatewayRunner:
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
-            _kill_tool_subprocesses("final-cleanup")
+            self._kill_tool_subprocesses("final-cleanup")
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",
                 _phase_elapsed(),
@@ -17928,6 +17927,7 @@ class GatewayRunner:
 
                 if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
                     _timed_out_agent.interrupt("Execution timed out (wall-clock)")
+                self._kill_tool_subprocesses("wall-clock-deadline")
                 _executor_task.cancel()
 
                 _deadline_mins = int((_wall_clock_timeout or 0) // 60) or 1
