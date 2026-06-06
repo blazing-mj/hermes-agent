@@ -5280,8 +5280,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
-        msg = self._effective_update_message(update)
-        if not msg or not msg.text:
+        # Command updates are normal messages. Prefer update.message when it
+        # has concrete text so test doubles (and Telegram's command handler)
+        # don't accidentally route through a truthy MagicMock effective_message.
+        raw_msg = getattr(update, "message", None)
+        if raw_msg is not None and isinstance(getattr(raw_msg, "text", None), str):
+            msg = raw_msg
+        else:
+            msg = self._effective_update_message(update)
+        if not msg or not isinstance(getattr(msg, "text", None), str) or not msg.text:
             return
         command_text = msg.text.split()[0].split("@", 1)[0].lower()
         if command_text in {"/stop_team_os", "/teamos_stop"}:
