@@ -8911,6 +8911,25 @@ def cmd_update(args):
         )
         return
 
+    # MJ local safety rail: this production install is pinned to v0.15.2 until
+    # an explicit gated cutover.  A blind `hermes update --yes` can restart the
+    # live gateway and jump to a risky release, so apply-path updates are
+    # blocked by default while read-only `hermes update --check` remains allowed.
+    try:
+        from hermes_cli.config import load_config
+
+        updates_cfg = load_config().get("updates", {})
+    except Exception:
+        updates_cfg = {}
+    apply_allowed = bool(updates_cfg.get("allow_apply", False)) or os.environ.get(
+        "HERMES_UPDATE_GATE_APPROVED"
+    ) == "1"
+    if not apply_allowed:
+        print("✗ Hermes update is gated on this install.")
+        print("  Current production pin: v0.15.2. Use `hermes update --check` for read-only checks.")
+        print("  To perform an approved cutover, set updates.allow_apply: true or HERMES_UPDATE_GATE_APPROVED=1 for that gated run only.")
+        sys.exit(2)
+
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
