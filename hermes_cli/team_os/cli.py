@@ -30,6 +30,7 @@ from .quota import quota_status_unknown
 from .router import TaskHints, route_task
 from .verification_gate import build_verification_plan, run_verification_plan, write_proof_artifact
 from .validator_runner import run_validator, write_result as write_validator_result
+from .worker_runner import run_worker
 
 DEFAULT_KILL_SWITCH_STATE = "~/.hermes/state/team-os-kill-switch.json"
 
@@ -585,6 +586,36 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
             print(rendered)
         return 0 if not errors else 1
 
+    if command == "run-worker":
+        contract_path = Path(getattr(args, "contract")).expanduser()
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        repo_root = Path(getattr(args, "repo_root")).expanduser()
+        worktree_root = Path(getattr(args, "worktree_root")).expanduser()
+        lease_path = Path(getattr(args, "lease")).expanduser()
+        branch = getattr(args, "branch")
+        timeout_seconds = float(getattr(args, "timeout_seconds", 600.0) or 600.0)
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        result = run_worker(
+            contract=contract,
+            repo_root=repo_root,
+            worktree_root=worktree_root,
+            lease_path=lease_path,
+            branch=branch,
+            timeout_seconds=timeout_seconds,
+        )
+        rendered = json.dumps(result, indent=2, sort_keys=True)
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0 if result.get("worker_status") == "completed" else 1
+
     if command != "snapshot":
         raise SystemExit(f"unknown team-os command: {command}")
 
@@ -875,6 +906,7 @@ def register_cli(parent) -> None:  # noqa: ANN001
     _register_decompose_goal(sub)
     _register_kill_switch(sub)
     _register_contracts(sub)
+    _register_run_worker(sub)
 
     parent.set_defaults(func=cmd_team_os)
 
@@ -974,3 +1006,31 @@ def _register_contracts(sub) -> None:  # noqa: ANN001
     )
     check_contract.add_argument("--output", help="Optional JSON output path")
     check_contract.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
+
+
+def _register_run_worker(sub) -> None:  # noqa: ANN001
+    """Register the Stage 3 isolated Worker runner subcommand (AGENTS-177)."""
+    worker = sub.add_parser(
+        "run-worker",
+        help=(
+            "Stage 3: run one Team OS Developer/Worker in an isolated git worktree; "
+            "human gate stays on and no auto-Done occurs"
+        ),
+    )
+    worker.add_argument("--contract", required=True, help="Validation contract JSON path")
+    worker.add_argument("--repo-root", required=True, help="Source git repository root")
+    worker.add_argument(
+        "--worktree-root",
+        required=True,
+        help="Directory under which worker worktrees are created",
+    )
+    worker.add_argument("--lease", required=True, help="Lease JSON path for this one-ticket worker")
+    worker.add_argument("--branch", required=True, help="Ephemeral worker branch/worktree name")
+    worker.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Hard worker timeout in seconds",
+    )
+    worker.add_argument("--output", help="Optional Worker handoff JSON output path")
+    worker.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
