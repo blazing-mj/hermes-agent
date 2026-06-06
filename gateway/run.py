@@ -15439,6 +15439,11 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        try:
+            if getattr(self, "_running", False):
+                self._update_runtime_status("draining" if getattr(self, "_draining", False) else "running")
+        except Exception as e:
+            logger.debug("runtime status refresh after running-agent release failed for %s: %s", session_key, e)
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:

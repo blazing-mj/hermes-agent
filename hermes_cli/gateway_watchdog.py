@@ -24,6 +24,7 @@ DEFAULT_PLIST = "ai.hermes.gateway.plist"
 LOG_NAME = "gateway-domain-watchdog.log"
 ALERT_COOLDOWN_SECONDS = 30 * 60
 DEFAULT_STUCK_BUSY_SECONDS = 20 * 60
+DEFAULT_STUCK_BUSY_PROBE_SECONDS = 12.0
 DEFAULT_RECOVERY_ROUNDS = 3
 DEFAULT_RECOVERY_PROBE_ATTEMPTS = 5
 
@@ -95,6 +96,42 @@ def _runtime_status_age_seconds(path: Path, status: dict[str, object], now: floa
         return max(0.0, now - path.stat().st_mtime)
     except OSError:
         return None
+
+
+def _runtime_heartbeat_marker(path: Path, status: dict[str, object]) -> float | None:
+    """Comparable heartbeat marker from updated_at, falling back to mtime."""
+    ts = _parse_status_timestamp(status.get("updated_at"))
+    if ts is not None:
+        return ts
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _stuck_busy_heartbeat_advances(probe_seconds: float = DEFAULT_STUCK_BUSY_PROBE_SECONDS) -> bool:
+    """Return True when the runtime status proves the live gateway is still ticking.
+
+    A leaked active_agents counter can make an idle gateway look "busy" forever.
+    Before destructive stuck-busy recovery, do a bounded live probe: if the
+    gateway's runtime heartbeat advances during the probe window, suppress
+    recovery and let the counter-reset path fix the status on the next turn end.
+    """
+    path = _runtime_status_path()
+    before = _read_runtime_status(path)
+    before_marker = _runtime_heartbeat_marker(path, before)
+    time.sleep(max(0.0, probe_seconds))
+    after = _read_runtime_status(path)
+    after_marker = _runtime_heartbeat_marker(path, after)
+    try:
+        after_active = int(after.get("active_agents") or 0)
+    except Exception:
+        after_active = 0
+    if after_active <= 0:
+        return True
+    if before_marker is None or after_marker is None:
+        return False
+    return after_marker > before_marker
 
 
 def _is_stuck_busy_runtime_status(*, now: float | None = None, threshold_seconds: float = DEFAULT_STUCK_BUSY_SECONDS) -> tuple[bool, str]:
@@ -278,6 +315,9 @@ def check_once(*, alert: bool = True, run: Callable[[Sequence[str]], subprocess.
     if status.live:
         stuck_busy, reason = _is_stuck_busy_runtime_status()
         if not stuck_busy:
+            return 0
+        if _stuck_busy_heartbeat_advances():
+            _log(f"stuck-busy heartbeat advanced during live probe; suppressing recovery ({reason})")
             return 0
         recovery_reason = reason
         _log(f"{reason}; attempting bootstrap")

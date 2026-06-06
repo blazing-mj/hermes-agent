@@ -283,6 +283,7 @@ def test_watchdog_suppresses_recovery_for_recent_active_gateway(monkeypatch, tmp
 def test_watchdog_recovers_stale_active_gateway(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(gateway_watchdog.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(gateway_watchdog, "DEFAULT_STUCK_BUSY_PROBE_SECONDS", 0.1)
     launch_agents = tmp_path / "Library" / "LaunchAgents"
     launch_agents.mkdir(parents=True)
     (launch_agents / "ai.hermes.gateway.plist").write_text("plist", encoding="utf-8")
@@ -309,6 +310,38 @@ def test_watchdog_recovers_stale_active_gateway(monkeypatch, tmp_path):
     assert ["launchctl", "bootstrap", domain, str(launch_agents / "ai.hermes.gateway.plist")] in calls
     log = tmp_path / "logs" / gateway_watchdog.LOG_NAME
     assert "stuck-busy" in log.read_text(encoding="utf-8")
+
+
+def test_watchdog_suppresses_stale_active_recovery_when_heartbeat_advances(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_watchdog.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(gateway_watchdog, "DEFAULT_STUCK_BUSY_PROBE_SECONDS", 0.1)
+    _write_gateway_state(tmp_path, active_agents=1, age_seconds=gateway_watchdog.DEFAULT_STUCK_BUSY_SECONDS + 5)
+    calls = []
+    reads = {"count": 0}
+    real_read = gateway_watchdog._read_runtime_status
+
+    def fake_read(path=None):
+        reads["count"] += 1
+        if reads["count"] >= 3:
+            path_to_write = tmp_path / "gateway_state.json"
+            future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 10))
+            path_to_write.write_text(
+                json.dumps({"gateway_state": "running", "active_agents": 1, "updated_at": future}),
+                encoding="utf-8",
+            )
+        return real_read(path)
+
+    monkeypatch.setattr(gateway_watchdog, "_read_runtime_status", fake_read)
+
+    def fake_run(cmd):
+        calls.append(list(cmd))
+        return _print_result(state="running", pid=1234)
+
+    assert gateway_watchdog.check_once(alert=False, run=fake_run) == 0
+    assert calls == [["launchctl", "print", f"gui/{gateway_watchdog.os.getuid()}/ai.hermes.gateway"]]
+    log = tmp_path / "logs" / gateway_watchdog.LOG_NAME
+    assert "stuck-busy heartbeat advanced" in log.read_text(encoding="utf-8")
 
 
 def test_watchdog_does_not_recover_idle_gateway_with_stale_status(monkeypatch, tmp_path):

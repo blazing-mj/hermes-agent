@@ -46,6 +46,29 @@ class TestReleaseRunningAgentStateUnit:
         assert "k" not in runner._running_agents_ts
         assert "k" not in runner._busy_ack_ts
 
+    def test_release_refreshes_runtime_status_after_active_count_drops(self):
+        runner = _make_runner()
+        runner._running_agents["k"] = MagicMock()
+        runner._running_agents_ts["k"] = 123.0
+        runner._busy_ack_ts["k"] = 456.0
+        runner._running = True
+        runner._draining = False
+        runner._update_runtime_status = MagicMock()
+
+        runner._release_running_agent_state("k")
+
+        runner._update_runtime_status.assert_called_once_with("running")
+
+    def test_release_does_not_refresh_runtime_status_when_generation_guard_blocks(self):
+        runner = _make_runner()
+        runner._running_agents["k"] = MagicMock()
+        runner._session_run_generation = {"k": 2}
+        runner._update_runtime_status = MagicMock()
+
+        assert runner._release_running_agent_state("k", run_generation=1) is False
+
+        runner._update_runtime_status.assert_not_called()
+
     def test_idempotent_on_missing_key(self):
         """Calling twice (or on an absent key) must not raise."""
         runner = _make_runner()
