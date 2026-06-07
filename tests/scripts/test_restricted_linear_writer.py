@@ -1,4 +1,4 @@
-"""Tests for restricted_linear_writer.py (AGENTS-150 Phase A)."""
+"""Tests for restricted_linear_writer.py (AGENTS-150 + AGENTS-190 Phase 1)."""
 from __future__ import annotations
 
 import importlib.util
@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 SCRIPT_PATH = Path("/Users/alfred/.hermes/scripts/restricted_linear_writer.py")
+TRANSITIONS_PATH = Path("/Users/alfred/.hermes/hermes-agent/docs/team-os/board-transitions.json")
 
 
 @pytest.fixture(scope="module")
@@ -37,7 +38,7 @@ def test_denied_actions_never_call_runner(mod):
     assert calls == []
 
 
-@pytest.mark.parametrize("field", ["issueUpdate", "stateId"])
+@pytest.mark.parametrize("field", ["issueUpdate", "stateId", "assigneeId"])
 def test_blocked_payload_field_denied(mod, field):
     calls = []
 
@@ -66,7 +67,7 @@ def test_nested_graphql_like_payload_denied_even_when_surface_fields_safe(mod):
         "action": "comment",
         "issue": "AGENTS-1",
         "body": "safe",
-        "graphql": {"mutation": "issueUpdate", "stateId": "done"},
+        "graphql": {"mutation": "issueUpdate", "stateId": "done", "assigneeId": "user-1"},
     }
     result = mod.execute_proposal(proposal, runner=runner)
 
@@ -170,10 +171,110 @@ def test_cli_dry_run_does_not_call_real_linear_agent(tmp_path):
         shell=False,
         timeout=30,
     )
-
     assert proc.returncode == 0
     payload = json.loads(proc.stdout)
     assert payload["ok"] is True
     assert payload["executed"] == 1
     assert "linear-agent" in payload["messages"][0]
     assert "comment" in payload["messages"][0]
+
+
+def test_every_transition_allowlist_move_is_accepted_by_status_gate(mod, tmp_path):
+    spec = json.loads(TRANSITIONS_PATH.read_text(encoding="utf-8"))
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append((argv, stdin))
+        return json.dumps({"issue": "AGENTS-1", "state": {"name": argv[3]}})
+
+    actions = [
+        {"action": "status", "issue": "AGENTS-1", "from": t["from"], "to": t["to"], "by": actor, "conditions_met": t.get("conditions", [])}
+        for t in spec["transitions"]
+        for actor in t["by"]
+    ]
+    result = mod.execute_proposal({"actions": actions}, runner=runner, ledger_dir=tmp_path)
+
+    assert result["ok"] is True
+    assert result["executed"] == len(actions)
+    assert result["denied"] == 0
+    assert len(calls) == len(actions)
+    assert all(call[0][1] == "status" for call in calls)
+
+
+def test_illegal_status_moves_are_rejected_before_runner(mod, tmp_path):
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append((argv, stdin))
+        return "SHOULD_NOT_RUN"
+
+    illegal_actions = [
+        {"action": "status", "issue": "AGENTS-1", "from": "Backlog", "to": "Done", "by": "cortex"},
+        {"action": "status", "issue": "AGENTS-1", "from": "Triage", "to": "Done", "by": "cortex"},
+        {"action": "status", "issue": "AGENTS-1", "from": "Needs-MJ", "to": "Done", "by": "cortex"},
+        {"action": "status", "issue": "AGENTS-1", "from": "Todo", "to": "In Progress", "by": "cortex"},
+        {"action": "status", "issue": "AGENTS-1", "from": "In Progress", "to": "In Review", "by": "cortex"},
+        {"action": "status", "issue": "AGENTS-1", "from": "In Review", "to": "Done", "by": "validator", "conditions_met": ["classified_low_cost"]},
+    ]
+    result = mod.execute_proposal({"actions": illegal_actions}, runner=runner, ledger_dir=tmp_path)
+
+    assert result["ok"] is False
+    assert result["executed"] == 0
+    assert result["denied"] == len(illegal_actions)
+    assert calls == []
+
+
+def test_standalone_assignee_update_is_rejected(mod, tmp_path):
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append((argv, stdin))
+        return "SHOULD_NOT_RUN"
+
+    result = mod.execute_proposal(
+        {"action": "assign", "issue": "AGENTS-1", "assignee": "cto"},
+        runner=runner,
+        ledger_dir=tmp_path,
+    )
+
+    assert result["ok"] is False
+    assert result["executed"] == 0
+    assert result["denied"] == 1
+    assert calls == []
+
+
+def test_assignee_update_is_only_available_inside_allowed_status_move(mod, tmp_path):
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append((argv, stdin))
+        return "ok"
+
+    legal = mod.execute_proposal(
+        {"action": "status", "issue": "AGENTS-1", "from": "Triage", "to": "Todo", "by": "cortex", "conditions_met": ["grounding_and_contract_present", "assignee_set_cto", "human_gate_label_absent"], "assignee": "cto"},
+        runner=runner,
+        ledger_dir=tmp_path,
+    )
+
+    assert legal["ok"] is True
+    assert calls[0][0] == [mod.LINEAR_AGENT, "status", "AGENTS-1", "Todo", "--assignee", "cto"]
+
+
+def test_status_move_uses_idempotent_outbox_and_skips_repeated_op(mod, tmp_path):
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append((argv, stdin))
+        return "moved"
+
+    action = {"action": "status", "issue": "AGENTS-1", "from": "Backlog", "to": "Triage", "by": "cortex"}
+    first = mod.execute_proposal(action, runner=runner, ledger_dir=tmp_path)
+    second = mod.execute_proposal(action, runner=runner, ledger_dir=tmp_path)
+    ledger = json.loads((tmp_path / "restricted-linear-writer-outbox.json").read_text(encoding="utf-8"))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert len(calls) == 1
+    assert first["messages"][0].startswith("outbox committed team-os-board-move:")
+    assert second["messages"][0].startswith("outbox already committed team-os-board-move:")
+    assert len(ledger["operations"]) == 1
