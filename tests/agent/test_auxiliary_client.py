@@ -2650,7 +2650,15 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self, monkeypatch):
+        fake_time = {"now": 0.0}
+
+        def _advance(seconds: float) -> None:
+            fake_time["now"] += seconds
+
+        monkeypatch.setattr(time, "monotonic", lambda: fake_time["now"])
+        monkeypatch.setattr(time, "sleep", _advance)
+
         class _SlowAliveCreateStream:
             def __iter__(self):
                 for _ in range(5):
@@ -2666,14 +2674,13 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert fake_time["now"] < 0.14
 
 
 class TestCodexAuxiliaryAdapterNullOutputRecovery:
