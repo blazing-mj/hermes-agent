@@ -186,7 +186,7 @@ def test_exec_slice_uses_teamos_exec_prompt_and_requires_handoff_file(tmp_path):
         worktree_path=worktree,
         handoff_path=handoff,
     )
-    assert "teamos-exec" in prompt
+    assert "cto" in prompt
     assert "delegate_task" in prompt
     assert str(worktree) in prompt
     assert "Do not merge" in prompt
@@ -200,7 +200,7 @@ def test_exec_slice_uses_teamos_exec_prompt_and_requires_handoff_file(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["profile"] == "teamos-exec"
+    assert result["profile"] == "cto"
     assert Path(result["mission_prompt_path"]).exists()
     assert json.loads(handoff.read_text())["worker_status"] == "completed"
 

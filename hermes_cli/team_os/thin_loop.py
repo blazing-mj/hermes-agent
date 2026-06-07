@@ -258,11 +258,11 @@ def prepare_thin_loop_mission(
 
 
 def build_developer_mission_prompt(*, contract_path: Path, worktree_path: Path, handoff_path: Path) -> str:
-    """Render the one-shot prompt for the subscription-only teamos-exec profile."""
+    """Render the one-shot prompt for the subscription-only cto profile."""
 
     return "\n".join(
         [
-            "You are the Team OS Developer slice running under the teamos-exec profile.",
+            "You are the Team OS Developer slice running under the cto profile.",
             "Subscription-only execution is required: use native delegate_task, not API keys.",
             "Run exactly one delegate_task Worker. Do not merge, live-dispatch, or mark Linear Done.",
             "Pass the Worker this exact isolated workspace path and require it to edit only allowed files.",
@@ -282,11 +282,11 @@ def run_teamos_exec_slice(
     worktree_path: Path,
     handoff_path: Path,
     mission_prompt_path: Path,
-    profile: str = "teamos-exec",
+    profile: str = "cto",
     timeout_seconds: float | None = None,
     command: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run one Developer slice through ``hermes chat --profile teamos-exec -q``.
+    """Run one Developer slice through ``hermes chat --profile cto -q``.
 
     The optional ``command`` exists for focused tests; production callers leave it
     unset so the path uses the Hermes CLI and the configured subscription profile.
@@ -558,7 +558,7 @@ def orchestrate_standard_engine_proof(
 
     standard_engine = {
         "orchestration": "grounding->contract->mission->worker->planted-bounce->adversarial->validator",
-        "worker_route": "teamos-exec/Codex subscription",
+        "worker_route": "cto/Codex subscription",
         "validator_route": "Claude Max cold session",
         "auto_done_allowed": False,
         "live_dispatch_allowed": False,
