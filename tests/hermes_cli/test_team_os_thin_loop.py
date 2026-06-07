@@ -81,3 +81,41 @@ def test_prepare_thin_loop_mission_denies_risky_surface_before_worktree(tmp_path
     assert not Path(result["paths"]["worktree_path"]).exists()
     status = json.loads(Path(result["paths"]["status_path"]).read_text())
     assert status["worktree_created"] is False
+
+
+def test_exec_slice_uses_teamos_exec_prompt_and_requires_handoff_file(tmp_path):
+    from hermes_cli.team_os.thin_loop import build_developer_mission_prompt, run_teamos_exec_slice
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    contract = tmp_path / "contract.json"
+    handoff = tmp_path / "handoff.json"
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    helper = tmp_path / "write_handoff.py"
+    helper.write_text(
+        "import json, pathlib; pathlib.Path(r'%s').write_text(json.dumps({'worker_status':'completed'}))\n" % handoff,
+        encoding="utf-8",
+    )
+
+    prompt = build_developer_mission_prompt(
+        contract_path=contract,
+        worktree_path=worktree,
+        handoff_path=handoff,
+    )
+    assert "teamos-exec" in prompt
+    assert "delegate_task" in prompt
+    assert str(worktree) in prompt
+    assert "Do not merge" in prompt
+
+    result = run_teamos_exec_slice(
+        contract_path=contract,
+        worktree_path=worktree,
+        handoff_path=handoff,
+        mission_prompt_path=tmp_path / "mission_prompt.md",
+        command=["python3.13", str(helper)],
+    )
+
+    assert result["ok"] is True
+    assert result["profile"] == "teamos-exec"
+    assert Path(result["mission_prompt_path"]).exists()
+    assert json.loads(handoff.read_text())["worker_status"] == "completed"

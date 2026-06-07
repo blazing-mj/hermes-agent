@@ -233,6 +233,78 @@ def prepare_thin_loop_mission(
     return {"ok": True, "status": "prepared", "branch": branch, "paths": _paths_dict(paths)}
 
 
+def build_developer_mission_prompt(*, contract_path: Path, worktree_path: Path, handoff_path: Path) -> str:
+    """Render the one-shot prompt for the subscription-only teamos-exec profile."""
+
+    return "\n".join(
+        [
+            "You are the Team OS Developer slice running under the teamos-exec profile.",
+            "Subscription-only execution is required: use native delegate_task, not API keys.",
+            "Run exactly one delegate_task Worker. Do not merge, live-dispatch, or mark Linear Done.",
+            "Pass the Worker this exact isolated workspace path and require it to edit only allowed files.",
+            "Write the final Worker handoff JSON to the handoff path below.",
+            "Return compact JSON with ok=true only after the handoff file exists.",
+            "",
+            f"CONTRACT_PATH: {contract_path}",
+            f"WORKTREE_PATH: {worktree_path}",
+            f"HANDOFF_PATH: {handoff_path}",
+        ]
+    )
+
+
+def run_teamos_exec_slice(
+    *,
+    contract_path: Path,
+    worktree_path: Path,
+    handoff_path: Path,
+    mission_prompt_path: Path,
+    profile: str = "teamos-exec",
+    timeout_seconds: float = 600.0,
+    command: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run one Developer slice through ``hermes chat --profile teamos-exec -q``.
+
+    The optional ``command`` exists for focused tests; production callers leave it
+    unset so the path uses the Hermes CLI and the configured subscription profile.
+    """
+
+    prompt = build_developer_mission_prompt(
+        contract_path=contract_path,
+        worktree_path=worktree_path,
+        handoff_path=handoff_path,
+    )
+    mission_prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    mission_prompt_path.write_text(prompt + "\n", encoding="utf-8")
+
+    argv = command or [
+        "hermes",
+        "chat",
+        "--profile",
+        profile,
+        "--toolsets",
+        "delegation,file,terminal",
+        "-q",
+        prompt,
+    ]
+    completed = subprocess.run(
+        argv,
+        cwd=worktree_path,
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    return {
+        "ok": completed.returncode == 0 and handoff_path.exists(),
+        "profile": profile,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "mission_prompt_path": str(mission_prompt_path),
+        "handoff_path": str(handoff_path),
+    }
+
+
 def _paths_dict(paths: MissionPaths) -> dict[str, str]:
     return {
         "mission_dir": str(paths.mission_dir),
