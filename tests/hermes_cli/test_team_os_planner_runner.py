@@ -176,9 +176,49 @@ def test_grounded_contracts_include_worker_ready_specific_scope_and_proof():
         assert contract["commands"] == contract["required_commands"]
         assert any("pytest" in cmd for cmd in contract["required_commands"])
         assert any(task["description"][:32] in item for item in contract["acceptance_criteria"])
+        grounding = contract["grounding_doc"]
+        assert grounding["schema"] == "team_os.grounding.v1"
+        assert grounding["source_ticket"] == "AGENTS-148"
+        assert grounding["citations"]
+        assert all("file" in citation and "line" in citation and "excerpt" in citation for citation in grounding["citations"])
         seen_acceptance.add(tuple(contract["acceptance_criteria"]))
 
     assert len(seen_acceptance) == len(run["tasks"])
+
+
+def test_plan_goal_bounces_contract_without_grounding_doc_file_line_citations():
+    from hermes_cli.team_os.planner_runner import plan_goal, validate_planner_output
+
+    run = plan_goal(**_goal())
+    bad_run = json.loads(json.dumps(run))
+    del bad_run["tasks"][0]["validation_contract"]["grounding_doc"]
+
+    missing = validate_planner_output(
+        goal_id=_goal()["goal_id"],
+        goal_title=_goal()["goal_title"],
+        goal_body=_goal()["goal_body"],
+        planned_tasks=bad_run["tasks"],
+        loop_feed_allowed=bad_run["loop_feed_allowed"],
+    )
+
+    assert missing["verdict"] == "BOUNCE"
+    assert any("grounding_doc" in err for err in missing["errors"])
+
+    bad_run = json.loads(json.dumps(run))
+    bad_run["tasks"][0]["validation_contract"]["grounding_doc"]["citations"] = [
+        {"file": "hermes_cli/team_os/planner_runner.py", "excerpt": "missing line"}
+    ]
+
+    no_line = validate_planner_output(
+        goal_id=_goal()["goal_id"],
+        goal_title=_goal()["goal_title"],
+        goal_body=_goal()["goal_body"],
+        planned_tasks=bad_run["tasks"],
+        loop_feed_allowed=bad_run["loop_feed_allowed"],
+    )
+
+    assert no_line["verdict"] == "BOUNCE"
+    assert any("file:line" in err for err in no_line["errors"])
 
 
 def test_generated_acceptance_criteria_are_crisp_pass_fail_conditions():

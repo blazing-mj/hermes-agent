@@ -202,10 +202,16 @@ def test_validate_worker_handoff_passes_only_with_quoted_git_diff_evidence(tmp_p
         encoding="utf-8",
     )
 
+    adversarial = tmp_path / "adversarial.json"
+    adversarial.write_text(
+        json.dumps({"verdict": "PASS", "semantic_claims_supported": True, "model": "claude-max"}),
+        encoding="utf-8",
+    )
     result = validate_worker_handoff(
         contract_path=contract,
         worktree_path=repo,
         handoff_path=handoff,
+        adversarial_review_path=adversarial,
         output_path=tmp_path / "pass.json",
     )
 
@@ -256,14 +262,129 @@ def test_validate_worker_handoff_uses_diff_head_for_committed_worker_changes(tmp
         encoding="utf-8",
     )
 
+    adversarial = tmp_path / "adversarial.json"
+    adversarial.write_text(
+        json.dumps({"verdict": "PASS", "semantic_claims_supported": True, "model": "claude-max"}),
+        encoding="utf-8",
+    )
     result = validate_worker_handoff(
+        contract_path=contract,
+        worktree_path=repo,
+        handoff_path=handoff,
+        adversarial_review_path=adversarial,
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["changed_files"] == ["hermes_cli/team_os/planner_runner.py"]
+
+
+def test_validate_worker_handoff_requires_adversarial_semantic_pass(tmp_path):
+    from hermes_cli.team_os.thin_loop import validate_worker_handoff
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    source = repo / "hermes_cli/team_os/planner_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def criteria():\n    return ['old']\n", encoding="utf-8")
+    test_file = repo / "tests/hermes_cli/test_team_os_planner_runner.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_old():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed planner"], cwd=repo, check=True, capture_output=True)
+    source.write_text("def criteria():\n    return ['Pass/fail: observable behavior']\n", encoding="utf-8")
+
+    contract = tmp_path / "contract.json"
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "worker_status": "completed",
+                "proof_output": "1 passed",
+                "claims": [
+                    {
+                        "claim": "Gateway media placeholder bug is fixed",
+                        "diff_substrings": ["Pass/fail: observable behavior"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    missing = validate_worker_handoff(
         contract_path=contract,
         worktree_path=repo,
         handoff_path=handoff,
     )
 
-    assert result["verdict"] == "PASS"
-    assert result["changed_files"] == ["hermes_cli/team_os/planner_runner.py"]
+    assert missing["verdict"] == "BOUNCE"
+    assert any("adversarial" in err.lower() for err in missing["errors"])
+
+    adversarial = tmp_path / "adversarial.json"
+    adversarial.write_text(
+        json.dumps(
+            {
+                "verdict": "BOUNCE",
+                "semantic_claims_supported": False,
+                "model": "claude-max",
+                "findings": ["Diff only changes generic criteria text; it does not support a gateway media placeholder fix claim."],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bounced = validate_worker_handoff(
+        contract_path=contract,
+        worktree_path=repo,
+        handoff_path=handoff,
+        adversarial_review_path=adversarial,
+    )
+
+    assert bounced["verdict"] == "BOUNCE"
+    assert any("semantic" in err.lower() for err in bounced["errors"])
+
+
+def test_run_adversarial_validator_uses_claude_max_cold_session_and_parses_wrapper_json(tmp_path):
+    from hermes_cli.team_os.thin_loop import build_adversarial_validator_prompt, run_adversarial_validator
+
+    contract = tmp_path / "contract.json"
+    handoff = tmp_path / "handoff.json"
+    review = tmp_path / "adversarial.json"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff.write_text(json.dumps({"claims": []}), encoding="utf-8")
+
+    prompt = build_adversarial_validator_prompt(
+        contract_path=contract,
+        worktree_path=worktree,
+        handoff_path=handoff,
+    )
+    assert "Claude Max" in prompt
+    assert "different model than the Worker" in prompt
+    assert "semantic" in prompt.lower()
+    assert "diff actually supports each claim" in prompt
+
+    helper = tmp_path / "reviewer.py"
+    helper.write_text(
+        "import json; print(json.dumps({'type':'result','result': json.dumps({'verdict':'PASS','semantic_claims_supported': True, 'model':'claude-max'})}))",
+        encoding="utf-8",
+    )
+
+    result = run_adversarial_validator(
+        contract_path=contract,
+        worktree_path=worktree,
+        handoff_path=handoff,
+        output_path=review,
+        command=["python3.13", str(helper)],
+    )
+
+    assert result["ok"] is True
+    assert result["review"]["verdict"] == "PASS"
+    assert result["review"]["semantic_claims_supported"] is True
+    assert json.loads(review.read_text(encoding="utf-8"))["model"] == "claude-max"
 
 
 def test_render_proof_ping_is_blocked_until_validator_pass():

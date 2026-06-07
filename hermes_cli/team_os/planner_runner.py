@@ -8,6 +8,7 @@ cold-style intent-preservation validator before anything can feed the loop.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Sequence
 
 from .contracts import check_contract
@@ -129,6 +130,94 @@ def _dedupe(items: Sequence[str]) -> list[str]:
     return result
 
 
+def _first_substantive_line(path: Path) -> dict[str, Any] | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line_no, line in enumerate(lines, start=1):
+        text = line.strip()
+        if text:
+            return {"file": str(path), "line": line_no, "excerpt": text[:220]}
+    return {"file": str(path), "line": 1, "excerpt": "<empty file>"}
+
+
+def _resolve_citation_target(surface: str, *, repo_root: Path) -> Path | None:
+    clean = surface.split(" or ", 1)[0].strip()
+    if "*" in clean:
+        matches = sorted(repo_root.glob(clean))
+        for match in matches:
+            if match.is_file() and match.suffix.lower() not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                return match
+        return None
+    candidate = repo_root / clean
+    if candidate.is_file():
+        return candidate
+    if candidate.is_dir():
+        for pattern in ("*.py", "*.md", "*.yaml", "*.yml", "*.json"):
+            matches = sorted(candidate.rglob(pattern))
+            if matches:
+                return matches[0]
+    return None
+
+
+def build_grounding_doc(
+    *,
+    source_ticket: str,
+    task_description: str,
+    files: Sequence[str],
+    areas: Sequence[str],
+    repo_root: Path | str = ".",
+) -> dict[str, Any]:
+    """Build the pre-contract grounding doc with concrete file:line citations."""
+    root = Path(repo_root)
+    citations: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    for surface in files:
+        target = _resolve_citation_target(surface, repo_root=root)
+        citation = _first_substantive_line(target) if target else None
+        if citation is None or target is None:
+            unresolved.append(surface)
+            continue
+        try:
+            citation["file"] = str(target.relative_to(root))
+        except ValueError:
+            citation["file"] = str(target)
+        citation["surface"] = surface
+        citations.append(citation)
+    return {
+        "schema": "team_os.grounding.v1",
+        "source_ticket": source_ticket,
+        "task_description": task_description,
+        "areas": list(areas),
+        "citations": citations,
+        "unresolved_surfaces": unresolved,
+    }
+
+
+def _grounding_doc_errors(grounding: Any, *, prefix: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(grounding, dict):
+        return [f"{prefix}: grounding_doc is required before writing a contract"]
+    if grounding.get("schema") != "team_os.grounding.v1":
+        errors.append(f"{prefix}: grounding_doc schema must be team_os.grounding.v1")
+    citations = grounding.get("citations")
+    if not isinstance(citations, list) or not citations:
+        errors.append(f"{prefix}: grounding_doc citations must include at least one file:line citation")
+        return errors
+    for idx, citation in enumerate(citations):
+        if not isinstance(citation, dict):
+            errors.append(f"{prefix}: grounding_doc citation[{idx}] must be an object")
+            continue
+        if not isinstance(citation.get("file"), str) or not citation.get("file", "").strip():
+            errors.append(f"{prefix}: grounding_doc citation[{idx}] missing file")
+        if not isinstance(citation.get("line"), int) or citation.get("line", 0) <= 0:
+            errors.append(f"{prefix}: grounding_doc citation[{idx}] missing file:line line number")
+        if not isinstance(citation.get("excerpt"), str) or not citation.get("excerpt", "").strip():
+            errors.append(f"{prefix}: grounding_doc citation[{idx}] missing excerpt")
+    return errors
+
+
 def _required_commands(goal_id: str, goal_title: str, description: str) -> list[str]:
     text = f"{goal_title} {description}".lower()
     commands = [
@@ -207,6 +296,12 @@ def _build_validation_contract(
 ) -> dict[str, Any]:
     title = goal_title or goal_id
     files, areas = _infer_files_and_areas(goal_title, task.description)
+    grounding_doc = build_grounding_doc(
+        source_ticket=goal_id,
+        task_description=task.description,
+        files=files,
+        areas=areas,
+    )
     commands = _required_commands(goal_id, goal_title, task.description)
     acceptance_criteria = _crisp_acceptance_criteria(task_description=task.description, files=files)
     return {
@@ -215,6 +310,7 @@ def _build_validation_contract(
         "problem": title,
         "areas": areas,
         "files_to_touch": files,
+        "grounding_doc": grounding_doc,
         "implementation_scope": [
             f"Solve only subtask {task.task_id}: {task.description}",
             "Do prerequisite discovery with search/read tools before editing files",
@@ -315,6 +411,8 @@ def validate_planner_output(
         if contract_errors:
             schema_valid = False
             errors.extend(f"{prefix}: contract {err}" for err in contract_errors)
+
+        errors.extend(_grounding_doc_errors(contract.get("grounding_doc"), prefix=prefix))
 
         if contract.get("source_ticket") != goal_id:
             errors.append(f"{prefix}: contract source_ticket does not match {goal_id}")
