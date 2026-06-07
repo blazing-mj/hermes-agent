@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -185,6 +186,20 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+
+    # macOS exposes per-user temp dirs under /private/var/folders/..., while
+    # tempfile.gettempdir() returns that exact tree. Do not classify pytest/tmp
+    # scratch files as system config writes just because their resolved path
+    # lives under /private/var/.
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        for candidate in (resolved, normalized):
+            candidate_real = os.path.realpath(candidate)
+            if candidate_real == temp_root or candidate_real.startswith(temp_root + os.sep):
+                return None
+    except (OSError, ValueError):
+        pass
+
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
