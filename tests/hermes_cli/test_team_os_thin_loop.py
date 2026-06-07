@@ -215,3 +215,45 @@ def test_validate_worker_handoff_passes_only_with_quoted_git_diff_evidence(tmp_p
     assert "+    return ['Pass/fail: observable behavior']" in quoted
     assert "+def test_crisp" in quoted
     assert result["auto_done_allowed"] is False
+
+
+def test_render_proof_ping_is_blocked_until_validator_pass():
+    from hermes_cli.team_os.thin_loop import render_proof_ping
+
+    bounce = {"verdict": "BOUNCE"}
+    not_passed = {"verdict": "BOUNCE"}
+
+    try:
+        render_proof_ping(source_ticket="AGENTS-172", bounce=bounce, passed=not_passed, commits=[])
+    except ValueError as exc:
+        assert "PASS" in str(exc)
+    else:  # pragma: no cover - explicit failure path
+        raise AssertionError("proof ping should require Validator PASS")
+
+
+def test_render_proof_ping_includes_bounce_pass_diff_quotes_and_commits():
+    from hermes_cli.team_os.thin_loop import render_proof_ping
+
+    message = render_proof_ping(
+        source_ticket="AGENTS-172",
+        bounce={"verdict": "BOUNCE"},
+        passed={
+            "verdict": "PASS",
+            "changed_files": ["hermes_cli/team_os/planner_runner.py"],
+            "auto_done_allowed": False,
+            "diff_quotes": [
+                {
+                    "claim": "criteria are crisp",
+                    "diff_lines": ["+        f\"Pass/fail: {subject} is satisfied\""],
+                }
+            ],
+        },
+        commits=["abc123 [verified] example"],
+    )
+
+    assert "AGENTS-172 thin-loop proof: PASS" in message
+    assert "planted_bounce: BOUNCE" in message
+    assert "corrected_pass: PASS" in message
+    assert "+        f\"Pass/fail: {subject} is satisfied\"" in message
+    assert "abc123 [verified] example" in message
+    assert "auto_done_allowed: false" in message

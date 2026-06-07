@@ -392,6 +392,32 @@ def validate_worker_handoff(
     return result
 
 
+def render_proof_ping(*, source_ticket: str, bounce: dict[str, Any], passed: dict[str, Any], commits: list[str]) -> str:
+    """Render the post-PASS operator proof ping for Telegram/Linear comments."""
+
+    if passed.get("verdict") != "PASS":
+        raise ValueError("proof ping is allowed only after Validator PASS")
+    quote_lines = [
+        line
+        for item in passed.get("diff_quotes", [])
+        if isinstance(item, dict)
+        for line in item.get("diff_lines", [])
+    ]
+    return "\n".join(
+        [
+            f"{source_ticket} thin-loop proof: PASS",
+            f"planted_bounce: {bounce.get('verdict')}",
+            f"corrected_pass: {passed.get('verdict')}",
+            f"changed_files: {', '.join(passed.get('changed_files', []))}",
+            f"auto_done_allowed: {str(passed.get('auto_done_allowed')).lower()}",
+            "validator_quoted_diff_lines:",
+            *(f"- {line}" for line in quote_lines[:8]),
+            "commits:",
+            *(f"- {commit}" for commit in commits),
+        ]
+    )
+
+
 def _paths_dict(paths: MissionPaths) -> dict[str, str]:
     return {
         "mission_dir": str(paths.mission_dir),
