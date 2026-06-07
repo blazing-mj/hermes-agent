@@ -259,13 +259,15 @@ def run_teamos_exec_slice(
     handoff_path: Path,
     mission_prompt_path: Path,
     profile: str = "teamos-exec",
-    timeout_seconds: float = 600.0,
+    timeout_seconds: float | None = None,
     command: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one Developer slice through ``hermes chat --profile teamos-exec -q``.
 
     The optional ``command`` exists for focused tests; production callers leave it
     unset so the path uses the Hermes CLI and the configured subscription profile.
+    ``timeout_seconds=None`` intentionally avoids reintroducing a fixed 10-minute
+    slice cap above the Team OS/gateway deadline layer.
     """
 
     prompt = build_developer_mission_prompt(
@@ -322,7 +324,7 @@ def validate_worker_handoff(
     """Validate one Worker handoff against the contract and git diff evidence.
 
     PASS is allowed only when each accepted Worker claim is backed by quoted
-    ``git diff`` lines from the isolated worktree. The Validator never accepts a
+    ``git diff HEAD`` lines from the isolated worktree. The Validator never accepts a
     claim solely because the Worker stated it.
     """
 
@@ -337,12 +339,12 @@ def validate_worker_handoff(
     else:
         handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
 
-    changed_files = _git_lines(["diff", "--name-only"], cwd=worktree_path)
+    changed_files = _git_lines(["diff", "HEAD", "--name-only"], cwd=worktree_path)
     escaped = [path for path in changed_files if path not in allowed_files]
     if escaped:
         errors.append(f"changed files escape allowed area: {escaped}")
 
-    diff_lines = _git_lines(["diff", "--", *sorted(allowed_files)], cwd=worktree_path)
+    diff_lines = _git_lines(["diff", "HEAD", "--", *sorted(allowed_files)], cwd=worktree_path)
     if not diff_lines:
         errors.append("git diff is empty; no worker claim can be proven")
 

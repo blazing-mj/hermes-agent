@@ -217,6 +217,55 @@ def test_validate_worker_handoff_passes_only_with_quoted_git_diff_evidence(tmp_p
     assert result["auto_done_allowed"] is False
 
 
+def test_validate_worker_handoff_uses_diff_head_for_committed_worker_changes(tmp_path):
+    from hermes_cli.team_os.thin_loop import validate_worker_handoff
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    source = repo / "hermes_cli/team_os/planner_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def criteria():\n    return ['complete the subtask']\n", encoding="utf-8")
+    test_file = repo / "tests/hermes_cli/test_team_os_planner_runner.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_old():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed planner"], cwd=repo, check=True, capture_output=True)
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True, check=True).stdout.strip()
+    source.write_text("def criteria():\n    return ['Pass/fail: committed behavior']\n", encoding="utf-8")
+    subprocess.run(["git", "add", "hermes_cli/team_os/planner_runner.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "worker commit"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "reset", "--soft", base], cwd=repo, check=True)
+
+    contract = tmp_path / "contract.json"
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "worker_status": "completed",
+                "proof_output": "1 passed",
+                "claims": [
+                    {
+                        "claim": "Committed worker changes remain visible to Validator",
+                        "diff_substrings": ["Pass/fail: committed behavior"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_worker_handoff(
+        contract_path=contract,
+        worktree_path=repo,
+        handoff_path=handoff,
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["changed_files"] == ["hermes_cli/team_os/planner_runner.py"]
+
+
 def test_render_proof_ping_is_blocked_until_validator_pass():
     from hermes_cli.team_os.thin_loop import render_proof_ping
 
