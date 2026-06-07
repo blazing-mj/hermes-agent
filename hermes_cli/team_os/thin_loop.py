@@ -314,11 +314,100 @@ def _git_lines(args: list[str], *, cwd: Path) -> list[str]:
     return result.stdout.splitlines()
 
 
+def build_adversarial_validator_prompt(*, contract_path: Path, worktree_path: Path, handoff_path: Path) -> str:
+    """Render the cold Claude Max second-opinion Validator prompt."""
+    return "\n".join(
+        [
+            "You are the Team OS adversarial Validator running in a cold Claude Max session.",
+            "You must be a different model than the Worker. Worker route is Codex/openai-codex; review route is Claude Max.",
+            "Do not re-implement. Do not trust worker claims or substring matches.",
+            "Run git diff HEAD in the worktree and verify the diff actually supports each claim semantically.",
+            "BOUNCE if a quoted diff substring exists but is unrelated to the claim, too generic, or only proves text presence.",
+            "Return strict JSON only: {\"verdict\":\"PASS|BOUNCE\",\"semantic_claims_supported\":true|false,\"model\":\"claude-max\",\"findings\":[...]}.",
+            "",
+            f"CONTRACT_PATH: {contract_path}",
+            f"WORKTREE_PATH: {worktree_path}",
+            f"HANDOFF_PATH: {handoff_path}",
+        ]
+    )
+
+
+def _extract_review_json(stdout: str) -> dict[str, Any]:
+    """Parse direct JSON or Claude Code wrapper JSON whose result field contains JSON."""
+    data = json.loads(stdout.strip())
+    if isinstance(data, dict) and isinstance(data.get("result"), str):
+        try:
+            nested = json.loads(data["result"])
+        except json.JSONDecodeError:
+            return data
+        if isinstance(nested, dict):
+            return nested
+    if not isinstance(data, dict):
+        raise ValueError("adversarial review output must be a JSON object")
+    return data
+
+
+def run_adversarial_validator(
+    *,
+    contract_path: Path,
+    worktree_path: Path,
+    handoff_path: Path,
+    output_path: Path,
+    command: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Run the Claude Max semantic second-opinion rail and persist its review JSON."""
+    prompt = build_adversarial_validator_prompt(
+        contract_path=contract_path,
+        worktree_path=worktree_path,
+        handoff_path=handoff_path,
+    )
+    argv = command or [
+        str(Path.home() / ".hermes/bin/claude-max-code"),
+        "team-os-adversarial-validator",
+        "--",
+        "-p",
+        prompt,
+        "--max-turns",
+        "3",
+        "--output-format",
+        "json",
+    ]
+    completed = subprocess.run(
+        argv,
+        cwd=worktree_path,
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    review: dict[str, Any] | None = None
+    parse_error = None
+    if completed.returncode == 0:
+        try:
+            review = _extract_review_json(completed.stdout)
+        except (json.JSONDecodeError, ValueError) as exc:
+            parse_error = str(exc)
+    if review is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(review, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "ok": completed.returncode == 0 and review is not None,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "parse_error": parse_error,
+        "review": review or {},
+        "output_path": str(output_path),
+    }
+
+
 def validate_worker_handoff(
     *,
     contract_path: Path,
     worktree_path: Path,
     handoff_path: Path,
+    adversarial_review_path: Path | None = None,
     output_path: Path | None = None,
 ) -> dict[str, Any]:
     """Validate one Worker handoff against the contract and git diff evidence.
@@ -332,6 +421,7 @@ def validate_worker_handoff(
     allowed_files = set(contract.get("files_to_touch", []))
     errors: list[str] = []
     diff_quotes: list[dict[str, Any]] = []
+    adversarial_review: dict[str, Any] = {}
 
     if not handoff_path.exists():
         errors.append("worker handoff is missing")
@@ -378,6 +468,17 @@ def validate_worker_handoff(
         if claim_quotes:
             diff_quotes.append({"claim": text, "diff_lines": claim_quotes})
 
+    if adversarial_review_path is None or not adversarial_review_path.exists():
+        errors.append("adversarial semantic review is missing; Claude Max second-opinion PASS required")
+    else:
+        adversarial_review = json.loads(adversarial_review_path.read_text(encoding="utf-8"))
+        if adversarial_review.get("model") != "claude-max":
+            errors.append("adversarial review must come from claude-max")
+        if adversarial_review.get("verdict") != "PASS":
+            errors.append("adversarial semantic review did not PASS")
+        if adversarial_review.get("semantic_claims_supported") is not True:
+            errors.append("adversarial semantic review says diff does not semantically support every claim")
+
     verdict = "PASS" if not errors else "BOUNCE"
     result = {
         "verdict": verdict,
@@ -385,6 +486,7 @@ def validate_worker_handoff(
         "source_ticket": contract.get("source_ticket"),
         "changed_files": changed_files,
         "diff_quotes": diff_quotes,
+        "adversarial_review": adversarial_review,
         "human_gate_required": contract.get("human_gate_required") is True,
         "auto_done_allowed": False,
         "live_dispatch_allowed": False,
