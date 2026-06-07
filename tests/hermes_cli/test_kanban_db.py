@@ -2118,6 +2118,7 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
+        (tmp_path / "ws").mkdir()
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -2127,6 +2128,35 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+
+    def test_dispatcher_refuses_missing_worktree_workspace(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        task = kb.Task(
+            id="t_missing_wt",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "missing-ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_missing_wt",
+        )
+
+        with pytest.raises(RuntimeError, match="refusing to spawn worktree task"):
+            kb._default_spawn(task, str(tmp_path / "missing-ws"))
 
 
 # ---------------------------------------------------------------------------

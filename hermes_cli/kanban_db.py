@@ -6009,12 +6009,18 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    workspace_cwd = workspace if os.path.isdir(workspace) else None
+    if task.workspace_kind == "worktree" and workspace_cwd is None:
+        raise RuntimeError(
+            f"refusing to spawn worktree task {task.id}: workspace does not exist: {workspace}"
+        )
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=workspace_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
