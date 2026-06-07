@@ -250,6 +250,67 @@ class TestPatchHandler:
         assert "error" in result
         assert "traversal" in result["error"].lower()
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_rejects_git_tracked_delete_without_authorization(self, mock_get, tmp_path):
+        import subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+        tracked = repo / "tests" / "test_guard.py"
+        tracked.parent.mkdir()
+        tracked.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tests/test_guard.py"], cwd=repo, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add tracked test"], cwd=repo, check=True, capture_output=True, text=True)
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok", "operations": 1}
+        mock_get.return_value.patch_v4a.return_value = result_obj
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="patch",
+            patch=(
+                "*** Begin Patch\n"
+                f"*** Delete File: {tracked}\n"
+                "*** End Patch\n"
+            ),
+        ))
+
+        assert "error" in result
+        assert "git-tracked" in result["error"]
+        mock_get.return_value.patch_v4a.assert_not_called()
+        assert tracked.exists()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_v4a_allows_git_tracked_delete_with_explicit_authorization(self, mock_get, tmp_path):
+        import subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+        tracked = repo / "tests" / "test_guard.py"
+        tracked.parent.mkdir()
+        tracked.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tests/test_guard.py"], cwd=repo, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add tracked test"], cwd=repo, check=True, capture_output=True, text=True)
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {"status": "ok", "operations": 1}
+        mock_get.return_value.patch_v4a.return_value = result_obj
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="patch",
+            patch=(
+                "*** Begin Patch\n"
+                f"*** Delete File: {tracked}\n"
+                "*** End Patch\n"
+            ),
+            allow_git_tracked_delete=True,
+        ))
+
+        assert result["status"] == "ok"
+        mock_get.return_value.patch_v4a.assert_called_once()
+
 
 class TestSearchHandler:
     @patch("tools.file_tools._get_file_ops")

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT_PATH = Path("/Users/alfred/.hermes/scripts/restricted_linear_writer.py")
-TRANSITIONS_PATH = Path("/Users/alfred/.hermes/hermes-agent/docs/team-os/board-transitions.json")
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "restricted_linear_writer.py"
+TRANSITIONS_PATH = Path(__file__).resolve().parents[2] / "docs" / "team-os" / "board-transitions.json"
 
 
 @pytest.fixture(scope="module")

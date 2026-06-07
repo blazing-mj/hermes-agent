@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import threading
 from pathlib import Path
@@ -246,6 +247,50 @@ def _is_expected_write_exception(exc: Exception) -> bool:
     if isinstance(exc, OSError) and exc.errno in _EXPECTED_WRITE_ERRNOS:
         return True
     return False
+
+
+def _git_tracked_file_delete_error(filepath: str, task_id: str = "default") -> str | None:
+    """Return an error if *filepath* is a git-tracked file being deleted.
+
+    This protects against recurring agent/worker raw test-file loss through the
+    file patch tool.  It is intentionally scoped to explicit V4A Delete File
+    operations: normal writes/patches still work, and authorized deletes must
+    opt in via ``allow_git_tracked_delete=True``.
+    """
+    try:
+        resolved = _resolve_path_for_task(filepath, task_id)
+    except (OSError, ValueError):
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    try:
+        root_proc = subprocess.run(
+            ["git", "-C", str(resolved.parent), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=5,
+        )
+        if root_proc.returncode != 0:
+            return None
+        root = Path(root_proc.stdout.strip())
+        rel = os.path.relpath(resolved, root)
+        tracked_proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", rel],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if tracked_proc.returncode == 0:
+        return (
+            f"Refusing to delete git-tracked file without explicit authorization: {resolved}. "
+            "Recoverability invariant: use an intentional git operation or pass "
+            "allow_git_tracked_delete=True only after explicit user approval."
+        )
+    return None
 
 
 _file_ops_lock = threading.Lock()
@@ -967,7 +1012,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
-               task_id: str = "default", cross_profile: bool = False) -> str:
+               task_id: str = "default", cross_profile: bool = False,
+               allow_git_tracked_delete: bool = False) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile`` opts out of the soft cross-Hermes-profile guard for
@@ -981,8 +1027,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if mode == "patch" and patch:
         import re as _re
         from tools.path_security import has_traversal_component
-        for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        for _m in _re.finditer(r'^\*\*\*\s+(Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
+            v4a_op = _m.group(1)
+            v4a_path = _m.group(2).strip()
             # V4A path headers come from patch CONTENT, not the explicit
             # ``path=`` arg — so they're more attacker-influenceable (skill
             # content, web extract, prompt injection). Reject ``..`` traversal
@@ -997,6 +1044,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     "Use the agent's cwd-relative path (no '..') or an absolute "
                     "path in '*** Update File:' / '*** Add File:' / '*** Delete File:' headers."
                 )
+            if v4a_op == "Delete" and not allow_git_tracked_delete:
+                tracked_delete_err = _git_tracked_file_delete_error(v4a_path, task_id)
+                if tracked_delete_err:
+                    return tool_error(tracked_delete_err)
             _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
@@ -1278,6 +1329,11 @@ PATCH_SCHEMA = {
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories.",
                 "default": False,
             },
+            "allow_git_tracked_delete": {
+                "type": "boolean",
+                "description": "Permit a V4A Delete File operation against a git-tracked file. Defaults to false; set true only after explicit user authorization for that exact deletion.",
+                "default": False,
+            },
         },
         "required": ["mode"],
     },
@@ -1341,6 +1397,7 @@ def _handle_patch(args, **kw):
         old_string=args.get("old_string"), new_string=args.get("new_string"),
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        allow_git_tracked_delete=bool(args.get("allow_git_tracked_delete", False)),
     )
 
 
