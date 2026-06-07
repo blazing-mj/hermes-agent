@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from collections.abc import Callable
@@ -14,6 +15,7 @@ from .classify import classify_observation
 from .collectors import collect_observations
 from .db import TeamOSState
 from .decomposer import decompose_goal
+from .dispatcher import DispatcherConfig, dispatch_outbox_event
 from .planner_runner import plan_goal
 from .loop_runner import (
     SandboxBoundaryViolation,
@@ -294,9 +296,104 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
 
         active = bool(getattr(args, "active", False))
         dry_run = not bool(getattr(args, "live_dispatch", False))
-        # CLI surface is intentionally fail-closed for Stage 4: no live dispatch
-        # function is wired here, so even --active --live-dispatch pauses unless
-        # future MJ-approved code supplies an explicit dispatcher.
+        dispatch_fn = None
+        if active and not dry_run:
+            repo_root = Path(getattr(args, "repo_root", ".")).expanduser().resolve()
+            worktree_root = Path(
+                getattr(args, "worktree_root", "~/.hermes/worktrees/team-os-workers")
+            ).expanduser()
+            artifact_root = Path(
+                getattr(args, "artifact_root", "~/.hermes/state/team-os-artifacts")
+            ).expanduser()
+            lease_root = Path(
+                getattr(args, "lease_root", "~/.hermes/state/team-os-leases")
+            ).expanduser()
+            dispatcher_config = DispatcherConfig(
+                repo_root=repo_root,
+                worktree_root=worktree_root,
+                artifact_root=artifact_root,
+                lease_root=lease_root,
+                worker_timeout_seconds=float(getattr(args, "worker_timeout_seconds", 600.0)),
+                telegram_push_enabled=bool(getattr(args, "telegram_push", False)),
+                auto_done_low_cost=bool(getattr(args, "auto_done_low_cost", False)),
+            )
+
+            worker = None
+            validator = None
+            if bool(getattr(args, "stub_dispatch_success", False)):
+
+                def _stub_worker(**kwargs):  # noqa: ANN001
+                    contract = kwargs["contract"]
+                    branch = kwargs["branch"]
+                    return {
+                        "worker_status": "completed",
+                        "source_ticket": contract["source_ticket"],
+                        "worktree_path": str(kwargs["worktree_root"] / branch),
+                        "changed_files": list(contract.get("files_to_touch", [])),
+                        "proof_results": [
+                            {
+                                "command": "stub-dispatch-success",
+                                "exit_code": 0,
+                                "stdout": "ok",
+                                "stderr": "",
+                            }
+                        ],
+                        "worker_output": "stub dispatch success",
+                        "human_gate_required": True,
+                        "loop_feed_allowed": False,
+                        "auto_dispatch_allowed": False,
+                        "auto_done_allowed": False,
+                    }
+
+                def _stub_validator(**_kwargs):  # noqa: ANN001
+                    return {
+                        "verdict": "PASS",
+                        "source_ticket": "stub",
+                        "review_text": "VERDICT: PASS\nstep_summary: intent=ok scope=ok acceptance=ok implementation=ok proof=ok",
+                        "human_gate_required": True,
+                        "auto_done_allowed": False,
+                    }
+
+                worker = _stub_worker
+                validator = _stub_validator
+
+            def _telegram_push(message: str) -> None:
+                completed = subprocess.run(
+                    ["hermes", "send", "telegram", "--message", message],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError((completed.stderr or completed.stdout or "telegram send failed").strip())
+
+            def _auto_done(ticket: str) -> None:
+                completed = subprocess.run(
+                    [str(Path("~/.hermes/bin/linear-agent").expanduser()), "status", ticket, "Done"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError((completed.stderr or completed.stdout or "Linear Done failed").strip())
+
+            def _dispatch(event: dict[str, Any]) -> object:
+                result = dispatch_outbox_event(
+                    event,
+                    dispatcher_config,
+                    worker=worker,
+                    validator=validator,
+                    telegram_push=_telegram_push if bool(getattr(args, "telegram_push", False)) else None,
+                    auto_done=_auto_done if bool(getattr(args, "auto_done_low_cost", False)) else None,
+                )
+                if result.get("status") != "validated":
+                    raise RuntimeError(json.dumps(result, sort_keys=True))
+                return result
+
+            dispatch_fn = _dispatch
+
         cortex_result = run_cortex(
             state,
             CortexConfig(
@@ -305,8 +402,8 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
                 max_dispatch_per_cycle=int(getattr(args, "max_dispatch_per_cycle", 1)),
             ),
             collector=_collector if linear_projects_arg else None,
-            gateway_health_probe=(lambda: False),
-            dispatch=None,
+            gateway_health_probe=(lambda: True),
+            dispatch=dispatch_fn,
         )
         rendered = json.dumps(cortex_result.to_dict(), indent=2, sort_keys=True)
         output = Path(getattr(args, "output", "")).expanduser() if getattr(args, "output", None) else None
@@ -709,9 +806,44 @@ def register_cli(parent) -> None:  # noqa: ANN001
         "--live-dispatch",
         action="store_true",
         default=False,
-        help="Future MJ-approved opt-in; Stage 4 CLI still has no dispatcher wired",
+        help="Opt in to deterministic low-failure-cost Worker->Validator dispatch",
     )
     cortex.add_argument("--max-dispatch-per-cycle", type=int, default=1)
+    cortex.add_argument("--repo-root", default=".", help="Repository root for ephemeral Worker worktrees")
+    cortex.add_argument(
+        "--worktree-root",
+        default="~/.hermes/worktrees/team-os-workers",
+        help="Root directory for ephemeral Worker worktrees",
+    )
+    cortex.add_argument(
+        "--artifact-root",
+        default="~/.hermes/state/team-os-artifacts",
+        help="Directory for contract/handoff/validator proof artifacts",
+    )
+    cortex.add_argument(
+        "--lease-root",
+        default="~/.hermes/state/team-os-leases",
+        help="Directory for Worker lease files",
+    )
+    cortex.add_argument("--worker-timeout-seconds", type=float, default=600.0)
+    cortex.add_argument(
+        "--telegram-push",
+        action="store_true",
+        default=False,
+        help="After Validator PASS, send a concise Telegram completion ping",
+    )
+    cortex.add_argument(
+        "--auto-done-low-cost",
+        action="store_true",
+        default=False,
+        help="After Validator PASS, mark only low-failure-cost source Linear tickets Done",
+    )
+    cortex.add_argument(
+        "--stub-dispatch-success",
+        action="store_true",
+        default=False,
+        help="Test-only: replace Worker and Validator with deterministic PASS stubs",
+    )
     cortex.set_defaults(func=cmd_team_os)
 
     snapshot = sub.add_parser(
