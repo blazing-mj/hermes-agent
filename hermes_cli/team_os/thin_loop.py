@@ -305,6 +305,93 @@ def run_teamos_exec_slice(
     }
 
 
+def _git_lines(args: list[str], *, cwd: Path) -> list[str]:
+    result = _run_git(args, cwd=cwd)
+    if result.returncode != 0:
+        return [result.stderr or result.stdout]
+    return result.stdout.splitlines()
+
+
+def validate_worker_handoff(
+    *,
+    contract_path: Path,
+    worktree_path: Path,
+    handoff_path: Path,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate one Worker handoff against the contract and git diff evidence.
+
+    PASS is allowed only when each accepted Worker claim is backed by quoted
+    ``git diff`` lines from the isolated worktree. The Validator never accepts a
+    claim solely because the Worker stated it.
+    """
+
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    allowed_files = set(contract.get("files_to_touch", []))
+    errors: list[str] = []
+    diff_quotes: list[dict[str, Any]] = []
+
+    if not handoff_path.exists():
+        errors.append("worker handoff is missing")
+        handoff: dict[str, Any] = {}
+    else:
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+
+    changed_files = _git_lines(["diff", "--name-only"], cwd=worktree_path)
+    escaped = [path for path in changed_files if path not in allowed_files]
+    if escaped:
+        errors.append(f"changed files escape allowed area: {escaped}")
+
+    diff_lines = _git_lines(["diff", "--", *sorted(allowed_files)], cwd=worktree_path)
+    if not diff_lines:
+        errors.append("git diff is empty; no worker claim can be proven")
+
+    if not handoff.get("proof_output"):
+        errors.append("worker handoff lacks focused proof output")
+
+    claims = handoff.get("claims")
+    if not isinstance(claims, list) or not claims:
+        errors.append("worker handoff must include non-empty claims")
+        claims = []
+
+    for idx, claim in enumerate(claims):
+        if not isinstance(claim, dict):
+            errors.append(f"claim[{idx}] must be an object")
+            continue
+        text = str(claim.get("claim", "")).strip()
+        substrings = claim.get("diff_substrings")
+        if not text:
+            errors.append(f"claim[{idx}] is missing claim text")
+        if not isinstance(substrings, list) or not substrings:
+            errors.append(f"claim[{idx}] lacks diff_substrings for Validator proof")
+            continue
+        claim_quotes: list[str] = []
+        for substring in substrings:
+            needle = str(substring)
+            match = next((line for line in diff_lines if needle in line), None)
+            if match is None:
+                errors.append(f"claim[{idx}] diff evidence not found: {needle}")
+            else:
+                claim_quotes.append(match)
+        if claim_quotes:
+            diff_quotes.append({"claim": text, "diff_lines": claim_quotes})
+
+    verdict = "PASS" if not errors else "BOUNCE"
+    result = {
+        "verdict": verdict,
+        "errors": errors,
+        "source_ticket": contract.get("source_ticket"),
+        "changed_files": changed_files,
+        "diff_quotes": diff_quotes,
+        "human_gate_required": contract.get("human_gate_required") is True,
+        "auto_done_allowed": False,
+        "live_dispatch_allowed": False,
+    }
+    if output_path is not None:
+        _write_json(output_path, result)
+    return result
+
+
 def _paths_dict(paths: MissionPaths) -> dict[str, str]:
     return {
         "mission_dir": str(paths.mission_dir),

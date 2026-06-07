@@ -119,3 +119,99 @@ def test_exec_slice_uses_teamos_exec_prompt_and_requires_handoff_file(tmp_path):
     assert result["profile"] == "teamos-exec"
     assert Path(result["mission_prompt_path"]).exists()
     assert json.loads(handoff.read_text())["worker_status"] == "completed"
+
+
+def test_validate_worker_handoff_bounces_claims_without_git_diff_quotes(tmp_path):
+    from hermes_cli.team_os.thin_loop import validate_worker_handoff
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    source = repo / "hermes_cli/team_os/planner_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def old():\n    return 'old'\n", encoding="utf-8")
+    test_file = repo / "tests/hermes_cli/test_team_os_planner_runner.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_old():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed planner"], cwd=repo, check=True, capture_output=True)
+    source.write_text("def old():\n    return 'Pass/fail:'\n", encoding="utf-8")
+
+    contract = tmp_path / "contract.json"
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "worker_status": "completed",
+                "proof_output": "pytest passed",
+                "claims": [{"claim": "Generated criteria now use Pass/fail labels"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_worker_handoff(
+        contract_path=contract,
+        worktree_path=repo,
+        handoff_path=handoff,
+        output_path=tmp_path / "bounce.json",
+    )
+
+    assert result["verdict"] == "BOUNCE"
+    assert any("diff_substrings" in err for err in result["errors"])
+
+
+def test_validate_worker_handoff_passes_only_with_quoted_git_diff_evidence(tmp_path):
+    from hermes_cli.team_os.thin_loop import validate_worker_handoff
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    source = repo / "hermes_cli/team_os/planner_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def criteria():\n    return ['complete the subtask']\n", encoding="utf-8")
+    test_file = repo / "tests/hermes_cli/test_team_os_planner_runner.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_old():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed planner"], cwd=repo, check=True, capture_output=True)
+    source.write_text("def criteria():\n    return ['Pass/fail: observable behavior']\n", encoding="utf-8")
+    test_file.write_text("def test_crisp():\n    assert 'Pass/fail:'\n", encoding="utf-8")
+
+    contract = tmp_path / "contract.json"
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text(
+        json.dumps(
+            {
+                "worker_status": "completed",
+                "proof_output": "2 passed",
+                "claims": [
+                    {
+                        "claim": "Generated criteria now use Pass/fail labels",
+                        "diff_substrings": ["Pass/fail: observable behavior"],
+                    },
+                    {
+                        "claim": "Focused test covers crisp criteria",
+                        "diff_substrings": ["def test_crisp"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_worker_handoff(
+        contract_path=contract,
+        worktree_path=repo,
+        handoff_path=handoff,
+        output_path=tmp_path / "pass.json",
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["errors"] == []
+    quoted = "\n".join(line for item in result["diff_quotes"] for line in item["diff_lines"])
+    assert "+    return ['Pass/fail: observable behavior']" in quoted
+    assert "+def test_crisp" in quoted
+    assert result["auto_done_allowed"] is False
