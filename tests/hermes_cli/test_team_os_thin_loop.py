@@ -58,6 +58,90 @@ def test_prepare_thin_loop_mission_writes_contract_lease_status_and_worktree(tmp
     assert Path(paths["worktree_path"]).is_dir()
 
 
+def test_build_durable_artifact_paths_uses_standard_names(tmp_path):
+    from hermes_cli.team_os.thin_loop import build_durable_artifact_paths
+
+    paths = build_durable_artifact_paths(
+        artifact_root=tmp_path / "artifacts",
+        source_ticket="AGENTS-184-PROOF 2",
+        run_id="clean-run-1",
+    )
+
+    assert paths["artifact_dir"].endswith("agents-184-proof-2/clean-run-1")
+    assert paths["grounding_path"].endswith("01-grounding.json")
+    assert paths["contract_path"].endswith("02-contract.json")
+    assert paths["mission_prompt_path"].endswith("03-developer-mission.md")
+    assert paths["handoff_path"].endswith("04-worker-handoff.json")
+    assert paths["validator_bounce_path"].endswith("05-validator-bounce.json")
+    assert paths["adversarial_review_path"].endswith("06-adversarial-review.json")
+    assert paths["validator_pass_path"].endswith("07-validator-pass.json")
+    assert paths["proof_ping_path"].endswith("08-proof-ping.md")
+    assert paths["manifest_path"].endswith("manifest.json")
+
+
+def test_standard_engine_orchestration_writes_durable_bounce_pass_manifest(tmp_path):
+    from hermes_cli.team_os.thin_loop import orchestrate_standard_engine_proof
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    source = repo / "hermes_cli/team_os/planner_runner.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def criteria():\n    return ['old']\n", encoding="utf-8")
+    test_file = repo / "tests/hermes_cli/test_team_os_planner_runner.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_old():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "seed planner"], cwd=repo, check=True, capture_output=True)
+
+    artifact_root = tmp_path / "artifacts"
+    paths = {
+        "handoff": artifact_root / "agents-184-proof-2" / "clean-run-1" / "04-worker-handoff.json",
+        "adversarial": artifact_root / "agents-184-proof-2" / "clean-run-1" / "06-adversarial-review.json",
+    }
+    helper = tmp_path / "worker.py"
+    helper.write_text(
+        "import json, pathlib, subprocess\n"
+        "root = pathlib.Path.cwd()\n"
+        "(root / 'hermes_cli/team_os/planner_runner.py').write_text(\"def criteria():\\n    return ['Pass/fail: standard engine artifact']\\n\")\n"
+        "pathlib.Path(r'%s').write_text(json.dumps({\"worker_status\":\"completed\",\"proof_output\":\"1 passed\",\"claims\":[{\"claim\":\"Standard engine changed criteria text\",\"diff_substrings\":[\"Pass/fail: standard engine artifact\"]}]}))\n"
+        % paths["handoff"],
+        encoding="utf-8",
+    )
+    reviewer = tmp_path / "reviewer.py"
+    reviewer.write_text(
+        "import json; print(json.dumps({'verdict':'PASS','semantic_claims_supported':True,'model':'claude-max'}))\n",
+        encoding="utf-8",
+    )
+
+    result = orchestrate_standard_engine_proof(
+        repo_root=repo,
+        artifact_root=artifact_root,
+        worktree_root=tmp_path / "worktrees",
+        source_ticket="AGENTS-184-PROOF 2",
+        title="Prove durable artifacts",
+        task_description="Change planner criteria for durable artifact proof",
+        allowed_files=["hermes_cli/team_os/planner_runner.py"],
+        required_commands=["python3.13 -m pytest -q tests/hermes_cli/test_team_os_planner_runner.py"],
+        run_id="clean-run-1",
+        worker_command=["python3.13", str(helper)],
+        adversarial_command=["python3.13", str(reviewer)],
+    )
+
+    assert result["status"] == "validated"
+    assert result["standard_engine"]["orchestration"] == "grounding->contract->mission->worker->planted-bounce->adversarial->validator"
+    assert result["bounce"]["verdict"] == "BOUNCE"
+    assert result["pass"]["verdict"] == "PASS"
+    manifest = json.loads(Path(result["paths"]["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["status"] == "validated"
+    assert manifest["human_gate_required"] is True
+    assert manifest["auto_done_allowed"] is False
+    assert manifest["live_dispatch_allowed"] is False
+    assert Path(result["paths"]["grounding_path"]).exists()
+    assert Path(result["paths"]["contract_path"]).exists()
+    assert Path(result["paths"]["proof_ping_path"]).read_text(encoding="utf-8").startswith("AGENTS-184-PROOF 2 thin-loop proof: PASS")
+
+
 def test_prepare_thin_loop_mission_denies_risky_surface_before_worktree(tmp_path):
     from hermes_cli.team_os.thin_loop import prepare_thin_loop_mission
 

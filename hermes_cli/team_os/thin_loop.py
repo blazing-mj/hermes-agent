@@ -43,6 +43,29 @@ def _safe_slug(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-") or "mission"
 
 
+def build_durable_artifact_paths(*, artifact_root: Path, source_ticket: str, run_id: str) -> dict[str, str]:
+    """Return the standard durable artifact layout for one gated proof run.
+
+    The names are intentionally ordinal so an operator can audit the exact proof
+    sequence without reading code: grounding before contract, Worker before
+    adversarial review, BOUNCE before PASS, then the proof ping and manifest.
+    """
+
+    artifact_dir = artifact_root.expanduser() / _safe_slug(source_ticket) / _safe_slug(run_id)
+    return {
+        "artifact_dir": str(artifact_dir),
+        "grounding_path": str(artifact_dir / "01-grounding.json"),
+        "contract_path": str(artifact_dir / "02-contract.json"),
+        "mission_prompt_path": str(artifact_dir / "03-developer-mission.md"),
+        "handoff_path": str(artifact_dir / "04-worker-handoff.json"),
+        "validator_bounce_path": str(artifact_dir / "05-validator-bounce.json"),
+        "adversarial_review_path": str(artifact_dir / "06-adversarial-review.json"),
+        "validator_pass_path": str(artifact_dir / "07-validator-pass.json"),
+        "proof_ping_path": str(artifact_dir / "08-proof-ping.md"),
+        "manifest_path": str(artifact_dir / "manifest.json"),
+    }
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -499,6 +522,144 @@ def validate_worker_handoff(
     if output_path is not None:
         _write_json(output_path, result)
     return result
+
+
+def orchestrate_standard_engine_proof(
+    *,
+    repo_root: Path,
+    artifact_root: Path,
+    worktree_root: Path,
+    source_ticket: str,
+    title: str,
+    task_description: str,
+    allowed_files: list[str],
+    required_commands: list[str],
+    run_id: str | None = None,
+    worker_command: list[str] | None = None,
+    adversarial_command: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run the standard gated proof spine and persist durable artifacts.
+
+    This is the non-autonomous orchestration path MJ asked to keep: no live
+    dispatch, no auto-Done, one standard sequence, and every artifact written to
+    stable paths that can be linked from Linear.
+    """
+
+    from .planner_runner import build_grounding_doc  # local import avoids planner/test cycles
+
+    run_id = run_id or str(int(time.time()))
+    paths = build_durable_artifact_paths(
+        artifact_root=artifact_root,
+        source_ticket=source_ticket,
+        run_id=run_id,
+    )
+    path = {name: Path(value) for name, value in paths.items()}
+    path["artifact_dir"].mkdir(parents=True, exist_ok=True)
+
+    standard_engine = {
+        "orchestration": "grounding->contract->mission->worker->planted-bounce->adversarial->validator",
+        "worker_route": "teamos-exec/Codex subscription",
+        "validator_route": "Claude Max cold session",
+        "auto_done_allowed": False,
+        "live_dispatch_allowed": False,
+    }
+
+    grounding = build_grounding_doc(
+        source_ticket=source_ticket,
+        task_description=task_description,
+        files=allowed_files,
+        areas=[title],
+        repo_root=repo_root,
+    )
+    _write_json(path["grounding_path"], grounding)
+    contract = build_thin_contract(
+        source_ticket=source_ticket,
+        title=title,
+        allowed_files=allowed_files,
+        required_commands=required_commands,
+    )
+    contract["grounding_doc"] = grounding
+    contract["task_description"] = task_description
+    _write_json(path["contract_path"], contract)
+
+    worktree_root.expanduser().mkdir(parents=True, exist_ok=True)
+    worktree_path = worktree_root.expanduser() / f"{_safe_slug(source_ticket)}-{_safe_slug(run_id)}"
+    branch = f"team-os/{_safe_slug(source_ticket)}-{_safe_slug(run_id)}"
+    manifest = {
+        "source_ticket": source_ticket,
+        "run_id": run_id,
+        "status": "started",
+        "paths": paths,
+        "worktree_path": str(worktree_path),
+        "branch": branch,
+        "standard_engine": standard_engine,
+        "human_gate_required": True,
+        "auto_done_allowed": False,
+        "live_dispatch_allowed": False,
+    }
+    _write_json(path["manifest_path"], manifest)
+
+    result = _run_git(["worktree", "add", "-b", branch, str(worktree_path)], cwd=repo_root.expanduser())
+    if result.returncode != 0:
+        manifest.update({"status": "worktree_failed", "error": result.stderr or result.stdout})
+        _write_json(path["manifest_path"], manifest)
+        return manifest
+
+    worker = run_teamos_exec_slice(
+        contract_path=path["contract_path"],
+        worktree_path=worktree_path,
+        handoff_path=path["handoff_path"],
+        mission_prompt_path=path["mission_prompt_path"],
+        command=worker_command,
+    )
+    if not worker.get("ok"):
+        manifest.update({"status": "worker_failed", "worker": worker})
+        _write_json(path["manifest_path"], manifest)
+        return manifest
+
+    bounce = validate_worker_handoff(
+        contract_path=path["contract_path"],
+        worktree_path=worktree_path,
+        handoff_path=path["handoff_path"],
+        output_path=path["validator_bounce_path"],
+    )
+    if bounce.get("verdict") != "BOUNCE":
+        manifest.update({"status": "planted_bounce_failed", "bounce": bounce, "worker": worker})
+        _write_json(path["manifest_path"], manifest)
+        return manifest
+    adversarial = run_adversarial_validator(
+        contract_path=path["contract_path"],
+        worktree_path=worktree_path,
+        handoff_path=path["handoff_path"],
+        output_path=path["adversarial_review_path"],
+        command=adversarial_command,
+    )
+    passed = validate_worker_handoff(
+        contract_path=path["contract_path"],
+        worktree_path=worktree_path,
+        handoff_path=path["handoff_path"],
+        adversarial_review_path=path["adversarial_review_path"],
+        output_path=path["validator_pass_path"],
+    )
+
+    status = "validated" if passed.get("verdict") == "PASS" else "validator_bounced"
+    proof_ping = ""
+    if status == "validated":
+        proof_ping = render_proof_ping(source_ticket=source_ticket, bounce=bounce, passed=passed, commits=[])
+        path["proof_ping_path"].write_text(proof_ping + "\n", encoding="utf-8")
+
+    manifest.update(
+        {
+            "status": status,
+            "bounce": bounce,
+            "worker": worker,
+            "adversarial": adversarial,
+            "pass": passed,
+            "proof_ping_path": paths["proof_ping_path"] if proof_ping else None,
+        }
+    )
+    _write_json(path["manifest_path"], manifest)
+    return manifest
 
 
 def render_proof_ping(*, source_ticket: str, bounce: dict[str, Any], passed: dict[str, Any], commits: list[str]) -> str:
