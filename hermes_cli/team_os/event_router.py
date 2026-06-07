@@ -51,6 +51,18 @@ def _failure_category_for_observation(obs: "Observation") -> ReversibilityCatego
         return ReversibilityCategory.DATA_MIGRATION
     if any(token in text for token in ("external", "client", "production", "send", "dispatch")):
         return ReversibilityCategory.EXTERNAL_SIDE_EFFECT
+    if any(
+        token in text
+        for token in (
+            "failure-cost:low",
+            "low-failure-cost",
+            "planner polish",
+            "acceptance criteria",
+            "docs-only",
+            "polish",
+        )
+    ):
+        return ReversibilityCategory.FULL_INSTANT
     return ReversibilityCategory.FULL_EFFORT
 
 
