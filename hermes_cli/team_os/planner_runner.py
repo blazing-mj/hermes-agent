@@ -152,6 +152,53 @@ def _required_commands(goal_id: str, goal_title: str, description: str) -> list[
     return _dedupe(commands)
 
 
+def _acceptance_subject(description: str) -> str:
+    subject = " ".join(description.split())
+    subject = re.sub(
+        r"\s+like\s+complete[sd]?\s+(?:the|this|exact)?\s*subtask\.?",
+        "",
+        subject,
+        flags=re.IGNORECASE,
+    )
+    for pattern in _GENERIC_ACCEPTANCE_PATTERNS:
+        subject = pattern.sub("generic acceptance phrasing", subject)
+    return subject or description
+
+
+_GENERIC_ACCEPTANCE_PATTERNS = (
+    re.compile(r"\bcomplete[sd]?\s+(?:the|this|exact)?\s*subtask\b", re.IGNORECASE),
+    re.compile(r"\bimplementation\s+is\s+done\b", re.IGNORECASE),
+    re.compile(r"\bwork\s+is\s+done\b", re.IGNORECASE),
+    re.compile(r"\btask\s+is\s+complete\b", re.IGNORECASE),
+)
+
+
+def _crisp_acceptance_criteria(*, task_description: str, files: list[str]) -> list[str]:
+    subject = _acceptance_subject(task_description)
+    file_scope = ", ".join(files)
+    return [
+        f"Pass/fail: {subject} is satisfied by observable behavior in the changed code or artifact",
+        f"Pass/fail: changed paths are limited to the declared files/areas: {file_scope}",
+        "Pass/fail: focused regression proof shows RED before GREEN, or names why RED is not applicable",
+        "Pass/fail: Worker handoff lists changed files, command output, and proof artifact path",
+    ]
+
+
+def _generic_acceptance_errors(criteria: Sequence[str], *, prefix: str) -> list[str]:
+    errors: list[str] = []
+    for idx, item in enumerate(criteria):
+        text = str(item).strip()
+        lower = text.lower()
+        if any(pattern.search(text) for pattern in _GENERIC_ACCEPTANCE_PATTERNS):
+            errors.append(
+                f"{prefix}: generic acceptance criterion[{idx}] must be rewritten as observable pass/fail behavior"
+            )
+            continue
+        if not lower.startswith("pass/fail:"):
+            errors.append(f"{prefix}: acceptance criterion[{idx}] must start with 'Pass/fail:'")
+    return errors
+
+
 def _build_validation_contract(
     *,
     goal_id: str,
@@ -161,12 +208,7 @@ def _build_validation_contract(
     title = goal_title or goal_id
     files, areas = _infer_files_and_areas(goal_title, task.description)
     commands = _required_commands(goal_id, goal_title, task.description)
-    acceptance_criteria = [
-        f"Worker completes this exact subtask: {task.description}",
-        f"Implementation stays within declared files/areas: {', '.join(files)}",
-        "Focused regression test fails before the fix and passes after the fix when applicable",
-        "Worker handoff includes changed files, command output, and proof artifact path",
-    ]
+    acceptance_criteria = _crisp_acceptance_criteria(task_description=task.description, files=files)
     return {
         "role": "planner-output",
         "source_ticket": goal_id,
@@ -306,12 +348,14 @@ def validate_planner_output(
 
         acceptance = contract.get("acceptance_criteria")
         task_description = str(planned.get("description", ""))
-        if isinstance(acceptance, list) and task_description:
-            task_anchor = task_description[:32]
-            if not any(task_anchor in item for item in acceptance if isinstance(item, str)):
-                errors.append(
-                    f"{prefix}: acceptance criteria must reference the specific subtask description"
-                )
+        if isinstance(acceptance, list):
+            errors.extend(_generic_acceptance_errors(acceptance, prefix=prefix))
+            if task_description:
+                task_anchor = _acceptance_subject(task_description)[:32]
+                if not any(task_anchor in item for item in acceptance if isinstance(item, str)):
+                    errors.append(
+                        f"{prefix}: acceptance criteria must reference the specific subtask description"
+                    )
 
         task_text = " ".join(
             [

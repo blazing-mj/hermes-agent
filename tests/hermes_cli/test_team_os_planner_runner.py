@@ -181,6 +181,84 @@ def test_grounded_contracts_include_worker_ready_specific_scope_and_proof():
     assert len(seen_acceptance) == len(run["tasks"])
 
 
+def test_generated_acceptance_criteria_are_crisp_pass_fail_conditions():
+    from hermes_cli.team_os.planner_runner import plan_goal
+
+    run = plan_goal(
+        goal_id="AGENTS-172",
+        goal_title="Polish Planner acceptance criteria into crisp testable conditions",
+        goal_body=(
+            "Step 1: Replace generic Planner acceptance criteria with observable pass/fail conditions.\n"
+            "Step 2: Validator bounces generic criteria like complete the subtask.\n"
+            "Step 3: Focused tests prove generic criteria bounce and crisp criteria pass."
+        ),
+        labels=["system:hermes", "type:rail"],
+    )
+
+    assert run["planner_review"]["verdict"] == "PASS"
+    forbidden = ("complete the subtask", "completes this exact subtask", "complete this exact subtask")
+    for task in run["tasks"]:
+        criteria = task["validation_contract"]["acceptance_criteria"]
+        assert len(criteria) >= 3
+        assert all(not any(phrase in item.lower() for phrase in forbidden) for item in criteria)
+        assert all("pass/fail:" in item.lower() for item in criteria)
+
+
+def test_validate_planner_output_bounces_generic_acceptance_criteria():
+    from hermes_cli.team_os.planner_runner import plan_goal, validate_planner_output
+
+    goal_body = (
+        "Step 1: Replace generic Planner acceptance criteria with observable pass/fail conditions.\n"
+        "Step 2: Validator bounces generic criteria like complete the subtask.\n"
+        "Step 3: Focused tests prove generic criteria bounce and crisp criteria pass."
+    )
+    run = plan_goal(
+        goal_id="AGENTS-172",
+        goal_title="Polish Planner acceptance criteria into crisp testable conditions",
+        goal_body=goal_body,
+        labels=["system:hermes", "type:rail"],
+    )
+    bad_run = json.loads(json.dumps(run))
+    task = bad_run["tasks"][0]
+    task["validation_contract"]["acceptance_criteria"] = [
+        f"Complete the subtask: {task['description']}",
+        "Implementation is done",
+    ]
+
+    review = validate_planner_output(
+        goal_id="AGENTS-172",
+        goal_title="Polish Planner acceptance criteria into crisp testable conditions",
+        goal_body=goal_body,
+        planned_tasks=bad_run["tasks"],
+        loop_feed_allowed=bad_run["loop_feed_allowed"],
+    )
+
+    assert review["verdict"] == "BOUNCE"
+    assert any("generic acceptance" in err.lower() for err in review["errors"])
+
+
+def test_generated_acceptance_criteria_strip_generic_examples_from_task_text():
+    from hermes_cli.team_os.planner_runner import plan_goal
+
+    run = plan_goal(
+        goal_id="AGENTS-172",
+        goal_title="Polish Planner acceptance criteria into crisp testable conditions",
+        goal_body=(
+            "Step 1: Replace acceptance criteria that say complete the subtask with observable pass/fail conditions.\n"
+            "Step 2: Keep the Planner output validator strict."
+        ),
+        labels=["system:hermes", "type:rail"],
+    )
+
+    assert run["planner_review"]["verdict"] == "PASS"
+    all_criteria = "\n".join(
+        item
+        for task in run["tasks"]
+        for item in task["validation_contract"]["acceptance_criteria"]
+    ).lower()
+    assert "complete the subtask" not in all_criteria
+
+
 def test_status_note_phase_is_excluded_from_worker_tasks():
     from hermes_cli.team_os.planner_runner import plan_goal
 
