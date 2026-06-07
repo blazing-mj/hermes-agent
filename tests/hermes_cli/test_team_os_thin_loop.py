@@ -387,6 +387,37 @@ def test_run_adversarial_validator_uses_claude_max_cold_session_and_parses_wrapp
     assert json.loads(review.read_text(encoding="utf-8"))["model"] == "claude-max"
 
 
+def test_run_adversarial_validator_extracts_json_from_claude_markdown_result(tmp_path):
+    from hermes_cli.team_os.thin_loop import run_adversarial_validator
+
+    contract = tmp_path / "contract.json"
+    handoff = tmp_path / "handoff.json"
+    review = tmp_path / "adversarial.json"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff.write_text(json.dumps({"claims": []}), encoding="utf-8")
+    helper = tmp_path / "reviewer.py"
+    helper.write_text(
+        "import json\n"
+        "payload = {'type': 'result', 'result': 'Review done.\\n```json\\n{\\\"verdict\\\":\\\"PASS\\\",\\\"semantic_claims_supported\\\":true,\\\"model\\\":\\\"claude-max\\\"}\\n```'}\n"
+        "print(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+
+    result = run_adversarial_validator(
+        contract_path=contract,
+        worktree_path=worktree,
+        handoff_path=handoff,
+        output_path=review,
+        command=["python3.13", str(helper)],
+    )
+
+    assert result["ok"] is True
+    assert result["review"]["model"] == "claude-max"
+    assert result["review"]["verdict"] == "PASS"
+
+
 def test_render_proof_ping_is_blocked_until_validator_pass():
     from hermes_cli.team_os.thin_loop import render_proof_ping
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -336,9 +337,13 @@ def _extract_review_json(stdout: str) -> dict[str, Any]:
     """Parse direct JSON or Claude Code wrapper JSON whose result field contains JSON."""
     data = json.loads(stdout.strip())
     if isinstance(data, dict) and isinstance(data.get("result"), str):
+        result_text = data["result"].strip()
         try:
-            nested = json.loads(data["result"])
+            nested = json.loads(result_text)
         except json.JSONDecodeError:
+            fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, flags=re.DOTALL)
+            if fenced:
+                return json.loads(fenced.group(1))
             return data
         if isinstance(nested, dict):
             return nested
