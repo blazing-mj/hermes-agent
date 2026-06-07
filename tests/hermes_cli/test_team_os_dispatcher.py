@@ -169,26 +169,16 @@ def test_dispatcher_only_auto_dones_low_cost_after_pass_when_callback_supplied(t
     assert done == ["AGENTS-172"]
 
 
-def test_cortex_cli_wires_dispatcher_when_live_dispatch_enabled(tmp_path, capsys):
+def _parse_cortex_args(tmp_path, state_db, *extra):
     import argparse
 
-    from hermes_cli.team_os.cli import cmd_team_os, register_cli
-    from hermes_cli.team_os.db import TeamOSState
-
-    state_db = tmp_path / "state.db"
-    state = TeamOSState(state_db)
-    state.queue_for_dispatch(
-        event_type="linear_observation",
-        source_id="AGENTS-172",
-        source="linear",
-        payload=_event()["payload"],
-    )
+    from hermes_cli.team_os.cli import register_cli
 
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd")
     team_os = sub.add_parser("team-os")
     register_cli(team_os)
-    args = parser.parse_args([
+    return parser.parse_args([
         "team-os",
         "cortex",
         "--state-db",
@@ -202,7 +192,47 @@ def test_cortex_cli_wires_dispatcher_when_live_dispatch_enabled(tmp_path, capsys
         "--artifact-root",
         str(tmp_path / "artifacts"),
         "--stub-dispatch-success",
+        *extra,
     ])
+
+
+def _queue_dispatch_fixture(state_db, payload):
+    from hermes_cli.team_os.db import TeamOSState
+
+    state = TeamOSState(state_db)
+    state.queue_for_dispatch(
+        event_type="linear_observation",
+        source_id="AGENTS-172",
+        source="linear",
+        payload=payload,
+    )
+    return state
+
+
+def test_cortex_cli_live_dispatch_still_pauses_without_explicit_gateway_health_ok(tmp_path, capsys):
+    from hermes_cli.team_os.cli import cmd_team_os
+
+    state_db = tmp_path / "state.db"
+    state = _queue_dispatch_fixture(state_db, _event()["payload"])
+    args = _parse_cortex_args(tmp_path, state_db)
+
+    rc = cmd_team_os(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["dispatched"] == 0
+    assert payload["paused_reason"] == "gateway/runtime unhealthy"
+    row = state.get_outbox_event_by_source("linear_observation", "AGENTS-172")
+    assert row is not None
+    assert row["state"] == "queued"
+
+
+def test_cortex_cli_wires_dispatcher_when_live_dispatch_and_gateway_health_enabled(tmp_path, capsys):
+    from hermes_cli.team_os.cli import cmd_team_os
+
+    state_db = tmp_path / "state.db"
+    state = _queue_dispatch_fixture(state_db, _event()["payload"])
+    args = _parse_cortex_args(tmp_path, state_db, "--gateway-health-ok")
 
     rc = cmd_team_os(args)
     payload = json.loads(capsys.readouterr().out)

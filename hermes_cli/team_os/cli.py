@@ -402,7 +402,7 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
                 max_dispatch_per_cycle=int(getattr(args, "max_dispatch_per_cycle", 1)),
             ),
             collector=_collector if linear_projects_arg else None,
-            gateway_health_probe=(lambda: True),
+            gateway_health_probe=(lambda: bool(getattr(args, "gateway_health_ok", False))),
             dispatch=dispatch_fn,
         )
         rendered = json.dumps(cortex_result.to_dict(), indent=2, sort_keys=True)
@@ -809,6 +809,12 @@ def register_cli(parent) -> None:  # noqa: ANN001
         help="Opt in to deterministic low-failure-cost Worker->Validator dispatch",
     )
     cortex.add_argument("--max-dispatch-per-cycle", type=int, default=1)
+    cortex.add_argument(
+        "--gateway-health-ok",
+        action="store_true",
+        default=False,
+        help="Operator-only test/live gate: treat gateway/runtime as healthy for this cycle; default is fail-closed",
+    )
     cortex.add_argument("--repo-root", default=".", help="Repository root for ephemeral Worker worktrees")
     cortex.add_argument(
         "--worktree-root",
