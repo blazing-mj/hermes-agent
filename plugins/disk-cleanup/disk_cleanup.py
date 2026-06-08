@@ -358,8 +358,13 @@ def quick() -> Dict[str, Any]:
                 rel_parts = dirpath.relative_to(hermes_home).parts
             except ValueError:
                 continue
-            # Skip the well-known top-level state dirs themselves.
+            # Skip the well-known top-level state dirs themselves and git
+            # metadata internals. AGENTS-199: cleanup may run under worktrees
+            # inside HERMES_HOME; removing empty .git/refs or .git/objects dirs
+            # corrupts repos even when no tracked source file is unlinked.
             if len(rel_parts) == 1 and rel_parts[0] in _PROTECTED_TOP_LEVEL:
+                continue
+            if ".git" in rel_parts:
                 continue
             try:
                 if not any(dirpath.iterdir()):

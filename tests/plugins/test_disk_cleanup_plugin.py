@@ -5,8 +5,8 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
   * ``disk_cleanup`` library: track / forget / dry_run / quick / status,
     ``is_safe_path`` and ``guess_category`` filtering.
   * Plugin ``__init__``: ``post_tool_call`` hook auto-tracks files created
-    by ``write_file`` / ``terminal``; ``on_session_end`` hook runs quick
-    cleanup when anything was tracked during the turn.
+    by ``write_file`` / ``terminal``; ``on_session_end`` logs but does not
+    auto-delete files, so tracked source files cannot vanish at turn end.
   * Slash command handler: status / dry-run / quick / track / forget /
     unknown subcommand behaviours.
   * Bundled-plugin discovery via ``PluginManager.discover_and_load``.
@@ -14,6 +14,7 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
 
 import importlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -256,6 +257,24 @@ class TestTrackForgetQuick:
         dg.quick()
         for d in ("logs", "memories", "sessions", "cron", "cache"):
             assert (_isolate_env / d).exists(), f"{d}/ should be preserved"
+
+    def test_quick_preserves_git_metadata_empty_dirs(self, _isolate_env):
+        dg = _load_lib()
+        repo = _isolate_env / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        source = repo / "tests" / "test_real_source.py"
+        source.parent.mkdir()
+        source.write_text("def test_real_source():\n    assert True\n")
+        subprocess.run(["git", "add", str(source.relative_to(repo))], cwd=repo, check=True)
+
+        summary = dg.quick()
+
+        assert (repo / ".git" / "refs" / "heads").exists()
+        assert (repo / ".git" / "objects" / "info").exists()
+        assert dg.is_git_tracked(source) is True
+        assert source.exists()
+        assert summary["deleted"] == 0
 
 
 class TestStatus:
