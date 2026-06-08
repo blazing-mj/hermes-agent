@@ -52,7 +52,7 @@ def test_same_linear_observation_across_two_polls_creates_one_row(tmp_path):
     assert rows[0]["payload"]["title"] == "first"
 
 
-def test_high_failure_cost_observation_is_held_for_mj_review(tmp_path):
+def test_high_failure_cost_observation_is_queued_for_human_gate_dispatch(tmp_path):
     from hermes_cli.team_os.event_router import route_linear_observation
 
     state = _make_state(tmp_path)
@@ -60,11 +60,11 @@ def test_high_failure_cost_observation_is_held_for_mj_review(tmp_path):
         _observation("AGENTS-176", "Rotate credential token"), state
     )
 
-    assert event is None
+    assert event is not None
     row = state.get_outbox_event_by_source("linear_observation", "AGENTS-176")
     assert row is not None
-    assert row["state"] == "mj_review"
-    assert row["escalation_required"] is True
+    assert row["state"] == "queued"
+    assert row["escalation_required"] is False
     assert row["payload"]["requires_mj_review"] is True
     assert row["payload"]["failure_cost_tier"] == "critical"
 

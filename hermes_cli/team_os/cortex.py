@@ -134,12 +134,18 @@ def run_cortex(
                     state.mark_event_dispatching(int(event["id"]))
                     dispatching_event = state.get_outbox_event(int(event["id"]))
                     try:
-                        dispatch(dispatching_event)
+                        dispatch_result = dispatch(dispatching_event)
                     except Exception as exc:  # pragma: no cover - defensive path
                         state.mark_event_failed(int(event["id"]), reason=str(exc))
                         raise
                     else:
-                        state.mark_event_succeeded(int(event["id"]))
+                        if isinstance(dispatch_result, dict) and dispatch_result.get("status") == "needs_mj":
+                            state.mark_event_mj_review(
+                                int(event["id"]),
+                                reason=str(dispatch_result.get("reason") or "human gate required"),
+                            )
+                        else:
+                            state.mark_event_succeeded(int(event["id"]))
                         dispatched += 1
 
     return CortexResult(

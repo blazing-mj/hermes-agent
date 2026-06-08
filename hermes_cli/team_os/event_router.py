@@ -109,9 +109,6 @@ def route_linear_observation(
     row = state.get_outbox_event(event_id)
     if row["state"] in {"dispatching", "succeeded", "failed", "abandoned", "mj_review"}:
         return None
-    if row["payload"].get("requires_mj_review"):
-        state.mark_event_mj_review(event_id, reason=row["payload"]["failure_cost_reason"])
-        return None
 
     return QueuedEvent(
         event_id=event_id,

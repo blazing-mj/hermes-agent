@@ -351,7 +351,9 @@ def test_cortex_cli_human_gate_uses_assignment_before_one_telegram_ping(tmp_path
     assert payload["dispatched"] == 1
     row = state.get_outbox_event_by_source("linear_observation", "AGENTS-172")
     assert row is not None
-    assert row["state"] == "succeeded"
+    assert row["state"] == "mj_review"
+    assert row["escalation_required"] is True
+    assert row["last_error"] == "human gate required"
     assert len(calls) == 2
     assert calls[0][0:2] == [__import__('sys').executable, "-c"]
     assert calls[0][-2] == "AGENTS-999"
