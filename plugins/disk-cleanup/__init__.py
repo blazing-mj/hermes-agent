@@ -175,17 +175,14 @@ def _on_session_end(
     if not drained_session and not task_buckets:
         return
 
-    try:
-        summary = dg.quick()
-    except Exception as exc:
-        logger.debug("disk-cleanup quick cleanup failed: %s", exc)
-        return
-
-    if summary["deleted"] or summary["empty_dirs"]:
-        dg._log(
-            f"AUTO_QUICK (session_end): deleted={summary['deleted']} "
-            f"dirs={summary['empty_dirs']} freed={dg.fmt_size(summary['freed'])}"
-        )
+    # AGENTS-199: auto-quick can delete source tests via Python unlink and
+    # bypass terminal/file-tool guards. Manual cleanup remains available, but
+    # session-end cleanup is disabled and auditable.
+    dg._log(
+        "AUTO_QUICK_DISABLED (session_end): "
+        f"tracked_tests={len(drained_session) + len(task_buckets)} deletion_suppressed=true"
+    )
+    return
 
 
 # ---------------------------------------------------------------------------

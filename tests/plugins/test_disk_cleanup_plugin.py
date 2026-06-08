@@ -166,6 +166,68 @@ class TestTrackForgetQuick:
         outside = "/etc/hostname" if Path("/etc/hostname").exists() else "/etc/passwd"
         assert dg.track(outside, "test", silent=True) is False
 
+
+    def test_git_tracked_file_never_tracked(self, _isolate_env):
+        dg = _load_lib()
+        repo = _isolate_env / "repo"
+        repo.mkdir()
+        import subprocess
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+        p = repo / "tests" / "test_real.py"
+        p.parent.mkdir()
+        p.write_text("def test_real(): pass\n")
+        subprocess.run(["git", "add", str(p.relative_to(repo))], cwd=repo, check=True, capture_output=True, text=True)
+
+        assert dg.guess_category(p) is None
+        assert dg.track(str(p), "test", silent=True) is False
+        assert p.exists()
+        assert "REJECT" in dg.get_log_file().read_text()
+        assert "git-tracked" in dg.get_log_file().read_text()
+
+    def test_quick_skips_legacy_tracked_git_file(self, _isolate_env):
+        dg = _load_lib()
+        repo = _isolate_env / "repo"
+        repo.mkdir()
+        import subprocess
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True, text=True)
+        p = repo / "tests" / "test_legacy.py"
+        p.parent.mkdir()
+        p.write_text("def test_legacy(): pass\n")
+        subprocess.run(["git", "add", str(p.relative_to(repo))], cwd=repo, check=True, capture_output=True, text=True)
+        dg.save_tracked([{
+            "path": str(p.resolve()),
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "category": "test",
+            "size": p.stat().st_size,
+        }])
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert p.exists()
+        remaining = dg.load_tracked()
+        assert remaining == []
+        log = dg.get_log_file().read_text()
+        assert "SKIP" in log
+        assert "git-tracked" in log
+
+    def test_git_probe_failure_degrades_without_crashing(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        repo = _isolate_env / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        p = repo / "test_git_unavailable.py"
+        p.write_text("x")
+
+        def raise_missing_git(*_args, **_kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(dg.subprocess, "run", raise_missing_git)
+
+        assert dg.is_git_tracked(p) is False
+        assert dg.guess_category(p) == "test"
+        assert dg.track(str(p), "test", silent=True) is True
+
     def test_track_skips_missing(self, _isolate_env):
         dg = _load_lib()
         assert dg.track(str(_isolate_env / "nope.txt"), "test", silent=True) is False
@@ -291,7 +353,7 @@ class TestPostToolCallHook:
 
 
 class TestOnSessionEndHook:
-    def test_runs_quick_when_test_files_tracked(self, _isolate_env):
+    def test_session_end_auto_quick_is_disabled(self, _isolate_env):
         pi = _load_plugin_init()
         p = _isolate_env / "test_cleanup.py"
         p.write_text("x")
@@ -303,7 +365,8 @@ class TestOnSessionEndHook:
         )
         assert p.exists()
         pi._on_session_end(session_id="s1", completed=True, interrupted=False)
-        assert not p.exists(), "test file should be auto-deleted"
+        assert p.exists(), "session-end auto-quick must not delete tests"
+        assert "AUTO_QUICK_DISABLED" in pi.dg.get_log_file().read_text()
 
     def test_noop_when_no_test_tracked(self, _isolate_env):
         pi = _load_plugin_init()

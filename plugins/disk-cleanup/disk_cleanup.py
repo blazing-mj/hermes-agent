@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -80,6 +81,48 @@ def is_safe_path(path: Path) -> bool:
         return True
     return False
 
+
+
+def _nearest_git_root(path: Path) -> Path | None:
+    current = path.resolve() if path.is_dir() else path.resolve().parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def is_git_tracked(path: Path) -> bool:
+    """Return True when *path* is tracked by the nearest git worktree.
+
+    This is intentionally best-effort and fail-closed for successful git
+    answers only: inability to run git does not make non-git scratch files
+    undeletable, but any exit-0 `git ls-files --error-unmatch` blocks
+    tracking/deletion.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    root = _nearest_git_root(resolved)
+    if root is None:
+        return False
+    try:
+        rel = resolved.relative_to(root)
+    except ValueError:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", str(rel)],
+            cwd=root,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 # ---------------------------------------------------------------------------
 # Audit log
@@ -171,6 +214,9 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
 
     if not is_safe_path(path):
         _log(f"REJECT: {path} (outside HERMES_HOME)")
+        return False
+    if is_git_tracked(path):
+        _log(f"REJECT: {path} (git-tracked source file)")
         return False
 
     size = path.stat().st_size if path.is_file() else 0
@@ -265,6 +311,9 @@ def quick() -> Dict[str, Any]:
 
         if not p.exists():
             _log(f"STALE: {p} (removed from tracking)")
+            continue
+        if is_git_tracked(p):
+            _log(f"SKIP: {p} (git-tracked source file; removed from cleanup tracking)")
             continue
 
         age = (now - datetime.fromisoformat(item["timestamp"])).days
@@ -467,6 +516,9 @@ def guess_category(path: Path) -> Optional[str]:
     Used by the ``post_tool_call`` hook to auto-track ephemeral files.
     """
     if not is_safe_path(path):
+        return None
+    if is_git_tracked(path):
+        _log(f"REJECT: {path} (git-tracked source file)")
         return None
 
     # Skip the state dir itself, logs, memory files, sessions, config.
