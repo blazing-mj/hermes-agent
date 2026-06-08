@@ -359,7 +359,7 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
 
             def _telegram_push(message: str) -> None:
                 completed = subprocess.run(
-                    ["hermes", "send", "telegram", "--message", message],
+                    ["hermes", "send", "--to", "telegram", message],
                     text=True,
                     capture_output=True,
                     check=False,
@@ -367,6 +367,39 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
                 )
                 if completed.returncode != 0:
                     raise RuntimeError((completed.stderr or completed.stdout or "telegram send failed").strip())
+
+            def _assign_mj(ticket: str) -> None:
+                code = r"""
+import runpy
+import sys
+
+helper = runpy.run_path(sys.argv[2])
+gql = helper['gql']
+users = gql('{ users(first:250) { nodes { id name displayName email active } } }')['users']['nodes']
+matches = [
+    u for u in users
+    if u.get('active') and (
+        (u.get('name') or '').lower() == 'mj'
+        or (u.get('displayName') or '').lower() == 'mj'
+        or (u.get('email') or '').lower() == 'mj@blazeragency.com'
+    )
+]
+if len(matches) != 1:
+    raise SystemExit(f'MJ Linear user lookup returned {len(matches)} matches')
+gql(
+    'mutation($id:String!, $input:IssueUpdateInput!) { issueUpdate(id:$id, input:$input) { success issue { identifier assignee { name displayName email } } } }',
+    {'id': sys.argv[1], 'input': {'assigneeId': matches[0]['id']}},
+)
+"""
+                completed = subprocess.run(
+                    [sys.executable, "-c", code, ticket, str(Path("~/.hermes/bin/linear-agent").expanduser())],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=60,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError((completed.stderr or completed.stdout or "Linear MJ assignment failed").strip())
 
             def _auto_done(ticket: str) -> None:
                 completed = subprocess.run(
@@ -386,9 +419,10 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
                     worker=worker,
                     validator=validator,
                     telegram_push=_telegram_push if bool(getattr(args, "telegram_push", False)) else None,
+                    assign_mj=_assign_mj if bool(getattr(args, "telegram_push", False)) else None,
                     auto_done=_auto_done if bool(getattr(args, "auto_done_low_cost", False)) else None,
                 )
-                if result.get("status") != "validated":
+                if result.get("status") not in {"validated", "needs_mj"}:
                     raise RuntimeError(json.dumps(result, sort_keys=True))
                 return result
 
@@ -836,7 +870,7 @@ def register_cli(parent) -> None:  # noqa: ANN001
         "--telegram-push",
         action="store_true",
         default=False,
-        help="After Validator PASS, send a concise Telegram completion ping",
+        help="For human-gate Needs-MJ cards only, assign MJ and send one Telegram proof ping",
     )
     cortex.add_argument(
         "--auto-done-low-cost",

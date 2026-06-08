@@ -21,6 +21,7 @@ from .worker_runner import run_worker
 WorkerCallable = Callable[..., dict[str, Any]]
 ValidatorCallable = Callable[..., dict[str, Any]]
 TelegramPush = Callable[[str], None]
+AssignMJ = Callable[[str], None]
 AutoDone = Callable[[str], None]
 
 _BLOCKED_SURFACE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -81,6 +82,21 @@ def _is_low_failure_cost(event: dict[str, Any]) -> bool:
     return (
         str(payload.get("failure_cost_tier") or "").lower() == "low"
         and bool(payload.get("requires_mj_review")) is False
+        and str(payload.get("gate") or "").lower() != "human"
+        and bool(payload.get("classifier_uncertain")) is False
+    )
+
+
+def _requires_human_gate(event: dict[str, Any]) -> bool:
+    payload = _event_payload(event)
+    labels = [str(x).lower() for x in payload.get("labels", []) if isinstance(x, str)]
+    tier = str(payload.get("failure_cost_tier") or "unknown").lower()
+    return (
+        tier != "low"
+        or bool(payload.get("requires_mj_review"))
+        or str(payload.get("gate") or "").lower() == "human"
+        or bool(payload.get("classifier_uncertain"))
+        or "gate:human" in labels
     )
 
 
@@ -154,12 +170,20 @@ def _changed_files_within_contract(worker_result: dict[str, Any], contract: dict
     return None
 
 
-def _telegram_message(ticket: str, result: dict[str, Any]) -> str:
-    changed = result.get("worker", {}).get("changed_files", [])
-    verdict = result.get("validator", {}).get("verdict", "UNKNOWN")
+def _proof_link(event: dict[str, Any], ticket: str) -> str:
+    payload = _event_payload(event)
+    url = str(payload.get("url") or "").strip()
+    if url:
+        return url
+    return f"https://linear.app/blazeragency/issue/{ticket.lower()}"
+
+
+def _human_gate_message(event: dict[str, Any], ticket: str, reason: str) -> str:
+    payload = _event_payload(event)
+    title = str(payload.get("title") or ticket).strip()
     return (
-        f"Team OS {ticket}: Worker completed and Validator {verdict}. "
-        f"Changed files: {', '.join(changed) if changed else 'none'}."
+        f"Team OS human gate: {ticket} needs MJ review. "
+        f"Reason: {reason}. Proof: {_proof_link(event, ticket)}. Title: {title}"
     )
 
 
@@ -170,6 +194,7 @@ def dispatch_outbox_event(
     worker: WorkerCallable | None = None,
     validator: ValidatorCallable | None = None,
     telegram_push: TelegramPush | None = None,
+    assign_mj: AssignMJ | None = None,
     auto_done: AutoDone | None = None,
 ) -> dict[str, Any]:
     """Dispatch one queued outbox event through Worker then Validator.
@@ -190,6 +215,28 @@ def dispatch_outbox_event(
         "telegram_push": {"enabled": config.telegram_push_enabled, "sent": False},
         "auto_done": {"enabled": config.auto_done_low_cost, "attempted": False, "done": False},
     }
+
+    if _requires_human_gate(event):
+        result = {
+            **base,
+            "status": "needs_mj",
+            "reason": "human gate required",
+            "proof_link": _proof_link(event, ticket),
+            "linear_assignment": {"assignee": "MJ", "set": False},
+        }
+        if assign_mj is None:
+            result["linear_assignment"] = {"assignee": "MJ", "set": False, "reason": "assignment callback not configured"}
+            result["telegram_push"] = {"enabled": config.telegram_push_enabled, "sent": False}
+            return result
+        assign_mj(ticket)
+        result["linear_assignment"] = {"assignee": "MJ", "set": True}
+        if config.telegram_push_enabled:
+            if telegram_push is None:
+                result["telegram_push"] = {"enabled": True, "sent": False, "reason": "telegram callback not configured"}
+            else:
+                telegram_push(_human_gate_message(event, ticket, "human gate required"))
+                result["telegram_push"] = {"enabled": True, "sent": True}
+        return result
 
     if not _is_low_failure_cost(event):
         return {**base, "status": "blocked_failure_cost", "reason": "dispatch requires low failure-cost and no MJ-review hold"}
@@ -249,12 +296,6 @@ def dispatch_outbox_event(
         return {**base, "status": "validator_bounced", "reason": "validator did not PASS"}
 
     result = {**base, "status": "validated"}
-    if config.telegram_push_enabled:
-        if telegram_push is None:
-            result["telegram_push"] = {"enabled": True, "sent": False, "reason": "telegram callback not configured"}
-        else:
-            telegram_push(_telegram_message(ticket, result))
-            result["telegram_push"] = {"enabled": True, "sent": True}
 
     if config.auto_done_low_cost:
         result["auto_done"]["attempted"] = True
