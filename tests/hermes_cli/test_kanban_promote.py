@@ -72,6 +72,74 @@ def test_promote_refuses_when_parent_not_done(conn):
     assert kb.get_task(conn, child).status == "todo"
 
 
+def _review_required_parent(conn):
+    parent = kb.create_task(conn, title="worker implementation", assignee="worker")
+    claimed = kb.claim_task(conn, parent)
+    assert claimed is not None
+    assert kb.block_task(
+        conn,
+        parent,
+        reason="review-required: implementation ready for validator/human gate",
+        expected_run_id=kb.get_task(conn, parent).current_run_id,
+    )
+    assert kb.get_task(conn, parent).status == "blocked"
+    return parent
+
+
+def test_promote_allows_validator_child_after_review_required_parent(conn):
+    parent = _review_required_parent(conn)
+    child = kb.create_task(
+        conn,
+        title="AGENTS-188 Validator: independent proof",
+        body="Separate validator. Do not merge or mark Linear Done.",
+        parents=[parent],
+        assignee="ruta",
+    )
+    conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
+
+    ok, err = kb.promote_task(conn, child, actor="tester")
+
+    assert ok and err is None
+    assert kb.get_task(conn, child).status == "ready"
+    assert kb.get_task(conn, parent).status == "blocked"
+
+
+def test_create_marks_validator_child_ready_after_review_required_parent(conn):
+    parent = _review_required_parent(conn)
+    child = kb.create_task(
+        conn,
+        title="AGENTS-188 Validator: independent proof",
+        body="Separate validator. Do not merge or mark Linear Done.",
+        parents=[parent],
+        assignee="ruta",
+    )
+
+    assert kb.get_task(conn, child).status == "ready"
+    claimed = kb.claim_task(conn, child)
+    assert claimed is not None
+    assert claimed.id == child
+    assert kb.get_task(conn, parent).status == "blocked"
+
+
+def test_promote_refuses_non_validator_child_after_review_required_parent(conn):
+    parent = _review_required_parent(conn)
+    child = kb.create_task(
+        conn,
+        title="follow-up implementation",
+        body="More worker execution, not an independent check.",
+        parents=[parent],
+        assignee="worker",
+    )
+
+    ok, err = kb.promote_task(conn, child, actor="tester")
+
+    assert ok is False
+    assert err is not None and "unsatisfied parent dependencies" in err
+    assert parent in err
+    assert kb.get_task(conn, child).status == "todo"
+    assert kb.get_task(conn, parent).status == "blocked"
+
+
 def test_promote_with_force_bypasses_dependency_check(conn):
     child, _ = _stuck_todo(conn, parents_done=False)
     ok, err = kb.promote_task(

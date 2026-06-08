@@ -1905,11 +1905,21 @@ def create_task(
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                         # If any parent is not yet done, we're todo.
                         rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
+                            "SELECT id, status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        if any(
+                            not _parent_satisfies_dependency_for_child(
+                                conn,
+                                parent_id=r["id"],
+                                parent_status=r["status"],
+                                child_title=title,
+                                child_body=body,
+                                child_assignee=assignee,
+                            )
+                            for r in rows
+                        ):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -2410,6 +2420,93 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+def _is_validator_handoff_task_fields(
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+) -> bool:
+    """Return True for a downstream validation/review card.
+
+    A parent blocked with ``review-required`` is not terminal for normal
+    follow-up work, but it is a valid input artifact for an independent
+    validator/reviewer card.  Keep this intentionally text/role based so the
+    parent remains blocked and no human merge/Linear-Done gate is bypassed.
+    """
+    haystack = " ".join(part or "" for part in (title, body, assignee)).casefold()
+    return any(
+        token in haystack
+        for token in (
+            "validator",
+            "validate",
+            "validation",
+            "verifier",
+            "reviewer",
+            "review-only",
+            "independent proof",
+        )
+    )
+
+
+def _is_validator_handoff_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    row = conn.execute(
+        "SELECT title, body, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return _is_validator_handoff_task_fields(
+        title=row["title"],
+        body=row["body"],
+        assignee=row["assignee"],
+    )
+
+
+def _latest_sticky_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or row["kind"] != "blocked":
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    reason = payload.get("reason")
+    return reason if isinstance(reason, str) else ""
+
+
+def _is_review_required_handoff(conn: sqlite3.Connection, task_id: str) -> bool:
+    reason = _latest_sticky_block_reason(conn, task_id)
+    return bool(reason) and reason.strip().casefold().startswith("review-required")
+
+
+def _parent_satisfies_dependency_for_child(
+    conn: sqlite3.Connection,
+    *,
+    parent_id: str,
+    parent_status: str,
+    child_id: Optional[str] = None,
+    child_title: Optional[str] = None,
+    child_body: Optional[str] = None,
+    child_assignee: Optional[str] = None,
+) -> bool:
+    if parent_status in ("done", "archived"):
+        return True
+    if parent_status != "blocked" or not _is_review_required_handoff(conn, parent_id):
+        return False
+    if child_id is not None:
+        return _is_validator_handoff_task(conn, child_id)
+    return _is_validator_handoff_task_fields(
+        title=child_title,
+        body=child_body,
+        assignee=child_assignee,
+    )
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -2439,13 +2536,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
-    row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return _latest_sticky_block_reason(conn, task_id) is not None
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
@@ -2478,12 +2569,20 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(
+                _parent_satisfies_dependency_for_child(
+                    conn,
+                    parent_id=p["id"],
+                    parent_status=p["status"],
+                    child_id=task_id,
+                )
+                for p in parents
+            ):
                 # Blocked tasks also get their failure counters reset —
                 # this is effectively an auto-unblock (circuit-breaker
                 # recovery; worker-initiated blocks are skipped above).
@@ -2533,12 +2632,20 @@ def claim_task(
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         undone = conn.execute(
-            "SELECT 1 FROM task_links l "
+            "SELECT p.id, p.status FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ?",
             (task_id,),
-        ).fetchone()
-        if undone:
+        ).fetchall()
+        if any(
+            not _parent_satisfies_dependency_for_child(
+                conn,
+                parent_id=p["id"],
+                parent_status=p["status"],
+                child_id=task_id,
+            )
+            for p in undone
+        ):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -3655,7 +3762,12 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if not _parent_satisfies_dependency_for_child(
+                conn,
+                parent_id=p["id"],
+                parent_status=p["status"],
+                child_id=task_id,
+            )
         ]
         if unsatisfied:
             return False, (
