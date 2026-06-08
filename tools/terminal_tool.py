@@ -258,6 +258,205 @@ from tools.approval import (
 )
 
 
+
+
+def _split_shell_segments(command: str) -> list[list[str]]:
+    """Best-effort split of a shell command into argv-like segments.
+
+    This is a safety preflight, not a shell interpreter. It intentionally handles
+    the direct terminal operations that can delete a single tracked file
+    (``rm``, ``git rm``, ``git clean``) while failing open for unparsable shell
+    syntax so normal dangerous-command approval still runs.
+    """
+    try:
+        import shlex
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except Exception:
+        return []
+
+    segments: list[list[str]] = []
+    current: list[str] = []
+    separators = {";", "&&", "||", "|", "\n"}
+    for token in tokens:
+        if token in separators or set(token) <= {";"}:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _strip_command_wrappers(tokens: list[str]) -> list[str]:
+    """Remove leading env assignments and common wrappers from a shell segment."""
+    out = list(tokens)
+    while out:
+        if _looks_like_env_assignment(out[0]):
+            out.pop(0)
+            continue
+        cmd = Path(out[0]).name
+        if cmd in {"sudo", "command", "exec", "nohup", "setsid", "time"}:
+            out.pop(0)
+            # Drop simple sudo/wrapper flags. Keep flag arguments conservative:
+            # if a flag takes an argument (e.g. sudo -u root), dropping one extra
+            # token is safer than misclassifying the argument as the command.
+            while out and out[0].startswith("-"):
+                flag = out.pop(0)
+                if flag in {"-u", "-g", "-p", "-C", "-T"} and out:
+                    out.pop(0)
+            continue
+        if cmd == "env":
+            out.pop(0)
+            while out and _looks_like_env_assignment(out[0]):
+                out.pop(0)
+            continue
+        break
+    return out
+
+
+def _command_operands(tokens: list[str], *, git_subcommand: bool = False) -> list[str]:
+    """Return path-like operands after command/options for rm/git pathspecs."""
+    operands: list[str] = []
+    after_double_dash = False
+    for token in tokens:
+        if not after_double_dash and token == "--":
+            after_double_dash = True
+            continue
+        if not after_double_dash and token.startswith("-"):
+            # Handle option forms with a separate value by skipping the next
+            # token only for options commonly taking values. For rm/git rm/git
+            # clean, path operands are otherwise non-option tokens.
+            continue
+        if git_subcommand and token in {"rm", "clean"}:
+            continue
+        operands.append(token)
+    return operands
+
+
+def _is_git_tracked_file(candidate: Path) -> bool:
+    """Return True when candidate resolves to an existing git-tracked file."""
+    try:
+        resolved = candidate.expanduser().resolve(strict=False)
+        if not resolved.exists() or not resolved.is_file():
+            return False
+        root_proc = subprocess.run(
+            ["git", "-C", str(resolved.parent), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=5,
+        )
+        if root_proc.returncode != 0:
+            return False
+        root = Path(root_proc.stdout.strip()).resolve()
+        rel = os.path.relpath(resolved, root)
+        tracked_proc = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", rel],
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=5,
+        )
+        return tracked_proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _tracked_delete_guard_log_path() -> Path:
+    """Return the forensic log path for blocked tracked-file terminal deletes."""
+    configured = os.getenv("HERMES_TRACKED_DELETE_GUARD_LOG")
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "logs" / "tracked-delete-guard.jsonl"
+    except Exception:
+        return Path.home() / ".hermes" / "logs" / "tracked-delete-guard.jsonl"
+
+
+def _log_tracked_delete_attempt(command: str, cwd: Path, path: Path, operation: str) -> None:
+    """Append exact blocked terminal delete command for AGENTS-199 forensics."""
+    try:
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "operation": operation,
+            "command": command,
+            "cwd": str(cwd),
+            "path": str(path),
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "session_key": os.getenv("HERMES_SESSION_KEY", ""),
+            "platform": os.getenv("HERMES_SESSION_PLATFORM", ""),
+        }
+        log_path = _tracked_delete_guard_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.debug("Failed to write tracked-delete guard log: %s", exc)
+
+
+def _tracked_file_delete_guard(command: str, cwd: str | None, authorized: bool = False) -> str | None:
+    """Refuse terminal deletes of git-tracked files without explicit authorization.
+
+    Mirrors the file patch tool's tracked-file delete guard at the terminal
+    layer for the raw operations that can produce an uncommitted ``git D``:
+    ``rm <path>``, ``git rm <path>``, and path-targeted ``git clean``.
+    """
+    if authorized:
+        return None
+    base = Path(cwd or os.getcwd()).expanduser()
+    try:
+        base = base.resolve(strict=False)
+    except Exception:
+        pass
+
+    for segment in _split_shell_segments(command):
+        tokens = _strip_command_wrappers(segment)
+        if not tokens:
+            continue
+        cmd = Path(tokens[0]).name
+        operands: list[str] = []
+        operation = cmd
+        if cmd == "rm":
+            operands = _command_operands(tokens[1:])
+        elif cmd == "git" and len(tokens) >= 2:
+            sub = tokens[1]
+            operation = f"git {sub}"
+            if sub == "rm":
+                operands = _command_operands(tokens[2:], git_subcommand=True)
+            elif sub == "clean":
+                operands = _command_operands(tokens[2:], git_subcommand=True)
+        for operand in operands:
+            # Globs or shell expansions cannot be safely resolved pre-exec; they
+            # remain covered by the existing dangerous-command approval layer.
+            if any(ch in operand for ch in "*$?[]{}"):
+                continue
+            candidate = Path(operand).expanduser()
+            if not candidate.is_absolute():
+                candidate = base / candidate
+            if _is_git_tracked_file(candidate):
+                resolved = candidate.resolve(strict=False)
+                logger.warning(
+                    "Blocked terminal tracked-file delete: command=%r cwd=%s path=%s",
+                    command,
+                    str(base),
+                    str(resolved),
+                )
+                _log_tracked_delete_attempt(command, base, resolved, operation)
+                return (
+                    f"Refusing to delete git-tracked file without explicit authorization: {resolved}. "
+                    "Recoverability invariant: use the patch tool with "
+                    "allow_git_tracked_delete=True only after explicit user approval, "
+                    "or run the deletion yourself outside the agent."
+                )
+    return None
+
+
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
@@ -1779,9 +1978,18 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
-        # Pre-exec security checks (tirith + dangerous command detection)
-        # Skip check if force=True (user has confirmed they want to run it)
+        # Pre-exec security checks (tracked-file delete guard, tirith, dangerous command detection)
         approval_note = None
+        tracked_delete_error = _tracked_file_delete_guard(command, workdir or cwd, authorized=force)
+        if tracked_delete_error:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": tracked_delete_error,
+                "status": "blocked"
+            }, ensure_ascii=False)
+
+        # Skip approval check if force=True (user has confirmed they want to run it)
         if not force:
             approval = _check_all_guards(command, env_type)
             if not approval["approved"]:
