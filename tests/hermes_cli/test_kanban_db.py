@@ -232,6 +232,7 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
             workspace_kind="worktree",
             workspace_path=str(target),
             branch_name=" wt/t6-wire ",
+            initial_status="blocked",
         )
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
@@ -2157,6 +2158,145 @@ class TestSharedBoardPaths:
 
         with pytest.raises(RuntimeError, match="refusing to spawn worktree task"):
             kb._default_spawn(task, str(tmp_path / "missing-ws"))
+
+
+    def test_create_worktree_task_precreates_git_worktree_before_ready(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        kb.write_board_metadata(None, default_workdir=str(repo))
+        workspace = kb.workspaces_root() / "t_atomic"
+        calls = []
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            assert cmd[:3] == ["git", "worktree", "add"]
+            assert kwargs.get("cwd") == repo
+            workspace.mkdir(parents=True)
+            (workspace / ".git").write_text("gitdir: test\n", encoding="utf-8")
+            return _Completed()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title="atomic worktree",
+                assignee="default",
+                workspace_kind="worktree",
+                workspace_path=str(workspace),
+                branch_name="wt/t_atomic",
+            )
+            task = kb.get_task(conn, task_id)
+
+        assert task is not None
+        assert task.status == "ready"
+        assert workspace.is_dir()
+        assert calls, "git worktree add must run before a worktree task can become ready"
+
+    def test_create_worktree_task_fails_closed_when_git_worktree_fails(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        kb.write_board_metadata(None, default_workdir=str(repo))
+        workspace = kb.workspaces_root() / "t_atomic_fail"
+
+        class _Completed:
+            returncode = 128
+            stdout = ""
+            stderr = "fatal: boom"
+
+        monkeypatch.setattr("subprocess.run", lambda *a, **k: _Completed())
+
+        with kb.connect_closing() as conn:
+            with pytest.raises(RuntimeError, match="could not be pre-created"):
+                kb.create_task(
+                    conn,
+                    title="atomic worktree fail",
+                    assignee="default",
+                    workspace_kind="worktree",
+                    workspace_path=str(workspace),
+                    branch_name="wt/t_atomic_fail",
+                )
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE title = ?",
+                ("atomic worktree fail",),
+            ).fetchall()
+
+        assert rows == []
+        assert not workspace.exists()
+
+
+    def test_dispatcher_rehydrates_missing_worktree_with_git_worktree_not_plain_mkdir(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        kb.write_board_metadata(None, default_workdir=str(repo))
+        workspace = kb.workspaces_root() / "t_rehydrate"
+        captured = {"run": [], "popen": None}
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured["run"].append((cmd, kwargs))
+            assert cmd[:3] == ["git", "worktree", "add"]
+            assert kwargs.get("cwd") == repo
+            # Simulate git creating a real worktree. A plain mkdir-only fix
+            # would not have made this assertion observable.
+            workspace.mkdir(parents=True)
+            (workspace / ".git").write_text("gitdir: test\n", encoding="utf-8")
+            return _Completed()
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["popen"] = kwargs
+                self.pid = 5252
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_rehydrate",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_rehydrate",
+        )
+
+        assert kb._default_spawn(task, str(workspace)) == 5252
+        assert captured["run"]
+        assert captured["popen"]["cwd"] == str(workspace)
 
 
 # ---------------------------------------------------------------------------

@@ -1874,7 +1874,7 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
-    if workspace_path is None and workspace_kind in {"dir", "worktree"}:
+    if workspace_path is None and workspace_kind == "dir":
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
@@ -1884,6 +1884,9 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        effective_workspace_path = workspace_path
+        if effective_workspace_path is None and workspace_kind == "worktree":
+            effective_workspace_path = str(workspaces_root(board=board) / task_id)
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -1928,6 +1931,22 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                if (
+                    task_status == "ready"
+                    and workspace_kind == "worktree"
+                    and effective_workspace_path
+                    and branch_name
+                    and not Path(effective_workspace_path).expanduser().is_dir()
+                    and not _precreate_worktree_workspace(
+                        effective_workspace_path,
+                        branch_name,
+                        board=board,
+                    )
+                ):
+                    raise RuntimeError(
+                        "refusing to create ready worktree task: workspace could not be pre-created via git worktree"
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1947,7 +1966,7 @@ def create_task(
                         created_by,
                         now,
                         workspace_kind,
-                        workspace_path,
+                        effective_workspace_path,
                         branch_name,
                         tenant,
                         idempotency_key,
@@ -5981,6 +6000,56 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+def _precreate_worktree_workspace(
+    workspace: str,
+    branch_name: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Create a kanban worktree workspace via git, never by plain mkdir."""
+    workspace_path = Path(workspace).expanduser()
+    try:
+        workspace_path.resolve().relative_to(workspaces_root(board=board).resolve())
+    except ValueError:
+        return False
+    board_default = read_board_metadata(board).get("default_workdir")
+    if not board_default:
+        return False
+    repo = Path(str(board_default)).expanduser()
+    if not (repo / ".git").exists():
+        return False
+    workspace_path.parent.mkdir(parents=True, exist_ok=True)
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "worktree", "add", "-B", branch_name, str(workspace_path), "HEAD"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and workspace_path.is_dir()
+
+
+def _rehydrate_missing_worktree_workspace(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Recreate a missing kanban worktree via git, never by plain mkdir.
+
+    A worktree workspace is only valid if git created it.  If the directory
+    disappeared while the task metadata still points at it, use the board's
+    default_workdir as the source repository and `git worktree add -B` to
+    rehydrate the worker checkout.  Return False when prerequisites are absent
+    so callers keep failing closed.
+    """
+    if task.workspace_kind != "worktree" or not task.branch_name:
+        return False
+    return _precreate_worktree_workspace(workspace, task.branch_name, board=board)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -6123,9 +6192,12 @@ def _default_spawn(
 
     workspace_cwd = workspace if os.path.isdir(workspace) else None
     if task.workspace_kind == "worktree" and workspace_cwd is None:
-        raise RuntimeError(
-            f"refusing to spawn worktree task {task.id}: workspace does not exist: {workspace}"
-        )
+        if _rehydrate_missing_worktree_workspace(task, workspace, board=board):
+            workspace_cwd = workspace
+        else:
+            raise RuntimeError(
+                f"refusing to spawn worktree task {task.id}: workspace does not exist or could not be rehydrated via git worktree: {workspace}"
+            )
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
