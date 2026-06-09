@@ -511,6 +511,41 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         self._seen_deliveries[delivery_id] = now
 
+        # ── Team OS Linear approval webhook ─────────────────────
+        # Linear is the event source for MJ approval UX.  This route is
+        # intentionally deterministic and returns 200 (not 202) because
+        # Linear retries/non-200s aggressively and requires a quick ACK.
+        if route_config.get("team_os_linear"):
+            try:
+                handler = globals().get("handle_team_os_linear_webhook")
+                if handler is None:
+                    from hermes_cli.team_os.linear_webhook import handle_team_os_linear_webhook as handler
+                result = handler(
+                    payload,
+                    state_db=route_config.get("state_db"),
+                )
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except Exception:
+                logger.exception(
+                    "[webhook] Team OS Linear handler failed route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                return web.json_response(
+                    {"status": "error", "error": "Team OS Linear handler failed", "delivery_id": delivery_id},
+                    status=500,
+                )
+            return web.json_response(
+                {
+                    "status": "handled",
+                    "route": route_name,
+                    "delivery_id": delivery_id,
+                    "result": result,
+                },
+                status=200,
+            )
+
         # ── Direct delivery mode (deliver_only) ─────────────────
         # Skip the agent entirely — the rendered prompt IS the message we
         # deliver.  Use case: external services (Supabase, monitoring,
@@ -672,6 +707,14 @@ class WebhookAdapter(BasePlatformAdapter):
         gl_token = request.headers.get("X-Gitlab-Token", "")
         if gl_token:
             return hmac.compare_digest(gl_token, secret)
+
+        # Linear: Linear-Signature = <hex HMAC-SHA256(raw_body)>.
+        linear_sig = request.headers.get("Linear-Signature", "") or request.headers.get("linear-signature", "")
+        if linear_sig:
+            expected = hmac.new(
+                secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            return hmac.compare_digest(linear_sig, expected)
 
         # Generic: X-Webhook-Signature = <hex HMAC-SHA256>
         generic_sig = request.headers.get("X-Webhook-Signature", "")
