@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -41,7 +42,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -55,6 +56,7 @@ from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.resume_state import build_restart_resume_state as _build_current_work_restart_resume_state
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -1759,6 +1761,126 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _resume_state_path_for_session(session_key: str, *, hermes_home: Path | None = None) -> Path:
+    """Durable checkpoint path for restart-resume state for a gateway session."""
+    home = hermes_home or _hermes_home
+    digest = hashlib.sha256(session_key.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return home / "state" / "resume-state" / f"{digest}.json"
+
+
+def _extract_resume_ticket_id(messages: list[dict[str, Any]]) -> str | None:
+    """Best-effort issue/ticket detector for RESUME-STATE metadata."""
+    ticket_re = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+    found: list[str] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        found.extend(ticket_re.findall(content))
+    return found[-1] if found else None
+
+
+def _build_restart_resume_state(
+    *,
+    session_key: str,
+    session_id: str | None,
+    reason: str,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the checkpoint the next gateway process injects into auto-resume."""
+    tail: list[dict[str, str]] = []
+    for msg in messages[-12:]:
+        role = str(msg.get("role") or "")
+        content = msg.get("content")
+        if not role or not isinstance(content, str) or not content.strip():
+            continue
+        tail.append({"role": role, "content": content[-2000:]})
+
+    current_state = _build_current_work_restart_resume_state(session_key, reason)
+    ticket_id = current_state.get("ticket_id") or _extract_resume_ticket_id(messages)
+    return {
+        "schema": "hermes.gateway.resume-state.v1",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "session_key": session_key,
+        "session_id": session_id,
+        "ticket_id": ticket_id,
+        "title": current_state.get("title"),
+        "phase": current_state.get("phase"),
+        "restart_reason": reason,
+        "steps_completed": current_state.get("completed_steps") or "none recorded",
+        "exact_next_step": current_state.get("next_step") or (
+            "Continue the unfinished task from the latest transcript/tool result. "
+            "Do not send an acknowledgement-only resume. Use tools immediately; "
+            "finish the next checklist item, then keep going until complete or blocked."
+        ),
+        "proof_pending": current_state.get("proof_pending") or [
+            "Attach concrete proof to the relevant Linear/Kanban item: tests, commit, deployed-live observation, or explicit blocker."
+        ],
+        "restart_policy": current_state.get("restart_policy"),
+        "transcript_tail": tail,
+    }
+
+
+def _format_resume_state_for_prompt(state: dict[str, Any], *, path: Path) -> str:
+    """Render durable RESUME-STATE as hard instructions for the resumed turn."""
+    payload = json.dumps(state, ensure_ascii=False, indent=2)[:12000]
+    return (
+        "[System note: RESUME-STATE exists for the previous interrupted work. "
+        "This is an execution checkpoint, not context for a status summary. "
+        "Resume means continue: read the exact_next_step, use tools immediately, "
+        "and do not reply with only an acknowledgement or recap while proof_pending remains. "
+        f"Checkpoint path: {path}\n{payload}]"
+    )
+
+
+def _build_resume_pending_system_note(
+    message: str,
+    reason: str,
+    *,
+    resume_state: dict[str, Any] | None = None,
+    resume_state_path: Path | None = None,
+) -> str:
+    """Build the hard auto-resume prompt: continue execution, never ack-only."""
+    reason_phrase = (
+        "a gateway restart"
+        if reason == "restart_timeout"
+        else "a gateway shutdown"
+        if reason == "shutdown_timeout"
+        else "a gateway interruption"
+    )
+    state_block = ""
+    if resume_state is not None:
+        path = resume_state_path or Path("(injected)")
+        state_block = "\n\n" + _format_resume_state_for_prompt(resume_state, path=path)
+    return (
+        f"[System note: Your previous turn in this session was interrupted by {reason_phrase}. "
+        "The conversation history below is intact. Resume means continue executing the "
+        "unfinished work, not narrate status. Do not reply with a brief acknowledgment "
+        "only. If there is unfinished work, use tools immediately. Process any pending "
+        "tool result(s), then execute the next concrete step until the task is complete "
+        "or genuinely blocked.]"
+        f"{state_block}\n\n"
+        + message
+    )
+
+
+def _load_resume_state_prompt(session_key: str, *, hermes_home: Path | None = None) -> str | None:
+    path = _resume_state_path_for_session(session_key, hermes_home=hermes_home)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return (
+            "[System note: A restart RESUME-STATE checkpoint exists but could not be "
+            f"parsed at {path}: {exc}. Continue the unfinished task from transcript; "
+            "do not acknowledge-only.]"
+        )
+    if not isinstance(state, dict):
+        return None
+    return _format_resume_state_for_prompt(state, path=path)
 
 
 def _preserve_queued_followup_history_offset(
@@ -3531,6 +3653,46 @@ class GatewayRunner:
                 logger.debug("Interrupted running agent for session %s during shutdown", session_key)
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
+
+    def _write_restart_resume_state(self, session_key: str, reason: str) -> Path | None:
+        """Checkpoint active work before a gateway restart can interrupt it."""
+        try:
+            entry = None
+            if getattr(self, "session_store", None) is not None:
+                self.session_store._ensure_loaded()  # noqa: SLF001
+                entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+            session_id = getattr(entry, "session_id", None)
+            messages: list[dict[str, Any]] = []
+            session_db = getattr(self, "_session_db", None)
+            if session_id and session_db is not None:
+                try:
+                    messages = list(session_db.get_messages(session_id))
+                except Exception as exc:
+                    logger.debug("RESUME-STATE transcript read failed for %s: %s", session_key, exc)
+            state = _build_restart_resume_state(
+                session_key=session_key,
+                session_id=session_id,
+                reason=reason,
+                messages=messages,
+            )
+            path = _resume_state_path_for_session(session_key)
+            atomic_json_write(path, state)
+            logger.info(
+                "Wrote RESUME-STATE checkpoint for %s to %s (ticket=%s)",
+                session_key,
+                path,
+                state.get("ticket_id"),
+            )
+            return path
+        except Exception as exc:
+            logger.error("Failed to write RESUME-STATE for %s: %s", session_key, exc)
+            return None
+
+    def _checkpoint_running_agents_for_restart(self, reason: str) -> None:
+        for session_key, agent in list(self._running_agents.items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            self._write_restart_resume_state(session_key, reason)
 
     def _kill_tool_subprocesses(self, phase: str) -> None:
         """Kill tool subprocesses + tear down terminal envs + browsers.
@@ -6125,6 +6287,13 @@ class GatewayRunner:
 
             self._running = False
             self._draining = True
+
+            # Phase 0 hard rule: before a gateway restart can interrupt an
+            # active turn, write durable RESUME-STATE.  The next process injects
+            # this checkpoint into auto-resume so "resume" means continue the
+            # checklist, not send a five-second acknowledgement.
+            if self._restart_requested:
+                self._checkpoint_running_agents_for_restart("restart_timeout")
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -17332,28 +17501,28 @@ class GatewayRunner:
 
             if _is_resume_pending:
                 _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
-                _reason_phrase = (
-                    "a gateway restart"
-                    if _reason == "restart_timeout"
-                    else "a gateway shutdown"
-                    if _reason == "shutdown_timeout"
-                    else "a gateway interruption"
-                )
-                message = (
-                    f"[System note: Your previous turn in this session was interrupted "
-                    f"by {_reason_phrase}. The conversation history below is intact. "
-                    f"If it contains unfinished tool result(s), process them first and "
-                    f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
-                    + message
+                _resume_state = None
+                _resume_state_path = None
+                if session_key:
+                    _resume_state_path = _resume_state_path_for_session(session_key)
+                    try:
+                        _resume_state = json.loads(_resume_state_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        _resume_state = None
+                message = _build_resume_pending_system_note(
+                    message,
+                    _reason,
+                    resume_state=_resume_state if isinstance(_resume_state, dict) else None,
+                    resume_state_path=_resume_state_path,
                 )
             elif _has_fresh_tool_tail:
                 message = (
                     "[System note: Your previous turn was interrupted before you could "
                     "process the last tool result(s). The conversation history contains "
-                    "tool outputs you haven't responded to yet. Please finish processing "
-                    "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    "tool outputs you haven't responded to yet. Resume means continue: "
+                    "process those results, use tools for the next concrete step, and "
+                    "do not reply with only an acknowledgement or recap while unfinished "
+                    "work remains.]\n\n"
                     + message
                 )
 

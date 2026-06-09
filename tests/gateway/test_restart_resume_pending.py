@@ -36,12 +36,15 @@ from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _auto_continue_freshness_window,
+    _build_resume_pending_system_note,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
 )
+from gateway.resume_state import read_restart_resume_state, write_restart_resume_state
 from gateway.session import SessionEntry, SessionSource, SessionStore
+from agent.current_work import CurrentWork
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -145,28 +148,15 @@ def _simulate_note_injection(
 
     if is_resume_pending:
         reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
-        reason_phrase = (
-            "a gateway restart"
-            if reason == "restart_timeout"
-            else "a gateway shutdown"
-            if reason == "shutdown_timeout"
-            else "a gateway interruption"
-        )
-        message = (
-            f"[System note: Your previous turn in this session was interrupted "
-            f"by {reason_phrase}. The conversation history below is intact. "
-            f"If it contains unfinished tool result(s), process them first and "
-            f"summarize what was accomplished, then address the user's new "
-            f"message below.]\n\n"
-            + message
-        )
+        message = _build_resume_pending_system_note(message, reason, resume_state=None)
     elif has_fresh_tool_tail:
         message = (
             "[System note: Your previous turn was interrupted before you could "
             "process the last tool result(s). The conversation history contains "
-            "tool outputs you haven't responded to yet. Please finish processing "
-            "those results and summarize what was accomplished, then address the "
-            "user's new message below.]\n\n"
+            "tool outputs you haven't responded to yet. Resume means continue: "
+            "process those results, use tools for the next concrete step, and "
+            "do not reply with only an acknowledgement or recap while unfinished "
+            "work remains.]\n\n"
             + message
         )
     return message
@@ -413,6 +403,36 @@ class TestSuspendRecentlyActiveSkipsResumePending:
 
 
 # ---------------------------------------------------------------------------
+# Durable restart RESUME-STATE
+# ---------------------------------------------------------------------------
+
+
+class TestRestartResumeState:
+    def test_write_restart_resume_state_captures_current_work_queue(self, tmp_path):
+        path = tmp_path / "restart-resume-state.json"
+        work = CurrentWork(
+            linear_id="AGENTS-219",
+            title="Phase 0 restart resume",
+            phase="proof",
+            queue=["run focused tests", "commit", "restart as last action"],
+        )
+
+        write_restart_resume_state(
+            "agent:main:telegram:dm:1",
+            "restart_timeout",
+            current_work=work,
+            path=path,
+        )
+
+        state = read_restart_resume_state("agent:main:telegram:dm:1", path=path)
+        assert state is not None
+        assert state["ticket_id"] == "AGENTS-219"
+        assert state["completed_steps"] == ["proof"]
+        assert state["next_step"] == "run focused tests"
+        assert state["proof_pending"] == ["run focused tests", "commit", "restart as last action"]
+
+
+# ---------------------------------------------------------------------------
 # Restart-resume system-note injection
 # ---------------------------------------------------------------------------
 
@@ -442,6 +462,26 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
         assert "what happened?" in result
+
+    def test_resume_pending_note_with_resume_state_continues_next_step_not_ack_only(self):
+        resume_state = {
+            "ticket_id": "AGENTS-219",
+            "completed_steps": ["tests written", "implementation committed"],
+            "next_step": "attach Linear proof and run live restart proof",
+            "proof_pending": ["focused tests", "live deploy proof"],
+        }
+
+        result = _build_resume_pending_system_note(
+            "",
+            "restart_timeout",
+            resume_state=resume_state,
+        )
+
+        assert "RESUME-STATE" in result
+        assert "AGENTS-219" in result
+        assert "attach Linear proof and run live restart proof" in result
+        assert "Do not reply with a brief acknowledgment only" in result
+        assert "continue executing" in result
 
     def test_resume_pending_shutdown_note_mentions_shutdown(self):
         entry = self._pending_entry(reason="shutdown_timeout")
