@@ -441,6 +441,34 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _gateway_config_wall_clock_timeout() -> tuple[bool, Optional[float]]:
+    """Return (present, timeout) for agent.gateway_wall_clock_timeout.
+
+    This deliberately reads config.yaml at call time instead of trusting the
+    environment bridge alone. Gateway turns hot-reload .env for credentials and
+    launchd can inject stale env defaults; config.yaml must remain authoritative
+    for this safety knob for the whole process lifetime.
+    """
+    config_path = _hermes_home / "config.yaml"
+    if not config_path.exists():
+        return False, None
+    try:
+        import yaml as _yaml
+        with open(config_path, encoding="utf-8") as handle:
+            cfg = _yaml.safe_load(handle) or {}
+        from hermes_cli.config import _expand_env_vars
+        cfg = _expand_env_vars(cfg)
+        if not isinstance(cfg, dict):
+            return False, None
+        agent_cfg = cfg.get("agent", {})
+        if not isinstance(agent_cfg, dict) or "gateway_wall_clock_timeout" not in agent_cfg:
+            return False, None
+        raw = float(agent_cfg["gateway_wall_clock_timeout"])
+    except Exception:
+        return False, None
+    return True, raw if raw > 0 else None
+
+
 def _gateway_turn_wall_clock_timeout() -> Optional[float]:
     """Return the per-turn wall-clock timeout in seconds.
 
@@ -448,7 +476,14 @@ def _gateway_turn_wall_clock_timeout() -> Optional[float]:
     loops can run forever as long as activity keeps flowing. Gateway turns need a
     separate hard wall-clock guard so a marathon turn aborts itself before the
     watchdog's stuck-busy backstop has to restart the whole gateway.
+
+    If ``agent.gateway_wall_clock_timeout`` exists in config.yaml, it is
+    authoritative over ``HERMES_AGENT_WALL_CLOCK_TIMEOUT`` for the whole process
+    lifetime. A value <= 0 disables the guillotine.
     """
+    present, config_timeout = _gateway_config_wall_clock_timeout()
+    if present:
+        return config_timeout
     raw = _float_env("HERMES_AGENT_WALL_CLOCK_TIMEOUT", 600)
     return raw if raw > 0 else None
 

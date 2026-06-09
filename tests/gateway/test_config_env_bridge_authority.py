@@ -178,3 +178,36 @@ def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:
     env = _run_gateway_import(hermes_home, initial_env={})
 
     assert env.get("HERMES_MAX_ITERATIONS") == "123"
+
+
+def test_config_zero_wall_clock_stays_authoritative_after_later_env_reload(hermes_home: Path) -> None:
+    """Regression: later .env reloads must not re-arm wall-clock when config disables it."""
+    _write_config(hermes_home, agent_cfg={"gateway_wall_clock_timeout": 0})
+    _write_env(hermes_home, {"HERMES_AGENT_WALL_CLOCK_TIMEOUT": "600"})
+
+    script = textwrap.dedent(
+        f"""
+        import os, sys
+        sys.path.insert(0, {str(PROJECT_ROOT)!r})
+        from gateway import run
+        # Simulate a later credential/.env reload or launchd env injection that
+        # reintroduces the stale default after gateway startup. config.yaml must
+        # remain authoritative for this setting.
+        os.environ["HERMES_AGENT_WALL_CLOCK_TIMEOUT"] = "600"
+        print(run._gateway_turn_wall_clock_timeout())
+        """
+    )
+    env = {
+        "HERMES_HOME": str(hermes_home),
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "None"
