@@ -27,6 +27,11 @@ from .loop_runner import (
     write_dispatch_result,
     write_loop_decision,
 )
+from .integrator import (
+    IntegratorInput,
+    classify_integrator_action,
+    integrate_after_validator,
+)
 from .kill_switch import KillSwitch, KillSwitchActive
 from .quota import quota_status_unknown
 from .router import TaskHints, route_task
@@ -787,6 +792,71 @@ gql(
             print(rendered)
         return 0 if result.get("worker_status") == "completed" else 1
 
+    if command == "integrate":
+        handoff_path = Path(getattr(args, "handoff")).expanduser()
+        validator_report_path = Path(getattr(args, "validator_report")).expanduser()
+        worktree_path = Path(getattr(args, "worktree")).expanduser()
+        output_path = (
+            Path(getattr(args, "output")).expanduser()
+            if getattr(args, "output", None)
+            else None
+        )
+        input_data = IntegratorInput(
+            source_ticket=getattr(args, "source_ticket"),
+            worktree_path=worktree_path,
+            handoff_path=handoff_path,
+            validator_report_path=validator_report_path,
+            main_branch=getattr(args, "main_branch", "main"),
+            deploy_command=tuple(getattr(args, "deploy_command", None) or ()),
+            fyi_counter_path=(
+                Path(getattr(args, "fyi_counter")).expanduser()
+                if getattr(args, "fyi_counter", None)
+                else Path("~/.hermes/state/team-os-integrator-fyi.json").expanduser()
+            ),
+            fyi_limit=int(getattr(args, "fyi_limit", 3) or 3),
+        )
+        if not bool(getattr(args, "apply", False)):
+            handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+            validator = json.loads(validator_report_path.read_text(encoding="utf-8"))
+            classification = classify_integrator_action(handoff)
+            verdict = str(validator.get("verdict") or "").upper()
+            would_status = (
+                "auto_landed"
+                if verdict == "PASS" and classification.reversibility == "reversible"
+                else "needs_mj"
+                if verdict == "PASS"
+                else "blocked"
+            )
+            result = {
+                "status": "planned",
+                "source_ticket": input_data.source_ticket,
+                "validator_verdict": verdict,
+                "reversibility": classification.reversibility,
+                "reasons": list(classification.reasons),
+                "would_status": would_status,
+                "apply_required_for_side_effects": True,
+            }
+        else:
+            applied = integrate_after_validator(input_data)
+            result = {
+                "status": applied.status,
+                "source_ticket": input_data.source_ticket,
+                "reversibility": applied.reversibility,
+                "reason": applied.reason,
+                "rollback_commands": list(applied.rollback_commands),
+                "fyi_sent": applied.fyi_sent,
+                "commands": [list(cmd) for cmd in applied.commands],
+                "gate_card": applied.gate_card,
+            }
+        rendered = json.dumps(result, indent=2, sort_keys=True)
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered + "\n", encoding="utf-8")
+            print(str(output_path))
+        else:
+            print(rendered)
+        return 0 if result.get("status") in {"planned", "auto_landed", "needs_mj"} else 1
+
     if command != "snapshot":
         raise SystemExit(f"unknown team-os command: {command}")
 
@@ -1136,6 +1206,7 @@ def register_cli(parent) -> None:  # noqa: ANN001
     _register_kill_switch(sub)
     _register_contracts(sub)
     _register_run_worker(sub)
+    _register_integrator(sub)
 
     parent.set_defaults(func=cmd_team_os)
 
@@ -1263,3 +1334,39 @@ def _register_run_worker(sub) -> None:  # noqa: ANN001
     )
     worker.add_argument("--output", help="Optional Worker handoff JSON output path")
     worker.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
+
+
+def _register_integrator(sub) -> None:  # noqa: ANN001
+    """Register the Phase 1 deterministic post-Validator Integrator."""
+    integrator = sub.add_parser(
+        "integrate",
+        help=(
+            "Phase 1: deterministic post-Validator stage; dry-run by default, "
+            "--apply performs reversible auto-land or irreversible Needs-MJ gate"
+        ),
+    )
+    integrator.add_argument("--source-ticket", required=True, help="Linear source ticket, e.g. AGENTS-220")
+    integrator.add_argument("--worktree", required=True, help="Validated Worker worktree path")
+    integrator.add_argument("--handoff", required=True, help="Worker handoff JSON path")
+    integrator.add_argument("--validator-report", required=True, help="Validator report JSON path")
+    integrator.add_argument("--main-branch", default="main", help="Branch to land into (default: main)")
+    integrator.add_argument(
+        "--deploy-command",
+        nargs="+",
+        default=[],
+        help="Command argv to run after reversible merge/push; omitted in plan-only tests",
+    )
+    integrator.add_argument(
+        "--fyi-counter",
+        default="~/.hermes/state/team-os-integrator-fyi.json",
+        help="Durable counter for first-N FYI auto-land pings",
+    )
+    integrator.add_argument("--fyi-limit", type=int, default=3, help="Number of initial auto-lands that send FYI")
+    integrator.add_argument("--output", help="Optional Integrator decision JSON path")
+    integrator.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help="Actually perform side effects; omitted means plan/classify only",
+    )
+    integrator.set_defaults(func=lambda args: sys.exit(cmd_team_os(args)))
