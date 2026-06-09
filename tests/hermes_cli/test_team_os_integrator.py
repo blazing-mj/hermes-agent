@@ -24,11 +24,14 @@ def _handoff(tmp_path: Path, **updates) -> Path:
         "risk": "low",
         "side_effects": [],
         "plain_language": {
+            "decision": "Approve the docs-only change.",
             "problem": "The docs were stale.",
             "what_changed": "The wording now matches runtime behavior.",
             "how_it_behaves_now": "Operators see the current command.",
             "approving": "Allow this docs-only change to land.",
             "not_approving": "No production restart, send, spend, credential, delete, or customer action.",
+            "rollback": "Revert the docs-only change.",
+            "proof": "Validator PASS and tests are linked on the ticket.",
         },
     }
     payload.update(updates)
@@ -99,11 +102,14 @@ def test_irreversible_validator_pass_stops_at_needs_mj_with_zero_code_gate(tmp_p
     assert result.status == "needs_mj"
     assert statuses == [("AGENTS-999", "Needs-MJ")]
     gate = comments[-1]
-    assert "Problem" in gate
-    assert "What changed" in gate
-    assert "How it behaves now" in gate
-    assert "What I’m approving" in gate
-    assert "What I’m NOT approving" in gate
+    assert "## 🛑 What needs your decision" in gate
+    assert "## ❓ The problem this solves" in gate
+    assert "## 🔧 What was changed" in gate
+    assert "## ▶️ How it behaves AFTER you approve" in gate
+    assert "## ✅ What you are approving" in gate
+    assert "## 🚫 What you are NOT approving" in gate
+    assert "## ↩️ If it goes wrong" in gate
+    assert "## 🔍 Proof it works (for the record, not for you to read)" in gate
     assert "```" not in gate
     assert "gateway/run.py" not in gate
 
@@ -180,7 +186,14 @@ def test_gate_card_uses_plain_language_not_code():
         not_approving="No sends, deletes, spends, or restarts.",
         source_ticket="AGENTS-999",
     )
-    assert "Problem" in card
+    assert "## 🛑 What needs your decision" in card
+    assert "## ❓ The problem this solves" in card
+    assert "## 🔧 What was changed" in card
+    assert "## ▶️ How it behaves AFTER you approve" in card
+    assert "## ✅ What you are approving" in card
+    assert "## 🚫 What you are NOT approving" in card
+    assert "## ↩️ If it goes wrong" in card
+    assert "## 🔍 Proof it works (for the record, not for you to read)" in card
     assert "```" not in card
     assert "def " not in card
 

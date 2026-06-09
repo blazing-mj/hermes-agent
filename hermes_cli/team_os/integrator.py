@@ -157,11 +157,14 @@ def _plain_language_from_handoff(handoff: dict[str, Any]) -> dict[str, str]:
         return {str(k): str(v).strip() for k, v in raw.items()}
     summary = str(handoff.get("summary") or "Validated work needs approval.").strip()
     return {
+        "decision": "Approve or reject the gated action for this ticket.",
         "problem": summary,
         "what_changed": "A validated Worker handoff is ready but contains irreversible risk.",
         "how_it_behaves_now": "Nothing changes until MJ approves the gated action.",
         "approving": "Allow the named irreversible action to proceed.",
         "not_approving": "No money, sends, production/customer action, credential change, delete, or restart is approved beyond this gate.",
+        "rollback": "Use the rollback recorded on the ticket to return to the current state.",
+        "proof": "Validator verdict and test counts are attached on this Linear issue.",
     }
 
 
@@ -180,18 +183,39 @@ def build_gate_card(
     approving: str,
     not_approving: str,
     source_ticket: str,
+    decision: str | None = None,
+    rollback: str | None = None,
+    proof: str | None = None,
 ) -> str:
-    sections = [
-        ("Problem", problem),
-        ("What changed", what_changed),
-        ("How it behaves now", how_it_behaves_now),
-        ("What I’m approving", approving),
-        ("What I’m NOT approving", not_approving),
-    ]
-    lines = [f"{source_ticket} needs MJ approval"]
-    for title, body in sections:
-        lines.append(f"\n{title}\n- {_scrub_code(body)}")
-    return "\n".join(lines).strip()
+    """Render the Integrator Needs-MJ card using GATE-CARD-TEMPLATE.md."""
+
+    return "\n".join(
+        [
+            "## 🛑 What needs your decision",
+            _scrub_code(decision or f"Approve or reject the gated action for {source_ticket}."),
+            "",
+            "## ❓ The problem this solves",
+            _scrub_code(problem),
+            "",
+            "## 🔧 What was changed",
+            _scrub_code(what_changed),
+            "",
+            "## ▶️ How it behaves AFTER you approve",
+            _scrub_code(how_it_behaves_now),
+            "",
+            "## ✅ What you are approving",
+            _scrub_code(approving),
+            "",
+            "## 🚫 What you are NOT approving",
+            _scrub_code(not_approving),
+            "",
+            "## ↩️ If it goes wrong",
+            _scrub_code(rollback or "Use the rollback recorded on the ticket to return to the current state."),
+            "",
+            "## 🔍 Proof it works (for the record, not for you to read)",
+            _scrub_code(proof or f"Validator verdict and test counts are attached to {source_ticket}."),
+        ]
+    ).strip()
 
 
 def _default_runner(argv: Sequence[str], cwd: Path) -> str:
@@ -292,6 +316,9 @@ def integrate_after_validator(
             approving=words.get("approving", "Approve the gated irreversible action."),
             not_approving=words.get("not_approving", "No unrelated irreversible action."),
             source_ticket=input_data.source_ticket,
+            decision=words.get("decision"),
+            rollback=words.get("rollback") or "; ".join(rollback),
+            proof=words.get("proof"),
         )
         linear_commenter(input_data.source_ticket, card)
         linear_status(input_data.source_ticket, "Needs-MJ")
