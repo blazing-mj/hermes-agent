@@ -605,6 +605,34 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             )
 
 
+def test_detect_crashed_workers_two_consecutive_instant_crashes_auto_blocks(
+    kanban_home, monkeypatch,
+):
+    """RED for the Ruta storm: 2 consecutive pid-not-alive runs must block."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="spawn crash storm", assignee="a")
+        for attempt, pid in enumerate((81001, 81002), start=1):
+            conn.execute(
+                "UPDATE tasks SET status='running', worker_pid=?, "
+                "claim_lock=?, started_at=? WHERE id=?",
+                (pid, f"{host}:ruta-crash-{attempt}", int(time.time()) - 60, tid),
+            )
+            conn.commit()
+            assert tid in kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+        assert "pid" in (task.last_failure_error or "")
+        assert any(e.kind == "gave_up" for e in kb.list_events(conn, tid))
+
+
 def test_detect_crashed_workers_skips_freshly_claimed_tasks(
     kanban_home, monkeypatch,
 ):

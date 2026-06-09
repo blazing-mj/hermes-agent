@@ -88,6 +88,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.team_os.role_registry import assignment_violation
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1739,6 +1740,15 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _assignment_violation_for_fields(
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+) -> Optional[str]:
+    return assignment_violation(title=title, body=body, assignee=assignee)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -1788,6 +1798,11 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    assignment_error = _assignment_violation_for_fields(
+        title=title, body=body, assignee=assignee,
+    )
+    if assignment_error:
+        raise ValueError(assignment_error)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2096,10 +2111,15 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, title, body FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
+        assignment_error = _assignment_violation_for_fields(
+            title=row["title"], body=row["body"], assignee=profile,
+        )
+        if assignment_error:
+            raise ValueError(assignment_error)
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -5462,6 +5482,30 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _reject_dispatch_assignment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> None:
+    """Fail-close an out-of-registry assignment before gateway spawn."""
+    with write_txn(conn):
+        run_id = _current_run_id(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, last_failure_error = ? "
+            "WHERE id = ? AND status IN ('ready', 'review')",
+            (reason[:500], task_id),
+        )
+        if cur.rowcount == 1:
+            _append_event(
+                conn,
+                task_id,
+                "assignment_rejected",
+                {"reason": reason},
+                run_id=run_id,
+            )
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -5539,7 +5583,7 @@ def dispatch_once(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, body FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -5563,6 +5607,13 @@ def dispatch_once(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        assignment_error = _assignment_violation_for_fields(
+            title=row["title"], body=row["body"], assignee=row["assignee"],
+        )
+        if assignment_error:
+            _reject_dispatch_assignment(conn, row["id"], assignment_error)
+            result.auto_blocked.append(row["id"])
             continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
@@ -5670,7 +5721,7 @@ def dispatch_once(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, title, body FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -5679,6 +5730,13 @@ def dispatch_once(
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        assignment_error = _assignment_violation_for_fields(
+            title=row["title"], body=row["body"], assignee=row["assignee"],
+        )
+        if assignment_error:
+            _reject_dispatch_assignment(conn, row["id"], assignment_error)
+            result.auto_blocked.append(row["id"])
             continue
         try:
             from hermes_cli.profiles import profile_exists

@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "purpose": "Team OS dispatch fail-closed role/capability registry",
+  "profiles": {
+    "default": {
+      "dispatchable": true,
+      "task_types": ["implementation", "ops", "docs", "research", "triage"]
+    },
+    "cortex": {
+      "dispatchable": true,
+      "task_types": ["grounding", "contract", "gate", "triage"],
+      "not_task_types": ["implementation", "validator"]
+    },
+    "cto": {
+      "dispatchable": true,
+      "task_types": ["route", "contract", "triage"],
+      "not_task_types": ["validator"]
+    },
+    "ruta": {
+      "dispatchable": false,
+      "task_types": ["chat"],
+      "reason": "chat assistant profile; not dispatchable"
+    },
+    "billprinter": {
+      "dispatchable": false,
+      "task_types": ["trading"],
+      "reason": "trader profile; not dispatchable"
+    }
+  },
+  "validator_route": {
+    "allowed_assignees": ["run_adversarial_validator", "claude-max-code"],
+    "gateway_profiles_allowed": false,
+    "contract_template_pin_required": true
+  }
+}

@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from hermes_cli.team_os.role_registry import validator_contract_route
+
 VALID_RISK_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "critical"})
 
 _REQUIRED_STRING_FIELDS = ("intended_behavior", "source_ticket")
@@ -134,7 +136,9 @@ VALIDATOR_TEMPLATE: dict[str, Any] = {
     ],
     "commands": [
         "hermes team-os verification-gate <task_id> --plan-only",
+        "run_adversarial_validator --runner claude-max-code --contract <contract.json> --handoff <handoff.json>",
     ],
+    "validator_route": validator_contract_route(),
     "behavior_check_required": True,
     "risk": "low",
     "human_gate_required": True,
