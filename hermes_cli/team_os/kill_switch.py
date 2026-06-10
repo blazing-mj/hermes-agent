@@ -108,13 +108,31 @@ class KillSwitch:
                 raise ValueError("kill-switch state must be a JSON object")
             return state
         except (json.JSONDecodeError, OSError, ValueError) as exc:
-            return {
+            state = {
                 "enabled": True,
                 "reason": "kill-switch state file is unreadable or corrupt",
                 "enabled_at": _utc_iso(),
                 "source": "corrupt",
                 "read_error": str(exc),
             }
+            self._emit_corrupt_event(state)
+            return state
+
+    def _emit_corrupt_event(self, state: dict[str, Any]) -> None:
+        """AGENTS-85: fail-closed on corrupt state must be visible, not silent.
+        Best-effort append to the lifecycle event log; never raises."""
+        try:
+            log = Path("~/.hermes/logs/team-os-lifecycle-events.jsonl").expanduser()
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": _utc_iso(),
+                    "event": "kill_switch_failed_closed_corrupt_state",
+                    "path": str(self.path),
+                    "read_error": state.get("read_error", ""),
+                }) + "\n")
+        except Exception:
+            pass
 
     def _write(self, state: dict[str, Any]) -> None:
         """Atomically write ``state`` to disk (write-to-tmp + os.replace)."""
