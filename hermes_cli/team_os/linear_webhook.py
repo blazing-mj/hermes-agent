@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -283,6 +284,41 @@ def _send_integrator_fyi(ticket: str, body: str) -> dict[str, Any]:
     return {"sent": False, "raw": parsed}
 
 
+_REPOS = ("/Users/alfred/.hermes/hermes-agent", "/Users/alfred/.openclaw")
+_NO_CODE_RE = re.compile(r"no-?code|investigation-?only|docs-?only|observation-?only|no code changes", re.I)
+
+
+def _landing_evidence(conn: Any, ticket: str) -> dict[str, Any]:
+    """AGENTS-244 gate: real commit sha verifiable in a local repo, or an explicit
+    no-code declaration, gathered from the chain's task bodies/comments."""
+    import re as _re
+    import subprocess as _sp
+    text_parts: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT t.body, tc.body AS cbody FROM tasks t LEFT JOIN task_comments tc ON tc.task_id = t.id "
+            "WHERE t.idempotency_key LIKE ?", (f"linear:{ticket}:spine:%",),
+        ).fetchall()
+        for r in rows:
+            text_parts.append(str(r["body"] or ""))
+            text_parts.append(str(r["cbody"] or ""))
+    except Exception:
+        pass
+    text = " ".join(text_parts)
+    if _NO_CODE_RE.search(text):
+        return {"ok": True, "kind": "no-code-declared"}
+    for sha in set(_re.findall(r"\b[0-9a-f]{9,40}\b", text)):
+        for repo in _REPOS:
+            try:
+                p = _sp.run(["git", "-C", repo, "cat-file", "-e", f"{sha}^{{commit}}"],
+                            capture_output=True, timeout=10)
+                if p.returncode == 0:
+                    return {"ok": True, "kind": "commit", "sha": sha, "repo": repo}
+            except Exception:
+                continue
+    return {"ok": False}
+
+
 def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict[str, Any]:
     """Deterministically land the approved reversible Team OS continuation.
 
@@ -308,6 +344,16 @@ def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict
             return {"status": "did_not_fire", "board": board, "reason": "worker task not found"}
         if not validator or validator["status"] != "done":
             return {"status": "needs_mj", "board": board, "worker": worker["id"], "reason": "validator PASS task not done"}
+
+        # AGENTS-244: NO EMPTY LANDINGS. A landing requires either a real commit
+        # (sha in the chain's comments, verifiable in a local repo) or an explicit
+        # investigation-only/no-code declaration. Otherwise BOUNCE to the worker.
+        evidence = _landing_evidence(conn, ticket)
+        if not evidence["ok"]:
+            return {
+                "status": "bounced_empty_landing", "board": board, "worker": str(worker["id"]),
+                "reason": "no landed commit and no no-code declaration in chain — refusing ceremony landing",
+            }
 
         worker_id = str(worker["id"])
         if worker["status"] != "done":
