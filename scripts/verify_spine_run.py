@@ -106,6 +106,19 @@ def grade(ticket: str) -> int:
         else:
             rows.append(("WARN", "validator independence (claude-max rail only)", "no claude-max PASS evidence found"))
 
+    # 3a. REAL independent sessions: a genuine stage run has a named profile or
+    # takes real time. 0-second profile-less runs = inline controller bookkeeping
+    # stamps (one session wearing all hats), not agent sessions.
+    genuine = [r for r in all_runs if (r.get("profile"))
+               or ((r.get("ended_at") or 0) - (r.get("started_at") or 0) >= 60)]
+    if not all_runs:
+        rows.append(("FAIL", "real independent sessions", "no runs recorded at all"))
+    elif not genuine:
+        rows.append(("FAIL", "real independent sessions",
+                     f"all {len(all_runs)} runs 0-sec/profile-less — inline controller stamps"))
+    else:
+        rows.append(("PASS", "real independent sessions", f"{len(genuine)}/{len(all_runs)} genuine run(s)"))
+
     # 3. instability: crashed/timed_out/spawn_failed runs
     unstable = [r for r in all_runs if (r.get("outcome") or "") in ("crashed", "timed_out", "spawn_failed", "gave_up")]
     rows.append(("PASS" if not unstable else "WARN" if len(unstable) <= 2 else "FAIL",
