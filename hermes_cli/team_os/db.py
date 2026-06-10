@@ -114,6 +114,27 @@ class TeamOSState:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intake_ledger (
+                    id TEXT PRIMARY KEY,
+                    headline TEXT NOT NULL,
+                    priority TEXT,
+                    age INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intake_control (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def record_snapshot(self, classified: list[ClassifiedObservation]) -> int:
@@ -355,6 +376,112 @@ class TeamOSState:
             data["reasons"] = json.loads(data.pop("reasons_json"))
             result.append(data)
         return result
+
+    # -----------------------------------------------------------------------
+    # AGENTS-223 — full-backlog intake ledger
+    # -----------------------------------------------------------------------
+
+    def reconcile_intake_ledger(self, cards: list[Any]) -> dict[str, Any]:
+        """Diff a full Linear Backlog scan into the durable intake ledger.
+
+        Cards must provide ``id``, ``headline``, ``priority``, and ``age`` as
+        attributes or mapping keys. Missing cards are added, cards absent from
+        the latest full Backlog scan are removed, and existing rows are updated.
+        """
+
+        self.init_schema()
+        now = int(time.time())
+        normalized: dict[str, dict[str, Any]] = {}
+        for raw in cards:
+            if isinstance(raw, dict):
+                card_id = str(raw["id"])
+                headline = str(raw.get("headline") or raw.get("title") or card_id)
+                priority = raw.get("priority")
+                age = int(raw.get("age", 0))
+                payload = dict(raw.get("payload") or raw)
+            else:
+                card_id = str(getattr(raw, "id"))
+                headline = str(getattr(raw, "headline"))
+                priority = getattr(raw, "priority")
+                age = int(getattr(raw, "age"))
+                payload = dict(getattr(raw, "payload", None) or {"id": card_id, "headline": headline, "priority": priority, "age": age})
+            normalized[card_id] = {
+                "id": card_id,
+                "headline": headline,
+                "priority": None if priority is None else str(priority),
+                "age": age,
+                "payload": payload,
+            }
+
+        with self.connect() as conn:
+            existing_rows = conn.execute("SELECT id FROM intake_ledger").fetchall()
+            existing = {str(row["id"]) for row in existing_rows}
+            incoming = set(normalized)
+            added = sorted(incoming - existing)
+            removed = sorted(existing - incoming)
+            for card in normalized.values():
+                conn.execute(
+                    """
+                    INSERT INTO intake_ledger(id, headline, priority, age, payload_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        headline = excluded.headline,
+                        priority = excluded.priority,
+                        age = excluded.age,
+                        payload_json = excluded.payload_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        card["id"],
+                        card["headline"],
+                        card["priority"],
+                        card["age"],
+                        json.dumps(card["payload"], sort_keys=True),
+                        now,
+                    ),
+                )
+            if removed:
+                placeholders = ", ".join("?" for _ in removed)
+                conn.execute(f"DELETE FROM intake_ledger WHERE id IN ({placeholders})", tuple(removed))
+            count = conn.execute("SELECT COUNT(*) FROM intake_ledger").fetchone()[0]
+            recheck = conn.execute("SELECT value FROM intake_control WHERE key = 'recheck_requested'").fetchone()
+            conn.commit()
+        return {"added": added, "removed": removed, "current_count": int(count), "recheck_requested": bool(recheck and recheck["value"] == "1")}
+
+    def list_intake_candidates(self) -> list[dict[str, Any]]:
+        """Return all current intake ledger cards; callers perform deterministic sorting."""
+
+        self.init_schema()
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM intake_ledger ORDER BY id ASC").fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
+    def set_intake_recheck_requested(self, requested: bool) -> None:
+        self.init_schema()
+        now = int(time.time())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO intake_control(key, value, updated_at) VALUES ('recheck_requested', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                ("1" if requested else "0", now),
+            )
+            conn.commit()
+
+    def pop_intake_recheck_requested(self) -> bool:
+        self.init_schema()
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM intake_control WHERE key = 'recheck_requested'").fetchone()
+            requested = bool(row and row["value"] == "1")
+            conn.execute("DELETE FROM intake_control WHERE key = 'recheck_requested'")
+            conn.commit()
+        return requested
 
     # -----------------------------------------------------------------------
     # Stage 4 — durable outbox
