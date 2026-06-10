@@ -46,7 +46,8 @@ BOARD_BY_PROJECT = {
     "Hermes System": "hermes-system",
     "OpenClaw Core": "openclaw-core",
 }
-KNOWN_HELD_TITLE_TOKENS = ("openrouter", "credential cleanup", "bill provider migration")
+# "ema" held while MJ improves EMA in a private session (2026-06-10) — remove to resume the EMA queue.
+KNOWN_HELD_TITLE_TOKENS = ("openrouter", "credential cleanup", "bill provider migration", "ema")
 GATED_TOKENS = ("trader", "money", "credential", "klaviyo", "send", "production", "customer")
 HARD_GATE_TOKENS = (
     "credential",
