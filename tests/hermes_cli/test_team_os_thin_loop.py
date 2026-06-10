@@ -471,6 +471,46 @@ def test_run_adversarial_validator_uses_claude_max_cold_session_and_parses_wrapp
     assert json.loads(review.read_text(encoding="utf-8"))["model"] == "claude-max"
 
 
+def test_run_adversarial_validator_default_route_is_claude_max_wrapper_not_anthropic_api(tmp_path, monkeypatch):
+    from hermes_cli.team_os.thin_loop import run_adversarial_validator
+
+    contract = tmp_path / "contract.json"
+    handoff = tmp_path / "handoff.json"
+    review = tmp_path / "adversarial.json"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    contract.write_text(json.dumps(_contract()), encoding="utf-8")
+    handoff.write_text(json.dumps({"claims": []}), encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"verdict": "PASS", "semantic_claims_supported": True, "model": "claude-max"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_adversarial_validator(
+        contract_path=contract,
+        worktree_path=worktree,
+        handoff_path=handoff,
+        output_path=review,
+    )
+
+    argv = seen["argv"]
+    assert isinstance(argv, list)
+    assert result["ok"] is True
+    assert str(argv[0]).endswith("/.hermes/bin/claude-max-code")
+    assert "team-os-adversarial-validator" in argv
+    assert "--provider" not in argv
+    assert "anthropic" not in " ".join(str(part) for part in argv).lower()
+
+
 def test_run_adversarial_validator_extracts_json_from_claude_markdown_result(tmp_path):
     from hermes_cli.team_os.thin_loop import run_adversarial_validator
 

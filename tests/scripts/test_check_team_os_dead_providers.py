@@ -32,6 +32,7 @@ def test_flags_dead_providers_only_in_routing_chains(tmp_path):
     findings = scan_config(cfg)
 
     assert {f["chain"] for f in findings} == {
+        "fallback_providers[0].provider",
         "fallback_providers[1].provider",
         "delegation.provider",
     }
@@ -43,7 +44,6 @@ def test_allows_current_team_os_chain_shape(tmp_path):
         {
             "model": {"provider": "openai-codex", "default": "gpt-5.5"},
             "fallback_providers": [
-                {"provider": "anthropic", "model": "claude-sonnet-4-6"},
                 {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
             ],
             "delegation": {"provider": "", "model": ""},
@@ -73,4 +73,21 @@ def test_flags_provider_prefixes_in_model_strings(tmp_path):
     assert {f["chain"] for f in findings} == {
         "model provider prefix",
         "fallback_model[0].model provider prefix",
+        "auxiliary.title_generation.provider",
+        "auxiliary.title_generation.model provider prefix",
     }
+
+
+def test_allows_anthropic_only_for_trader_migration_exception(tmp_path):
+    exception_dir = tmp_path / "trader-migration"
+    exception_dir.mkdir()
+    cfg = _write_config(
+        exception_dir / "config.yaml",
+        {
+            "model": {"provider": "anthropic", "default": "claude-sonnet-4-6"},
+            "fallback_providers": [{"provider": "anthropic", "model": "claude-sonnet-4-6"}],
+            "delegation": {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+        },
+    )
+
+    assert scan_config(cfg) == []

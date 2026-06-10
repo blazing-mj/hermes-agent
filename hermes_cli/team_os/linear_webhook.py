@@ -8,6 +8,8 @@ Needs-MJ comments, then records the result in the Team OS outbox and Linear.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +17,7 @@ from typing import Any, Callable
 from .db import TeamOSState
 
 AddComment = Callable[[str, str], None]
+RunIntakeWake = Callable[..., dict[str, Any]]
 
 _APPROVED = "approved"
 _REJECTED = "rejected"
@@ -62,6 +65,43 @@ def _previous_state(payload: dict[str, Any]) -> str:
     raw_updated_from = payload.get("updatedFrom")
     updated_from: dict[str, Any] = raw_updated_from if isinstance(raw_updated_from, dict) else {}
     return _state_name(updated_from.get("state"))
+
+
+def _event_action(payload: dict[str, Any]) -> str:
+    return str(payload.get("action") or payload.get("webhookAction") or "").strip().lower()
+
+
+def _is_backlog_intake_doorbell(payload: dict[str, Any]) -> bool:
+    """Return true for Linear Issue events that should wake Cortex intake."""
+
+    if _norm(payload.get("type")) != "issue":
+        return False
+    if _norm(_current_state(payload)) != "backlog":
+        return False
+    action = _event_action(payload)
+    if action == "create":
+        return True
+    return action in {"update", ""} and _norm(_previous_state(payload)) != "backlog"
+
+
+def run_cortex_intake_wake(*, issue_id: str, wake_source: str = "doorbell") -> dict[str, Any]:
+    """Start the Cortex safe-work intake runner asynchronously."""
+
+    script = Path(os.environ.get("TEAM_OS_CORTEX_INTAKE_SCRIPT", "/Users/alfred/.hermes/scripts/cortex_work_intake_dispatch.sh"))
+    if not script.exists():
+        return {"started": False, "reason": "intake script missing", "script": str(script)}
+    env = os.environ.copy()
+    env["TEAM_OS_INTAKE_WAKE_SOURCE"] = wake_source
+    env["TEAM_OS_INTAKE_WAKE_ISSUE"] = issue_id
+    proc = subprocess.Popen(
+        [str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    return {"started": True, "pid": proc.pid, "script": str(script)}
 
 
 def _latest_comment_body(payload: dict[str, Any]) -> str:
@@ -163,6 +203,7 @@ def handle_linear_webhook(
     *,
     state: TeamOSState,
     add_comment: AddComment,
+    run_intake_wake: RunIntakeWake = run_cortex_intake_wake,
 ) -> dict[str, Any]:
     """Handle one Linear webhook payload for Team OS approval UX.
 
@@ -175,6 +216,10 @@ def handle_linear_webhook(
     issue_id = _issue_identifier(payload)
     if not issue_id:
         return {"decision": "ignored", "reason": "missing issue identifier"}
+
+    if _is_backlog_intake_doorbell(payload):
+        wake = run_intake_wake(issue_id=issue_id, wake_source="doorbell")
+        return {"decision": "doorbell", "issue": issue_id, **wake}
 
     row = state.get_outbox_event_by_source("linear_observation", issue_id)
     if not _is_needs_mj_context(payload, row):

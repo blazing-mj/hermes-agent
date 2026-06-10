@@ -191,6 +191,62 @@ def test_low_cost_non_needs_mj_webhook_is_ignored(tmp_path):
     assert comments == []
 
 
+def test_issue_created_in_backlog_rings_cortex_intake_doorbell(tmp_path):
+    from hermes_cli.team_os.linear_webhook import handle_linear_webhook
+
+    state = TeamOSState(tmp_path / "team-os.db")
+    comments: list[tuple[str, str]] = []
+    wakes: list[dict] = []
+
+    payload = _issue_payload("Backlog", issue_id="AGENTS-225", previous="")
+    payload["action"] = "create"
+
+    result = handle_linear_webhook(
+        payload,
+        state=state,
+        add_comment=lambda issue_id, body: comments.append((issue_id, body)),
+        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True, "pid": 1234},
+    )
+
+    assert result == {"decision": "doorbell", "issue": "AGENTS-225", "started": True, "pid": 1234}
+    assert wakes == [{"issue_id": "AGENTS-225", "wake_source": "doorbell"}]
+    assert comments == []
+
+
+def test_issue_update_into_backlog_rings_cortex_intake_doorbell(tmp_path):
+    from hermes_cli.team_os.linear_webhook import handle_linear_webhook
+
+    state = TeamOSState(tmp_path / "team-os.db")
+    wakes: list[dict] = []
+
+    result = handle_linear_webhook(
+        _issue_payload("Backlog", issue_id="AGENTS-226", previous="Triage"),
+        state=state,
+        add_comment=lambda _issue_id, _body: None,
+        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True},
+    )
+
+    assert result["decision"] == "doorbell"
+    assert wakes == [{"issue_id": "AGENTS-226", "wake_source": "doorbell"}]
+
+
+def test_issue_update_outside_backlog_does_not_ring_intake_doorbell(tmp_path):
+    from hermes_cli.team_os.linear_webhook import handle_linear_webhook
+
+    state = TeamOSState(tmp_path / "team-os.db")
+    wakes: list[dict] = []
+
+    result = handle_linear_webhook(
+        _issue_payload("In Progress", issue_id="AGENTS-226", previous="Backlog"),
+        state=state,
+        add_comment=lambda _issue_id, _body: None,
+        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True},
+    )
+
+    assert result["decision"] == "ignored"
+    assert wakes == []
+
+
 def test_team_os_linear_webhook_ignores_its_own_reply_comments(tmp_path):
     from hermes_cli.team_os.linear_webhook import handle_linear_webhook
 

@@ -15,7 +15,8 @@ from typing import Any
 
 import yaml
 
-DISALLOWED_PROVIDERS = {"nous", "openrouter"}
+DISALLOWED_PROVIDERS = {"anthropic", "nous", "openrouter"}
+ANTHROPIC_EXCEPTION_MARKERS = {"trader", "trader-migration"}
 _ALLOWED_EMPTY = {"", "auto", None}
 
 
@@ -26,10 +27,24 @@ def _provider_from_model(value: Any) -> str | None:
     return provider or None
 
 
+def _anthropic_exception_allowed(file: Path) -> bool:
+    """Return true for the only approved Anthropic API routing exception.
+
+    MJ's default Team OS chains must stay subscription-only.  Anthropic API is
+    intentionally limited to trader-migration surfaces, so the checker treats any
+    other Anthropic routing chain as a live-route defect.
+    """
+
+    normalized_path = str(file).lower()
+    return any(marker in normalized_path for marker in ANTHROPIC_EXCEPTION_MARKERS)
+
+
 def _add_if_disallowed(findings: list[dict[str, str]], *, file: Path, chain: str, provider: Any) -> None:
     if provider in _ALLOWED_EMPTY:
         return
     normalized = str(provider).strip().lower()
+    if normalized == "anthropic" and _anthropic_exception_allowed(file):
+        return
     if normalized in DISALLOWED_PROVIDERS:
         findings.append({"file": str(file), "chain": chain, "provider": normalized})
 
