@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import runpy
 import sqlite3
 import subprocess
@@ -526,6 +527,44 @@ def _set_payload_marker(state: TeamOSState, event_id: int, key: str, value: Any)
         conn.commit()
 
 
+_IRREVERSIBLE = {
+    "money": "moves/spends money", "trade": "places a trade", "trading": "enables trading",
+    "credential": "touches credentials", "secret": "touches secrets", "api key": "touches an API key",
+    "token": "touches a token", "live send": "sends live email", "klaviyo": "writes to Klaviyo",
+    "production": "writes to production", "customer": "touches customer data",
+    "delete data": "deletes data", "restart": "restarts a live service",
+}
+
+
+def _human_title(t: str) -> str:
+    t = re.sub(r"^AGENTS-\d+[: ]*", "", t or "")
+    t = re.sub(r"\b(follow-up|gated cleanup|phase \d+ autonomy gate #?\d*)[: ]*", "", t, flags=re.I)
+    return t.strip()
+
+
+def _compose_needs_mj_message(ticket: str, payload: dict[str, Any], chain: dict[str, str]) -> str:
+    """GOAT-level decision message: classified, plain-language, with risk framing."""
+    title = _human_title(payload.get("title") or ticket)
+    desc = " ".join((payload.get("description") or "").split())
+    what = (desc.split(". ")[0][:160] if desc else title) or title
+    text = ((payload.get("title") or "") + " " + (payload.get("description") or "")).lower()
+    hits = [v for k, v in _IRREVERSIBLE.items() if re.search(r"\b" + re.escape(k) + r"\b", text)]
+    if hits:
+        risk = f"⚠️ IRREVERSIBLE — {hits[0]}. Cannot be auto-undone. Approve only if you mean it."
+    else:
+        risk = "↩️ REVERSIBLE — already built & cross-model validated; worst case = 1-min rollback (recorded on the ticket). No money/sends/credentials/production touched."
+    return (
+        f"✅ APPROVAL NEEDED · {ticket}\n"
+        f"{title}\n\n"
+        f"▸ What it does: {what}\n"
+        f"▸ Why it stopped here: it's the consequential step — the work is done & validated, it just needs your yes.\n"
+        f"▸ If you approve: it ships itself (merge + deploy) and you get a “✅ shipped” note. Nothing else happens.\n"
+        f"▸ Risk: {risk}\n\n"
+        f"Decide → in Linear move it to Approved (or reply APPROVED {ticket}); to stop it, Rejected + a reason; a question? just comment.\n"
+        f"{payload.get('url') or ticket}"
+    )
+
+
 def _send_needs_mj_ping_once(state: TeamOSState, ticket: str, payload: dict[str, Any], outbox_id: int | None, chain: dict[str, str]) -> dict[str, Any]:
     if not outbox_id:
         return {"sent": False, "reason": "no_outbox"}
@@ -533,15 +572,7 @@ def _send_needs_mj_ping_once(state: TeamOSState, ticket: str, payload: dict[str,
     if (row.get("payload") or {}).get("needs_mj_ping_sent_at"):
         return {"sent": False, "reason": "already_sent"}
     assigned = _assign_to_viewer(ticket)
-    body = (
-        f"Needs-MJ: {ticket}\n"
-        f"Problem: Team OS hit a gated surface for {payload.get('title') or ticket}.\n"
-        "Fix: approve only if the autonomous spine may continue without hard-gated side effects.\n"
-        "After update: the Approved Linear webhook requeues continuation.\n"
-        f"Proof link: {payload.get('url') or ticket}\n"
-        f"Kanban: board={chain.get('board')} worker={chain.get('worker')} validator={chain.get('validator')}\n"
-        "What approving allows: continue reversible investigation/work only; no trader/billprinter restart, credentials, live sends, money, Klaviyo, production/customer writes."
-    )
+    body = _compose_needs_mj_message(ticket, payload, chain)
     try:
         _load_env_file()
         from tools.send_message_tool import send_message_tool
