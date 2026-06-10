@@ -52,25 +52,36 @@ def test_approved_status_requeues_mj_review_event_and_comments_with_notes(tmp_pa
         event_type="linear_observation",
         source_id="AGENTS-205",
         source="linear",
-        payload={"source_id": "AGENTS-205", "title": "Approval UX blocker"},
+        payload={"source_id": "AGENTS-205", "title": "Approval UX blocker", "project": "Hermes System"},
     )
     state.mark_event_mj_review(event_id, reason="human gate required")
     comments: list[tuple[str, str]] = []
     wakes: list[dict] = []
 
-    result = handle_linear_webhook(
+    import hermes_cli.team_os.linear_webhook as linear_webhook
+    monkeypatch = __import__("pytest").MonkeyPatch()
+    monkeypatch.setattr(
+        linear_webhook,
+        "unblock_approved_kanban_worker",
+        lambda ticket, project: {"board": "hermes-system", "worker": "t_worker", "unblocked": True},
+    )
+    try:
+        result = handle_linear_webhook(
         _issue_payload("Approved", comment_body="Approved, but keep Phase 6 stopped."),
         state=state,
         add_comment=lambda issue_id, body: comments.append((issue_id, body)),
-        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True, "pid": 4321},
-    )
+            run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True, "pid": 4321},
+        )
+    finally:
+        monkeypatch.undo()
 
     assert result["decision"] == "approved"
     row = state.get_outbox_event(event_id)
     assert row["state"] == "queued"
     assert "Approved, but keep Phase 6 stopped." in row["payload"]["mj_notes"]
-    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.")]
+    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'hermes-system', 'worker': 't_worker', 'unblocked': True}), and woke the intake/dispatch motor.")]
     assert wakes == [{"issue_id": "AGENTS-205", "wake_source": "completion"}]
+    assert result["kanban"] == {"board": "hermes-system", "worker": "t_worker", "unblocked": True}
     assert result["started"] is True
 
 
@@ -127,7 +138,7 @@ def test_question_lane_or_comment_on_needs_mj_gets_linear_reply_without_requeue(
     assert "Problem → fix → new behavior → what approval allows" in comments[0][1]
 
 
-def test_approved_comment_on_needs_mj_requeues_event(tmp_path):
+def test_approved_comment_on_needs_mj_requeues_event(tmp_path, monkeypatch):
     from hermes_cli.team_os.linear_webhook import handle_linear_webhook
 
     state = TeamOSState(tmp_path / "team-os.db")
@@ -135,11 +146,17 @@ def test_approved_comment_on_needs_mj_requeues_event(tmp_path):
         event_type="linear_observation",
         source_id="AGENTS-205",
         source="linear",
-        payload={"source_id": "AGENTS-205", "title": "Approval UX blocker"},
+        payload={"source_id": "AGENTS-205", "title": "Approval UX blocker", "project": "Hermes System"},
     )
     state.mark_event_mj_review(event_id, reason="human gate required")
     comments: list[tuple[str, str]] = []
     wakes: list[dict] = []
+    import hermes_cli.team_os.linear_webhook as linear_webhook
+    monkeypatch.setattr(
+        linear_webhook,
+        "unblock_approved_kanban_worker",
+        lambda ticket, project: {"board": "hermes-system", "worker": "t_worker", "unblocked": True},
+    )
 
     result = handle_linear_webhook(
         _comment_payload(body="APPROVED AGENTS-205 — continue but keep Phase 6 blocked."),
@@ -152,8 +169,9 @@ def test_approved_comment_on_needs_mj_requeues_event(tmp_path):
     row = state.get_outbox_event(event_id)
     assert row["state"] == "queued"
     assert "keep Phase 6 blocked" in row["payload"]["mj_notes"]
-    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.")]
+    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'hermes-system', 'worker': 't_worker', 'unblocked': True}), and woke the intake/dispatch motor.")]
     assert wakes == [{"issue_id": "AGENTS-205", "wake_source": "completion"}]
+    assert result["kanban"] == {"board": "hermes-system", "worker": "t_worker", "unblocked": True}
 
 
 def test_rejected_comment_on_needs_mj_fails_closed(tmp_path):
@@ -311,20 +329,25 @@ def test_handle_team_os_linear_webhook_default_db_matches_intake_motor_env(tmp_p
         event_type="linear_observation",
         source_id="AGENTS-5",
         source="linear",
-        payload={"source_id": "AGENTS-5", "title": "Gated card"},
+        payload={"source_id": "AGENTS-5", "title": "Gated card", "project": "OpenClaw Core"},
     )
     state.mark_event_mj_review(event_id, reason="human gate required")
     comments: list[tuple[str, str]] = []
     monkeypatch.setenv("TEAM_OS_STATE_DB", str(db_path))
     monkeypatch.setenv("TEAM_OS_CORTEX_INTAKE_SCRIPT", str(tmp_path / "missing-intake.sh"))
     monkeypatch.setattr(linear_webhook, "add_linear_comment", lambda issue_id, body: comments.append((issue_id, body)))
+    monkeypatch.setattr(
+        linear_webhook,
+        "unblock_approved_kanban_worker",
+        lambda ticket, project: {"board": "openclaw-core", "worker": "t_worker", "unblocked": True},
+    )
 
     result = linear_webhook.handle_team_os_linear_webhook(_issue_payload("Approved", issue_id="AGENTS-5"))
 
     assert result["decision"] == "approved"
     assert result["reason"] == "intake script missing"
     assert TeamOSState(db_path).get_outbox_event(event_id)["state"] == "queued"
-    assert comments == [("AGENTS-5", "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.")]
+    assert comments == [("AGENTS-5", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'openclaw-core', 'worker': 't_worker', 'unblocked': True}), and woke the intake/dispatch motor.")]
 
 
 def test_linear_webhook_adapter_handles_linear_signature_and_invokes_team_os_handler(monkeypatch):

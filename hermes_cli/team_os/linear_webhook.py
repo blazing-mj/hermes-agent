@@ -14,10 +14,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import kanban_db
+
 from .db import TeamOSState
 
 AddComment = Callable[[str, str], None]
 RunIntakeWake = Callable[..., dict[str, Any]]
+
+BOARD_BY_PROJECT = {
+    "Hermes System": "hermes-system",
+    "OpenClaw Core": "openclaw-core",
+}
 
 DEFAULT_TEAM_OS_STATE_DB = "/Users/alfred/.hermes/state/team-os-cortex.db"
 
@@ -217,6 +224,44 @@ def apply_mj_decision(
     raise ValueError(f"Unsupported MJ decision: {decision}")
 
 
+def _kanban_project_from_row(row: dict[str, Any] | None) -> str:
+    payload = row.get("payload") if row else {}
+    if isinstance(payload, dict):
+        return str(payload.get("project") or "")
+    return ""
+
+
+def unblock_approved_kanban_worker(ticket: str, project: str) -> dict[str, Any]:
+    board = BOARD_BY_PROJECT.get(project, "hermes-system")
+    conn = kanban_db.connect(board=board)
+    try:
+        row = conn.execute(
+            """
+            SELECT id, status FROM tasks
+             WHERE idempotency_key = ? AND status != 'archived'
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (f"linear:{ticket}:spine:worker",),
+        ).fetchone()
+        if not row:
+            return {"board": board, "worker": "", "unblocked": False, "reason": "worker task not found"}
+        worker_id = str(row["id"])
+        unblocked = kanban_db.unblock_task(conn, worker_id)
+        if unblocked:
+            kanban_db.add_comment(
+                conn,
+                worker_id,
+                "team-os-linear-webhook",
+                "Linear Approved received; cleared the Needs-MJ block so the worker can continue.",
+            )
+            kanban_db.recompute_ready(conn)
+            return {"board": board, "worker": worker_id, "unblocked": True}
+        return {"board": board, "worker": worker_id, "unblocked": False, "reason": f"worker status is {row['status']}"}
+    finally:
+        conn.close()
+
+
 def _question_reply(issue_id: str, title: str, comment_body: str) -> str:
     question_line = f"\n\nMJ question captured: {comment_body}" if comment_body else ""
     return (
@@ -281,12 +326,13 @@ def handle_linear_webhook(
 
     if comment_decision == _APPROVED or current == _APPROVED:
         apply_mj_decision(state, row, decision=_APPROVED, note=note)
+        kanban_result = unblock_approved_kanban_worker(issue_id, _kanban_project_from_row(row))
         wake = run_intake_wake(issue_id=issue_id, wake_source="completion")
         add_comment(
             issue_id,
-            "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.",
+            f"Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({kanban_result}), and woke the intake/dispatch motor.",
         )
-        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, **wake}
+        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, "kanban": kanban_result, **wake}
 
     if comment_decision == _REJECTED or current in {_REJECTED, _NOT_APPROVED}:
         apply_mj_decision(state, row, decision=_REJECTED, note=note)
