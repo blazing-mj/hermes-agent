@@ -98,6 +98,16 @@ Build only when a real failure demands it:
 8. **First closed loop achieved 2026-06-10 21:37** — AGENTS-225: full autonomous chain, MJ one-click gate,
    first live Integrator auto-land, FYI msg 8857, grader v3 12/12 CLEAN. **Streak = 1.**
 
+## HUMAN-EXPERIENCE LAYER (2026-06-10, MJ-driven — every gate must read like a decision, not a log)
+- **Ping messages**: classified (APPROVAL/REQUEST/INFO), plain-language What/Why/After/Risk, reversible-vs-irreversible
+  framing with worst-case. SHIPPED in _compose_needs_mj_message (intake motor).
+- **MJ Inbox** (team_os_inbox.py): one "what needs you" screen + daily 09:00 DM. SHIPPED.
+- **Pause button** (team_os_control.py): pause/resume/status, wired into intake. SHIPPED.
+- **Telegram inline buttons** (AGENTS-243): Approve/Reject/Question from the message itself → same decision path.
+- **Pending UX**: FYI "shipped" notes in same plain style; Integrator auto-Done (AGENTS-238); pinned "⚡ My Decisions"
+  Linear view; no throwaway proof cards as real issues.
+- Principle: MJ reads ≤4 lines and decides in <30s; if a card needs more, the card failed.
+
 ## Standing rules (unchanged)
 Subscription-only (Codex + Claude Max; no API except gated Bill exception until migrated).
 Worktree-only execution. Money/trading/sends/production/credentials always human-gated.
