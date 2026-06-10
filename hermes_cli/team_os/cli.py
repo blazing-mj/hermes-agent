@@ -321,6 +321,11 @@ def cmd_team_os(args) -> int:  # noqa: ANN001
                 worker_timeout_seconds=float(getattr(args, "worker_timeout_seconds", 600.0)),
                 telegram_push_enabled=bool(getattr(args, "telegram_push", False)),
                 auto_done_low_cost=bool(getattr(args, "auto_done_low_cost", False)),
+                integrator_auto_land=bool(getattr(args, "integrator_auto_land", False)),
+                integrator_main_branch=str(getattr(args, "integrator_main_branch", "main") or "main"),
+                integrator_deploy_command=tuple(getattr(args, "integrator_deploy_command", None) or ()),
+                integrator_fyi_counter_path=Path(getattr(args, "integrator_fyi_counter", "~/.hermes/state/team-os-integrator-fyi.json")).expanduser(),
+                integrator_fyi_limit=int(getattr(args, "integrator_fyi_limit", 3) or 3),
             )
 
             worker = None
@@ -427,7 +432,7 @@ gql(
                     assign_mj=_assign_mj if bool(getattr(args, "telegram_push", False)) else None,
                     auto_done=_auto_done if bool(getattr(args, "auto_done_low_cost", False)) else None,
                 )
-                if result.get("status") not in {"validated", "needs_mj"}:
+                if result.get("status") not in {"validated", "auto_landed", "needs_mj"}:
                     raise RuntimeError(json.dumps(result, sort_keys=True))
                 return result
 
@@ -948,6 +953,25 @@ def register_cli(parent) -> None:  # noqa: ANN001
         default=False,
         help="After Validator PASS, mark only low-failure-cost source Linear tickets Done",
     )
+    cortex.add_argument(
+        "--integrator-auto-land",
+        action="store_true",
+        default=False,
+        help="After Validator PASS, run the deterministic Integrator to land/deploy reversible work or gate irreversible work",
+    )
+    cortex.add_argument("--integrator-main-branch", default="main", help="Branch the Integrator lands into")
+    cortex.add_argument(
+        "--integrator-deploy-command",
+        nargs="+",
+        default=[],
+        help="Command argv the Integrator runs after a reversible auto-land, e.g. hermes gateway restart",
+    )
+    cortex.add_argument(
+        "--integrator-fyi-counter",
+        default="~/.hermes/state/team-os-integrator-fyi.json",
+        help="Durable first-N FYI counter for Integrator auto-lands",
+    )
+    cortex.add_argument("--integrator-fyi-limit", type=int, default=3)
     cortex.add_argument(
         "--stub-dispatch-success",
         action="store_true",

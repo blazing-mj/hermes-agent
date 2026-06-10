@@ -243,6 +243,71 @@ def test_dispatcher_only_auto_dones_low_cost_after_pass_when_callback_supplied(t
     assert done == ["AGENTS-172"]
 
 
+def test_dispatcher_triggers_integrator_after_validator_pass_when_enabled(tmp_path):
+    from hermes_cli.team_os.dispatcher import DispatcherConfig, dispatch_outbox_event
+    from hermes_cli.team_os.integrator import IntegratorResult
+
+    seen: dict[str, object] = {}
+
+    def worker(**kwargs):  # noqa: ANN003
+        contract = kwargs["contract"]
+        branch = kwargs["branch"]
+        return {
+            "worker_status": "completed",
+            "source_ticket": contract["source_ticket"],
+            "worktree_path": str(kwargs["worktree_root"] / branch),
+            "changed_files": ["pkg/planner.py"],
+            "proof_results": [{"command": "python -m py_compile pkg/planner.py", "exit_code": 0}],
+            "worker_output": "ok",
+            "human_gate_required": True,
+            "loop_feed_allowed": False,
+            "auto_dispatch_allowed": False,
+            "auto_done_allowed": False,
+        }
+
+    def validator(**_kwargs):  # noqa: ANN003
+        return {"verdict": "PASS", "review_text": "VERDICT: PASS", "source_ticket": "AGENTS-172"}
+
+    def integrator(input_data):  # noqa: ANN001
+        seen["source_ticket"] = input_data.source_ticket
+        seen["handoff_exists"] = input_data.handoff_path.exists()
+        seen["validator_exists"] = input_data.validator_report_path.exists()
+        seen["deploy_command"] = input_data.deploy_command
+        return IntegratorResult(
+            status="auto_landed",
+            reversibility="reversible",
+            rollback_commands=("git revert abc123 --no-edit",),
+            fyi_sent=True,
+            commands=(("git", "merge", "--ff-only", "feature"), ("hermes", "gateway", "restart")),
+        )
+
+    result = dispatch_outbox_event(
+        _event(),
+        DispatcherConfig(
+            repo_root=tmp_path / "repo",
+            worktree_root=tmp_path / "workers",
+            artifact_root=tmp_path / "artifacts",
+            lease_root=tmp_path / "leases",
+            integrator_auto_land=True,
+            integrator_deploy_command=("hermes", "gateway", "restart"),
+            integrator_fyi_counter_path=tmp_path / "fyi.json",
+        ),
+        worker=worker,
+        validator=validator,
+        integrator=integrator,
+    )
+
+    assert result["status"] == "auto_landed"
+    assert result["integrator"]["status"] == "auto_landed"
+    assert result["integrator"]["fyi_sent"] is True
+    assert seen == {
+        "source_ticket": "AGENTS-172",
+        "handoff_exists": True,
+        "validator_exists": True,
+        "deploy_command": ("hermes", "gateway", "restart"),
+    }
+
+
 def _parse_cortex_args(tmp_path, state_db, *extra):
     import argparse
 

@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .contracts import check_contract
+from .integrator import IntegratorInput, IntegratorResult, integrate_after_validator
 from .validator_runner import run_validator
 from .worker_runner import run_worker
 
 WorkerCallable = Callable[..., dict[str, Any]]
 ValidatorCallable = Callable[..., dict[str, Any]]
+IntegratorCallable = Callable[[IntegratorInput], IntegratorResult]
 TelegramPush = Callable[[str], None]
 AssignMJ = Callable[[str], None]
 AutoDone = Callable[[str], None]
@@ -45,6 +47,11 @@ class DispatcherConfig:
     worker_timeout_seconds: float = 600.0
     telegram_push_enabled: bool = False
     auto_done_low_cost: bool = False
+    integrator_auto_land: bool = False
+    integrator_main_branch: str = "main"
+    integrator_deploy_command: tuple[str, ...] = ()
+    integrator_fyi_counter_path: Path | None = None
+    integrator_fyi_limit: int = 3
 
 
 def _safe_slug(value: str) -> str:
@@ -193,6 +200,7 @@ def dispatch_outbox_event(
     *,
     worker: WorkerCallable | None = None,
     validator: ValidatorCallable | None = None,
+    integrator: IntegratorCallable | None = None,
     telegram_push: TelegramPush | None = None,
     assign_mj: AssignMJ | None = None,
     auto_done: AutoDone | None = None,
@@ -296,6 +304,33 @@ def dispatch_outbox_event(
         return {**base, "status": "validator_bounced", "reason": "validator did not PASS"}
 
     result = {**base, "status": "validated"}
+
+    if config.integrator_auto_land:
+        integrator_input = IntegratorInput(
+            source_ticket=ticket,
+            worktree_path=Path(str(worker_result.get("worktree_path") or config.worktree_root / branch)),
+            handoff_path=handoff_path,
+            validator_report_path=validator_path,
+            main_branch=config.integrator_main_branch,
+            deploy_command=config.integrator_deploy_command,
+            fyi_counter_path=config.integrator_fyi_counter_path,
+            fyi_limit=config.integrator_fyi_limit,
+        )
+        integrator_fn = integrator or integrate_after_validator
+        integrated = integrator_fn(integrator_input)
+        result["integrator"] = {
+            "status": integrated.status,
+            "reversibility": integrated.reversibility,
+            "reason": integrated.reason,
+            "rollback_commands": list(integrated.rollback_commands),
+            "fyi_sent": integrated.fyi_sent,
+            "commands": [list(cmd) for cmd in integrated.commands],
+            "gate_card": integrated.gate_card,
+        }
+        if integrated.status in {"auto_landed", "needs_mj"}:
+            result["status"] = integrated.status
+        else:
+            return {**result, "status": "integrator_blocked", "reason": integrated.reason}
 
     if config.auto_done_low_cost:
         result["auto_done"]["attempted"] = True
