@@ -47,6 +47,27 @@ BOARD_BY_PROJECT = {
 }
 KNOWN_HELD_TITLE_TOKENS = ("openrouter", "credential cleanup", "bill provider migration")
 GATED_TOKENS = ("trader", "money", "credential", "klaviyo", "send", "production", "customer")
+HARD_GATE_TOKENS = (
+    "credential",
+    "secret",
+    "api key",
+    "token",
+    "klaviyo",
+    "live send",
+    "customer",
+    "production",
+    "delete data",
+    "mass-delete",
+    "new external account",
+)
+TRADER_ACTION_TOKENS = ("restart", "kickstart", "clear stop", "stop.sh --clear", "resume", "trade", "trading", "money")
+REVERSIBLE_ALLOW_TOKENS = (
+    "reversible code/tests/docs",
+    "reversible code/config/docs/tests",
+    "no daemon restart",
+    "without trader restart",
+    "no trader/billprinter restart",
+)
 DECISION_STATES = ("Approved", "Rejected")
 
 
@@ -315,20 +336,113 @@ def db_counts(state: TeamOSState, picked: str | None) -> dict[str, Any]:
         return out
 
 
-def _is_gated(payload: dict[str, Any]) -> bool:
+def _payload_text(payload: dict[str, Any]) -> str:
     labels = payload.get("labels") if isinstance(payload.get("labels"), list) else []
-    text = " ".join([str(payload.get("title") or ""), str(payload.get("body") or ""), " ".join(str(x) for x in labels)]).lower()
-    return any(token in text for token in GATED_TOKENS)
+    return " ".join([str(payload.get("title") or ""), str(payload.get("body") or ""), " ".join(str(x) for x in labels)]).lower()
+
+
+def _has_negated_trader_restart(text: str) -> bool:
+    negations = ("no daemon restart", "no trader restart", "without trader restart", "do not restart", "no restart")
+    return any(token in text for token in negations)
+
+
+def _is_gated(payload: dict[str, Any]) -> bool:
+    """Tuned Team OS gate classifier: gate what work touches, not keywords alone."""
+
+    text = _payload_text(payload)
+    if "cortex triage protocol" in text and "type:rail" in text:
+        return False
+    if "trader" in text or "billprinter" in text:
+        trader_action = any(token in text for token in TRADER_ACTION_TOKENS)
+        if trader_action and not _has_negated_trader_restart(text):
+            return True
+    if any(token in text for token in HARD_GATE_TOKENS):
+        # Explicit non-touch language lets reversible rail work proceed even if
+        # it mentions denied surfaces for context.
+        if any(token in text for token in REVERSIBLE_ALLOW_TOKENS) and any(guard in text for guard in ("no credential", "no live", "no production", "no customer")):
+            return False
+        return True
+    return False
+
+
+def _brief_line(text: str, max_chars: int = 180) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 1].rstrip() + "…"
+
+
+def _build_cortex_triage_artifact(ticket: str, payload: dict[str, Any], *, gated: bool) -> dict[str, Any]:
+    """Build the deterministic artifact shell for Cortex Triage Protocol v1.
+
+    Cortex remains the judgment owner; deterministic code makes the artifact and
+    routing invariants auditable for every picked ticket.
+    """
+
+    title = str(payload.get("title") or ticket)
+    body = str(payload.get("body") or "")
+    text = _payload_text(payload)
+    title_text = str(payload.get("title") or "").lower()
+    body_text = str(payload.get("body") or "").lower()
+    audit = "RELEVANT"
+    if any(token in text for token in ("duplicate of", "dupe of")):
+        audit = "DUPLICATE"
+    elif any(token in text for token in ("already done", "fixed in commit")):
+        audit = "ALREADY DONE"
+    elif any(token in title_text for token in ("stale", "superseded")) or any(token in body_text for token in ("status: stale", "status: superseded", "this ticket is stale", "this ticket is superseded")):
+        audit = "STALE"
+
+    asks: list[str] = []
+    if any(token in text for token in ("access", "credential", "api key", "token", "permission", "tool")):
+        asks.append("type: access | tool/credential/API needed | why/scope required before work can proceed | fallback: no-op until granted")
+    elif gated:
+        asks.append("type: decision | approve reversible continuation only | blocker: hard-gated surface or uncertainty | options: Approved / Rejected with constraints")
+    elif any(token in text for token in ("vague", "unclear", "tbd", "decide")):
+        asks.append("type: question | clarify exact desired outcome | options: narrow scope / split / cancel")
+    else:
+        asks.append("none — reversible class can proceed without MJ")
+
+    split = "not required"
+    if len(body) > 1200 or sum(token in text for token in ("and", "plus", "also", "mixed", "multi")) >= 3:
+        split = "candidate: create ordered sub-issues before worker execution"
+
+    classification = "Needs-MJ" if gated or audit in {"STALE", "DUPLICATE", "ALREADY DONE"} else "Proceed"
+    human = _brief_line(f"{title}: {body or 'No description provided.'}", 420)
+    agent = (
+        f"Grounding: Linear {payload.get('url') or ticket}; project={payload.get('project') or '<unknown>'}; labels={payload.get('labels') or []}. "
+        f"Scope: {title}. Non-goals: credentials, live sends, trader/billprinter restarts, customer/production writes unless explicitly gated. "
+        "Proof: focused tests, grader output, DB counts, cold-review rail=claude-max-code."
+    )
+    comment = (
+        f"Cortex Triage Protocol v1 — {ticket}\n"
+        f"AUDIT: {audit}\n"
+        f"SIZE/SPLIT: {split}\n"
+        f"CLASSIFICATION: {classification}\n\n"
+        f"Human brief: {human}\n\n"
+        f"Agent brief: {agent}\n\n"
+        "Structured ask/access request:\n"
+        + "\n".join(f"- {ask}" for ask in asks)
+    )
+    return {"audit": audit, "classification": classification, "asks": asks, "split": split, "comment": comment}
 
 
 def _spine_body(ticket: str, payload: dict[str, Any], stage: str, gated: bool) -> str:
+    triage = ""
+    if stage != "worker" and isinstance(payload.get("triage_protocol"), dict):
+        triage = (payload.get("triage_protocol") or {}).get("comment") or ""
+    linear_ref = payload.get("url") or ticket
+    task_title = payload.get("title") or ticket
+    if stage == "worker":
+        linear_ref = ticket
+        task_title = f"{ticket} implementation slice"
     return (
-        f"Linear: {payload.get('url') or ticket}\n"
+        f"Linear: {linear_ref}\n"
         f"Project: {payload.get('project') or '<unknown>'}\n"
         f"Gate: {'Needs-MJ before implementation/integration side effects' if gated else 'non-gated reversible class'}\n\n"
         f"Stage: {stage}\n\n"
-        f"Title: {payload.get('title') or ticket}\n\n"
+        f"Title: {task_title}\n\n"
         f"Evidence requirement: attach concise proof to Linear; no credentials, no live sends, no trader/billprinter restarts."
+        + (f"\n\nTriage artifact:\n{triage}" if triage else "")
     )
 
 
@@ -481,6 +595,8 @@ def main() -> int:
 
     payload = dict(pick.card.get("payload") or {})
     gated = _is_gated(payload)
+    triage_artifact = _build_cortex_triage_artifact(picked, payload, gated=gated)
+    payload["triage_protocol"] = triage_artifact
     chain = _ensure_spine_chain(picked, payload, gated=gated)
     outbox = _queue_or_hold_outbox(state, payload, gated=gated)
     target_state = "Needs-MJ" if gated else "In Progress"
@@ -496,9 +612,10 @@ def main() -> int:
         f"Kanban chain: board={chain['board']} cortex={chain['cortex']} cto={chain['cto']} worker={chain['worker']} validator={chain['validator']}.\n"
         f"Outbox: id={outbox.get('outbox_id')} state={outbox.get('outbox_state')}.\n"
         f"Next state: {target_state}; gated={gated}; needs_mj_ping={ping}.\n"
-        "No trader/billprinter restart, credentials, external sends, or production writes were performed by intake."
+        "No trader/billprinter restart, credentials, external sends, or production writes were performed by intake.\n\n"
+        f"{triage_artifact['comment']}"
     )
-    summary.update({"gated": gated, "chain": chain, "outbox": outbox, "needs_mj_ping": ping, "target_state": target_state})
+    summary.update({"gated": gated, "triage_protocol": triage_artifact, "chain": chain, "outbox": outbox, "needs_mj_ping": ping, "target_state": target_state})
     print(json.dumps(summary, sort_keys=True))
     return 0
 
