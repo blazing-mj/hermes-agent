@@ -56,18 +56,22 @@ def test_approved_status_requeues_mj_review_event_and_comments_with_notes(tmp_pa
     )
     state.mark_event_mj_review(event_id, reason="human gate required")
     comments: list[tuple[str, str]] = []
+    wakes: list[dict] = []
 
     result = handle_linear_webhook(
         _issue_payload("Approved", comment_body="Approved, but keep Phase 6 stopped."),
         state=state,
         add_comment=lambda issue_id, body: comments.append((issue_id, body)),
+        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True, "pid": 4321},
     )
 
     assert result["decision"] == "approved"
     row = state.get_outbox_event(event_id)
     assert row["state"] == "queued"
     assert "Approved, but keep Phase 6 stopped." in row["payload"]["mj_notes"]
-    assert comments == [("AGENTS-205", "Approved received — Team OS will continue this card with MJ notes attached. Phase 6 remains blocked until approval UX is proven.")]
+    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.")]
+    assert wakes == [{"issue_id": "AGENTS-205", "wake_source": "completion"}]
+    assert result["started"] is True
 
 
 def test_rejected_status_with_comment_fails_closed_for_revision(tmp_path):
@@ -135,18 +139,21 @@ def test_approved_comment_on_needs_mj_requeues_event(tmp_path):
     )
     state.mark_event_mj_review(event_id, reason="human gate required")
     comments: list[tuple[str, str]] = []
+    wakes: list[dict] = []
 
     result = handle_linear_webhook(
         _comment_payload(body="APPROVED AGENTS-205 — continue but keep Phase 6 blocked."),
         state=state,
         add_comment=lambda issue_id, body: comments.append((issue_id, body)),
+        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True},
     )
 
     assert result["decision"] == "approved"
     row = state.get_outbox_event(event_id)
     assert row["state"] == "queued"
     assert "keep Phase 6 blocked" in row["payload"]["mj_notes"]
-    assert comments == [("AGENTS-205", "Approved received — Team OS will continue this card with MJ notes attached. Phase 6 remains blocked until approval UX is proven.")]
+    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.")]
+    assert wakes == [{"issue_id": "AGENTS-205", "wake_source": "completion"}]
 
 
 def test_rejected_comment_on_needs_mj_fails_closed(tmp_path):

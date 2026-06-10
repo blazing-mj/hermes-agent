@@ -245,11 +245,12 @@ def handle_linear_webhook(
 
     if comment_decision == _APPROVED or current == _APPROVED:
         _update_outbox_payload_and_state(state, row, new_state="queued", note=note)
+        wake = run_intake_wake(issue_id=issue_id, wake_source="completion")
         add_comment(
             issue_id,
-            "Approved received — Team OS will continue this card with MJ notes attached. Phase 6 remains blocked until approval UX is proven.",
+            "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.",
         )
-        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True}
+        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, **wake}
 
     if comment_decision == _REJECTED or current in {_REJECTED, _NOT_APPROVED}:
         reason = "Rejected by MJ"
