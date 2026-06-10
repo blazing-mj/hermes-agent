@@ -559,6 +559,19 @@ def _send_needs_mj_ping_once(state: TeamOSState, ticket: str, payload: dict[str,
     return {"sent": True, "assigned": assigned, "send_result": send_result}
 
 
+def _loop_paused() -> bool:
+    """MJ pause button (scripts/team_os_control.py). Paused = stop NEW picks;
+    decisions and in-flight chains are unaffected."""
+    try:
+        ks = os.path.expanduser("~/.hermes/state/team-os-kill-switch.json")
+        if os.path.exists(ks):
+            with open(ks) as f:
+                return bool(json.load(f).get("enabled"))
+    except Exception:
+        return False
+    return False
+
+
 def main() -> int:
     state = TeamOSState(STATE_DB)
     cards = fetch_backlog_cards(PROJECTS)
@@ -577,9 +590,11 @@ def main() -> int:
     before_count = len(state.list_intake_candidates())
     result = reconcile_full_backlog(state=state, backlog_cards=cards, wake_source=source)
     pick = pick_one_after_reconcile(state=state, busy=active_work_busy() or bool(decision_results))
-    picked = pick.card["id"] if pick.card else None
+    paused = _loop_paused()
+    picked = None if paused else (pick.card["id"] if pick.card else None)
     summary = {
-        "status": "decision_processed" if decision_results else ("busy" if pick.busy else ("picked" if picked else "empty")),
+        "status": "paused" if (paused and not decision_results) else ("decision_processed" if decision_results else ("busy" if pick.busy else ("picked" if picked else "empty"))),
+        "paused": paused,
         "wake_source": source.value,
         "wake_issue": WAKE_ISSUE,
         "projects": PROJECTS,
