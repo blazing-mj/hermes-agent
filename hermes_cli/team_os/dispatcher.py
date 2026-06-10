@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .clarification_gate import assess_clarification_need, build_clarification_card
 from .contracts import check_contract
 from .integrator import IntegratorInput, IntegratorResult, integrate_after_validator
 from .validator_runner import run_validator
@@ -246,9 +247,6 @@ def dispatch_outbox_event(
                 result["telegram_push"] = {"enabled": True, "sent": True}
         return result
 
-    if not _is_low_failure_cost(event):
-        return {**base, "status": "blocked_failure_cost", "reason": "dispatch requires low failure-cost and no MJ-review hold"}
-
     blocked_reason = _blocked_surface_reason(event, contract)
     if blocked_reason:
         return {**base, "status": "blocked_surface", "reason": blocked_reason}
@@ -256,6 +254,20 @@ def dispatch_outbox_event(
     contract_errors = check_contract(contract)
     if contract_errors:
         return {**base, "status": "invalid_contract", "contract_errors": contract_errors}
+
+    clarification = assess_clarification_need(_event_payload(event), contract)
+    if clarification.needs_clarification:
+        return {
+            **base,
+            "status": "clarification_needed",
+            "lane": clarification.lane,
+            "reason": "; ".join(clarification.reasons),
+            "structured_asks": list(clarification.asks),
+            "clarification_card": build_clarification_card(ticket, clarification),
+        }
+
+    if not _is_low_failure_cost(event):
+        return {**base, "status": "blocked_failure_cost", "reason": "dispatch requires low failure-cost and no MJ-review hold"}
 
     slug = _safe_slug(ticket)
     branch = f"team-os-{slug}-{event_id or 'manual'}"
