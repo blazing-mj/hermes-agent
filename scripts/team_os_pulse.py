@@ -104,9 +104,24 @@ def fleet() -> None:
     print(f"  live checkout branch: {col}{branch}{N}" + ("  ← not main (unmerged live code)" if branch != "main" else ""))
 
 
+def streak() -> None:
+    print(f"\n{B}── AUTONOMY STREAK ──{N}")
+    f = HERMES / "state" / "team-os-streak.json"
+    try:
+        import json as _json
+        d = _json.loads(f.read_text())
+        n, tgt = d.get("count", 0), d.get("target", 5)
+        bar = G + "●" * n + N + "○" * max(0, tgt - n)
+        print(f"  {bar}  {n}/{tgt} clean runs (reviewer-graded)")
+        for r in d.get("runs", [])[-3:]:
+            print(f"    ✓ {r['ticket']} — {r['verdict']}")
+    except Exception:
+        print("  (no streak state)")
+
+
 def main() -> int:
     print(f"{B}TEAM OS PULSE{N}  {datetime.now():%Y-%m-%d %H:%M}")
-    board(); chains(); motors(); fleet()
+    board(); chains(); motors(); streak(); fleet()
     print()
     return 0
 

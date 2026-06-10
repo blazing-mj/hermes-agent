@@ -80,6 +80,24 @@ Build only when a real failure demands it:
 - **Reviewer (Claude, read-only + artifacts):** specs (gate card, scorecard, metrics defs), independent verification of every phase, `verify_spine_run` tooling.
 - **MJ:** drops real goals; approves irreversible only; reads digests. Never reads code.
 
+## OPERATING DECISIONS (locked 2026-06-10, MJ-ratified — canon)
+1. **Two human lanes:** `Blocked` = pre/mid-work asks (question/decision/access) — answer resumes the EXACT
+   stage recorded on the kanban chain. `Needs-MJ` = post-validation consequential approval — approval proceeds
+   to Integrator. Stage state lives on the chain, never in agent memory.
+2. **CTO = Codex** (gpt-5.5); writes contracts; workers are ephemeral fresh sessions per task.
+3. **Cross-model rule, always:** Worker=Codex, Validator=Claude Max. A contract may escalate a hard task's
+   worker to Claude Max → validation flips to Codex adversarial. Builder ≠ validator model, no exceptions.
+4. **Gate autonomy:** reversible code/tests/docs/rail in worktree, no denied surface → proceeds with zero MJ.
+   Gate on what the work TOUCHES, not keywords. Hard gates unchanged (money/sends/credentials/prod/delete).
+5. **Cruel validator:** adversarial — hunt bugs, hard tests, try to break. BOUNCE attaches findings to the
+   WORKER card (CTO only if the contract was wrong) → fix → re-validate. **Max 3 cycles**, then Blocked + ask MJ.
+6. **Pipelining (Phase 3, after 5-run streak):** stages work independent queues — CTO picks next contract
+   while workers build; bounces re-enter the worker queue.
+7. **Integrator:** real merge from worktree branch → main + deploy (checkpoint/resume protocol; never
+   billprinter) + rollback recorded + FYI ping. Grader v3 auto-detects hand-pushes and committed-not-live.
+8. **First closed loop achieved 2026-06-10 21:37** — AGENTS-225: full autonomous chain, MJ one-click gate,
+   first live Integrator auto-land, FYI msg 8857, grader v3 12/12 CLEAN. **Streak = 1.**
+
 ## Standing rules (unchanged)
 Subscription-only (Codex + Claude Max; no API except gated Bill exception until migrated).
 Worktree-only execution. Money/trading/sends/production/credentials always human-gated.
