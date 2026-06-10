@@ -19,6 +19,8 @@ from .db import TeamOSState
 AddComment = Callable[[str, str], None]
 RunIntakeWake = Callable[..., dict[str, Any]]
 
+DEFAULT_TEAM_OS_STATE_DB = "/Users/alfred/.hermes/state/team-os-cortex.db"
+
 _APPROVED = "approved"
 _REJECTED = "rejected"
 _NOT_APPROVED = "not approved"
@@ -186,6 +188,35 @@ def _update_outbox_payload_and_state(
         conn.commit()
 
 
+def apply_mj_decision(
+    state: TeamOSState,
+    row: dict[str, Any],
+    *,
+    decision: str,
+    note: str = "",
+) -> str:
+    """Apply an MJ decision to a pending outbox row.
+
+    The webhook and sweep fallback share this transition so a missed Linear
+    delivery cannot leave a card stranded in ``mj_review``.
+    """
+
+    if row.get("state") != "mj_review":
+        return str(row.get("state") or "unchanged")
+
+    normalized = _norm(decision)
+    if normalized == _APPROVED:
+        _update_outbox_payload_and_state(state, row, new_state="queued", note=note)
+        return "queued"
+    if normalized in {_REJECTED, _NOT_APPROVED}:
+        reason = "Rejected by MJ"
+        if note:
+            reason = f"Rejected by MJ: {note}"
+        _update_outbox_payload_and_state(state, row, new_state="failed", note=note, last_error=reason)
+        return "failed"
+    raise ValueError(f"Unsupported MJ decision: {decision}")
+
+
 def _question_reply(issue_id: str, title: str, comment_body: str) -> str:
     question_line = f"\n\nMJ question captured: {comment_body}" if comment_body else ""
     return (
@@ -243,8 +274,13 @@ def handle_linear_webhook(
     if row is None:
         return {"decision": "ignored", "issue": issue_id, "reason": "no outbox row"}
 
+    if row.get("state") != "mj_review" and (
+        comment_decision in {_APPROVED, _REJECTED} or current in {_APPROVED, _REJECTED, _NOT_APPROVED}
+    ):
+        return {"decision": "duplicate", "issue": issue_id, "outbox_state": row.get("state")}
+
     if comment_decision == _APPROVED or current == _APPROVED:
-        _update_outbox_payload_and_state(state, row, new_state="queued", note=note)
+        apply_mj_decision(state, row, decision=_APPROVED, note=note)
         wake = run_intake_wake(issue_id=issue_id, wake_source="completion")
         add_comment(
             issue_id,
@@ -253,10 +289,7 @@ def handle_linear_webhook(
         return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, **wake}
 
     if comment_decision == _REJECTED or current in {_REJECTED, _NOT_APPROVED}:
-        reason = "Rejected by MJ"
-        if note:
-            reason = f"Rejected by MJ: {note}"
-        _update_outbox_payload_and_state(state, row, new_state="failed", note=note, last_error=reason)
+        apply_mj_decision(state, row, decision=_REJECTED, note=note)
         add_comment(
             issue_id,
             "Rejected received — Team OS will not continue this card. MJ notes were captured for revise/archive handling.",
@@ -280,5 +313,5 @@ def add_linear_comment(issue_id: str, body: str) -> None:
 
 
 def handle_team_os_linear_webhook(payload: dict[str, Any], *, state_db: str | Path | None = None) -> dict[str, Any]:
-    db_path = Path(state_db).expanduser() if state_db else Path("~/.hermes/state/team-os/state.db").expanduser()
+    db_path = Path(state_db or os.environ.get("TEAM_OS_STATE_DB") or DEFAULT_TEAM_OS_STATE_DB).expanduser()
     return handle_linear_webhook(payload, state=TeamOSState(db_path), add_comment=add_linear_comment)

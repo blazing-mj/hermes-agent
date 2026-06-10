@@ -27,6 +27,7 @@ from hermes_cli import kanban_db
 from hermes_cli.team_os.db import TeamOSState
 from hermes_cli.team_os.event_router import route_linear_observation
 from hermes_cli.team_os.intake_reconcile import WakeSource, pick_one_after_reconcile, reconcile_full_backlog
+from hermes_cli.team_os.linear_webhook import apply_mj_decision
 from hermes_cli.team_os.schema import Observation
 
 LINEAR = Path("/Users/alfred/.hermes/bin/linear-agent")
@@ -46,6 +47,7 @@ BOARD_BY_PROJECT = {
 }
 KNOWN_HELD_TITLE_TOKENS = ("openrouter", "credential cleanup", "bill provider migration")
 GATED_TOKENS = ("trader", "money", "credential", "klaviyo", "send", "production", "customer")
+DECISION_STATES = ("Approved", "Rejected")
 
 
 def _gql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -148,6 +150,131 @@ def fetch_backlog_cards(projects: list[str]) -> list[dict[str, Any]]:
     for project in projects:
         cards.extend(fetch_backlog_cards_for_project(project))
     return cards
+
+
+def fetch_decision_cards_for_project(project: str) -> list[dict[str, Any]]:
+    query = """
+    query($project:String!, $states:[String!], $after:String) {
+      issues(first: 250, after: $after, filter: { project: { name: { eq: $project } }, state: { name: { in: $states } } }) {
+        nodes {
+          identifier
+          title
+          url
+          state { name }
+          project { name }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+    cards: list[dict[str, Any]] = []
+    after: str | None = None
+    while True:
+        data = _gql(query, {"project": project, "states": list(DECISION_STATES), "after": after})
+        page = data.get("issues", {})
+        for node in page.get("nodes", []):
+            cards.append({
+                "id": node["identifier"],
+                "title": node.get("title") or node["identifier"],
+                "url": node.get("url"),
+                "project": project,
+                "state": (node.get("state") or {}).get("name") or "",
+                "note": "",
+            })
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            break
+        after = info.get("endCursor")
+    return cards
+
+
+def fetch_decision_cards(projects: list[str]) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    for project in projects:
+        cards.extend(fetch_decision_cards_for_project(project))
+    return cards
+
+
+def _find_spine_task_id(board: str, ticket: str, stage: str) -> str:
+    conn = kanban_db.connect(board=board)
+    try:
+        row = conn.execute(
+            """
+            SELECT id FROM tasks
+             WHERE idempotency_key = ? AND status != 'archived'
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (f"linear:{ticket}:spine:{stage}",),
+        ).fetchone()
+        return str(row["id"] if row else "")
+    finally:
+        conn.close()
+
+
+def _unblock_approved_kanban_worker(ticket: str, project: str) -> dict[str, Any]:
+    """Unblock the gated worker stage after Linear moves to Approved.
+
+    The outbox state alone is not enough: the worker card was deliberately put
+    in a sticky ``blocked`` lane for MJ review, so a missed webhook or sweep
+    fallback must also clear that Kanban block.
+    """
+
+    board = BOARD_BY_PROJECT.get(project, "hermes-system")
+    worker_id = _find_spine_task_id(board, ticket, "worker")
+    if not worker_id:
+        return {"board": board, "worker": "", "unblocked": False, "reason": "worker task not found"}
+    conn = kanban_db.connect(board=board)
+    try:
+        unblocked = kanban_db.unblock_task(conn, worker_id)
+        if unblocked:
+            kanban_db.add_comment(
+                conn,
+                worker_id,
+                "team-os-decision-reconcile",
+                "Linear Approved reconciled; cleared the Needs-MJ block so the worker can continue.",
+            )
+            kanban_db.recompute_ready(conn)
+            return {"board": board, "worker": worker_id, "unblocked": True}
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (worker_id,)).fetchone()
+        return {
+            "board": board,
+            "worker": worker_id,
+            "unblocked": False,
+            "reason": f"worker status is {(row['status'] if row else 'missing')}",
+        }
+    finally:
+        conn.close()
+
+
+def reconcile_pending_decisions(state: TeamOSState, decision_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    processed: list[dict[str, Any]] = []
+    for card in decision_cards:
+        ticket = str(card.get("id") or "")
+        decision = str(card.get("state") or "")
+        row = state.get_outbox_event_by_source("linear_observation", ticket)
+        if not row or row.get("state") != "mj_review":
+            continue
+        new_state = apply_mj_decision(state, row, decision=decision, note=str(card.get("note") or ""))
+        kanban_result: dict[str, Any] = {}
+        if new_state == "queued":
+            kanban_result = _unblock_approved_kanban_worker(ticket, str(card.get("project") or ""))
+        try:
+            if new_state == "queued":
+                _linear_comment(ticket, f"Decision sweep saw Linear Approved and queued Team OS continuation. This is the fallback path for a missed webhook delivery. Kanban worker unblock: {kanban_result}.")
+            elif new_state == "failed":
+                _linear_comment(ticket, "Decision sweep saw Linear Rejected and stopped Team OS continuation. This is the fallback path for a missed webhook delivery.")
+        except Exception as exc:
+            item: dict[str, Any] = {"id": ticket, "decision": decision, "new_state": new_state, "comment_error": str(exc)[:200]}
+            if kanban_result:
+                item["kanban"] = kanban_result
+            processed.append(item)
+            continue
+        item: dict[str, Any] = {"id": ticket, "decision": decision, "new_state": new_state}
+        if kanban_result:
+            item["kanban"] = kanban_result
+        processed.append(item)
+    return processed
 
 
 def active_work_busy() -> bool:
@@ -302,20 +429,31 @@ def _send_needs_mj_ping_once(state: TeamOSState, ticket: str, payload: dict[str,
 def main() -> int:
     state = TeamOSState(STATE_DB)
     cards = fetch_backlog_cards(PROJECTS)
+    decision_error = ""
+    try:
+        decision_cards = fetch_decision_cards(PROJECTS)
+        decision_results = reconcile_pending_decisions(state, decision_cards)
+    except Exception as exc:
+        decision_cards = []
+        decision_results = []
+        decision_error = str(exc)[:300]
     try:
         source = WakeSource(WAKE_SOURCE)
     except ValueError:
         source = WakeSource.SWEEP
     before_count = len(state.list_intake_candidates())
     result = reconcile_full_backlog(state=state, backlog_cards=cards, wake_source=source)
-    pick = pick_one_after_reconcile(state=state, busy=active_work_busy())
+    pick = pick_one_after_reconcile(state=state, busy=active_work_busy() or bool(decision_results))
     picked = pick.card["id"] if pick.card else None
     summary = {
-        "status": "busy" if pick.busy else ("picked" if picked else "empty"),
+        "status": "decision_processed" if decision_results else ("busy" if pick.busy else ("picked" if picked else "empty")),
         "wake_source": source.value,
         "wake_issue": WAKE_ISSUE,
         "projects": PROJECTS,
         "backlog_cards": len(cards),
+        "decision_cards": len(decision_cards),
+        "decision_error": decision_error,
+        "decisions_processed": decision_results,
         "ledger_before": before_count,
         "ledger_added": list(result.added),
         "ledger_removed": list(result.removed),

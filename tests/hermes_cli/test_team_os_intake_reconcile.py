@@ -95,3 +95,103 @@ def test_sweep_uses_same_reconcile_path_and_removes_missing_backlog_cards(tmp_pa
     assert result.wake_source is WakeSource.SWEEP
     assert result.removed == ("DONE",)
     assert [c["id"] for c in state.list_intake_candidates()] == ["KEEP"]
+
+
+def test_decision_sweep_requeues_approved_pending_mj_review(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("team_os_linear_intake_motor", Path("scripts/team_os_linear_intake_motor.py"))
+    motor = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(motor)
+
+    state = _state(tmp_path)
+    event_id = state.queue_for_dispatch(
+        event_type="linear_observation",
+        source_id="AGENTS-5",
+        source="linear",
+        payload={"source_id": "AGENTS-5", "title": "Gated card"},
+    )
+    state.mark_event_mj_review(event_id, reason="human gate required")
+    comments: list[tuple[str, str]] = []
+    monkeypatch.setattr(motor, "_linear_comment", lambda ticket, body: comments.append((ticket, body)))
+    monkeypatch.setattr(
+        motor,
+        "_unblock_approved_kanban_worker",
+        lambda ticket, project: {"board": "openclaw-core", "worker": "t_worker", "unblocked": True},
+    )
+
+    processed = motor.reconcile_pending_decisions(
+        state,
+        [{"id": "AGENTS-5", "state": "Approved", "note": "Approved by MJ", "project": "OpenClaw Core"}],
+    )
+
+    assert processed == [
+        {
+            "id": "AGENTS-5",
+            "decision": "Approved",
+            "new_state": "queued",
+            "kanban": {"board": "openclaw-core", "worker": "t_worker", "unblocked": True},
+        }
+    ]
+    row = state.get_outbox_event(event_id)
+    assert row["state"] == "queued"
+    assert row["payload"]["mj_notes"] == "Approved by MJ"
+    assert comments == [
+        (
+            "AGENTS-5",
+            "Decision sweep saw Linear Approved and queued Team OS continuation. This is the fallback path for a missed webhook delivery. Kanban worker unblock: {'board': 'openclaw-core', 'worker': 't_worker', 'unblocked': True}.",
+        )
+    ]
+
+
+def test_decision_sweep_fails_rejected_pending_mj_review(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("team_os_linear_intake_motor", Path("scripts/team_os_linear_intake_motor.py"))
+    motor = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(motor)
+
+    state = _state(tmp_path)
+    event_id = state.queue_for_dispatch(
+        event_type="linear_observation",
+        source_id="AGENTS-6",
+        source="linear",
+        payload={"source_id": "AGENTS-6", "title": "Gated card"},
+    )
+    state.mark_event_mj_review(event_id, reason="human gate required")
+    comments: list[tuple[str, str]] = []
+    monkeypatch.setattr(motor, "_linear_comment", lambda ticket, body: comments.append((ticket, body)))
+
+    processed = motor.reconcile_pending_decisions(
+        state,
+        [{"id": "AGENTS-6", "state": "Rejected", "note": "Do not continue"}],
+    )
+
+    assert processed == [{"id": "AGENTS-6", "decision": "Rejected", "new_state": "failed"}]
+    row = state.get_outbox_event(event_id)
+    assert row["state"] == "failed"
+    assert "Do not continue" in (row["last_error"] or "")
+    assert comments == [("AGENTS-6", "Decision sweep saw Linear Rejected and stopped Team OS continuation. This is the fallback path for a missed webhook delivery.")]
+
+
+def test_decision_sweep_ignores_cards_without_pending_outbox_row(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("team_os_linear_intake_motor", Path("scripts/team_os_linear_intake_motor.py"))
+    motor = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(motor)
+
+    state = _state(tmp_path)
+    comments: list[tuple[str, str]] = []
+    monkeypatch.setattr(motor, "_linear_comment", lambda ticket, body: comments.append((ticket, body)))
+
+    processed = motor.reconcile_pending_decisions(state, [{"id": "AGENTS-404", "state": "Approved", "note": "Approved"}])
+
+    assert processed == []
+    assert comments == []

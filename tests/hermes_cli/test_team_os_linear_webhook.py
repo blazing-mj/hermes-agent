@@ -198,6 +198,37 @@ def test_low_cost_non_needs_mj_webhook_is_ignored(tmp_path):
     assert comments == []
 
 
+def test_late_approved_retry_after_sweep_is_duplicate_not_requeued(tmp_path):
+    from hermes_cli.team_os.linear_webhook import handle_linear_webhook
+
+    state = TeamOSState(tmp_path / "team-os.db")
+    event_id = state.queue_for_dispatch(
+        event_type="linear_observation",
+        source_id="AGENTS-205",
+        source="linear",
+        payload={"source_id": "AGENTS-205", "title": "Approval UX blocker"},
+    )
+    state.mark_event_mj_review(event_id, reason="human gate required")
+    # Simulate the sweep fallback already processing MJ's approval before a late webhook retry arrives.
+    row = state.get_outbox_event(event_id)
+    from hermes_cli.team_os.linear_webhook import apply_mj_decision
+    apply_mj_decision(state, row, decision="Approved")
+    comments: list[tuple[str, str]] = []
+    wakes: list[dict] = []
+
+    result = handle_linear_webhook(
+        _issue_payload("Approved", issue_id="AGENTS-205", previous="Needs-MJ"),
+        state=state,
+        add_comment=lambda issue_id, body: comments.append((issue_id, body)),
+        run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True},
+    )
+
+    assert result == {"decision": "duplicate", "issue": "AGENTS-205", "outbox_state": "queued"}
+    assert state.get_outbox_event(event_id)["state"] == "queued"
+    assert comments == []
+    assert wakes == []
+
+
 def test_issue_created_in_backlog_rings_cortex_intake_doorbell(tmp_path):
     from hermes_cli.team_os.linear_webhook import handle_linear_webhook
 
@@ -271,6 +302,31 @@ def test_team_os_linear_webhook_ignores_its_own_reply_comments(tmp_path):
     assert comments == []
 
 
+def test_handle_team_os_linear_webhook_default_db_matches_intake_motor_env(tmp_path, monkeypatch):
+    import hermes_cli.team_os.linear_webhook as linear_webhook
+
+    db_path = tmp_path / "team-os-cortex.db"
+    state = TeamOSState(db_path)
+    event_id = state.queue_for_dispatch(
+        event_type="linear_observation",
+        source_id="AGENTS-5",
+        source="linear",
+        payload={"source_id": "AGENTS-5", "title": "Gated card"},
+    )
+    state.mark_event_mj_review(event_id, reason="human gate required")
+    comments: list[tuple[str, str]] = []
+    monkeypatch.setenv("TEAM_OS_STATE_DB", str(db_path))
+    monkeypatch.setenv("TEAM_OS_CORTEX_INTAKE_SCRIPT", str(tmp_path / "missing-intake.sh"))
+    monkeypatch.setattr(linear_webhook, "add_linear_comment", lambda issue_id, body: comments.append((issue_id, body)))
+
+    result = linear_webhook.handle_team_os_linear_webhook(_issue_payload("Approved", issue_id="AGENTS-5"))
+
+    assert result["decision"] == "approved"
+    assert result["reason"] == "intake script missing"
+    assert TeamOSState(db_path).get_outbox_event(event_id)["state"] == "queued"
+    assert comments == [("AGENTS-5", "Approved received — Team OS queued continuation with MJ notes attached and woke the intake/dispatch motor.")]
+
+
 def test_linear_webhook_adapter_handles_linear_signature_and_invokes_team_os_handler(monkeypatch):
     import hashlib
     import hmac
@@ -319,3 +375,46 @@ def test_linear_webhook_adapter_handles_linear_signature_and_invokes_team_os_han
     assert response.status == 200
     assert json.loads(response.text)["status"] == "handled"
     assert called == [payload]
+
+
+def test_linear_delivery_header_dedupes_retries(monkeypatch):
+    import asyncio
+    import hashlib
+    import hmac
+    from gateway.config import PlatformConfig
+    from gateway.platforms.webhook import WebhookAdapter
+
+    secret = "linear-secret"
+    payload = _comment_payload()
+    body = json.dumps(payload).encode()
+    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    calls: list[dict] = []
+
+    adapter = WebhookAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"routes": {"linear-team-os": {"secret": secret, "team_os_linear": True}}},
+        )
+    )
+
+    async def fake_handler(payload_arg, **_kwargs):  # noqa: ANN001
+        calls.append(payload_arg)
+        return {"decision": "question", "issue": "AGENTS-205"}
+
+    monkeypatch.setattr("gateway.platforms.webhook.handle_team_os_linear_webhook", fake_handler, raising=False)
+
+    class Req:
+        method = "POST"
+        content_length = len(body)
+        headers = {"Linear-Signature": signature, "Linear-Delivery": "linear-delivery-1"}
+        match_info = {"route_name": "linear-team-os"}
+
+        async def read(self):
+            return body
+
+    first = asyncio.run(adapter._handle_webhook(Req()))
+    second = asyncio.run(adapter._handle_webhook(Req()))
+
+    assert first.status == 200
+    assert json.loads(second.text)["status"] == "duplicate"
+    assert calls == [payload]

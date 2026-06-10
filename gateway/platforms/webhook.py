@@ -488,7 +488,10 @@ class WebhookAdapter(BasePlatformAdapter):
             "X-GitHub-Delivery",
             request.headers.get(
                 "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                request.headers.get(
+                    "Linear-Delivery",
+                    request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                ),
             ),
         )
 
@@ -536,6 +539,12 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"status": "error", "error": "Team OS Linear handler failed", "delivery_id": delivery_id},
                     status=500,
                 )
+            logger.info(
+                "[webhook] Team OS Linear handled route=%s delivery=%s result=%s",
+                route_name,
+                delivery_id,
+                result,
+            )
             return web.json_response(
                 {
                     "status": "handled",
