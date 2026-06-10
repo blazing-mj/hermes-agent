@@ -549,7 +549,10 @@ def _compose_needs_mj_message(ticket: str, payload: dict[str, Any], chain: dict[
     desc = " ".join((payload.get("description") or "").split())
     what = (desc.split(". ")[0][:160] if desc else title) or title
     text = ((payload.get("title") or "") + " " + (payload.get("description") or "")).lower()
-    hits = [v for k, v in _IRREVERSIBLE.items() if re.search(r"\b" + re.escape(k) + r"\b", text)]
+    # negation-aware: "no trading enabled" / "without restart" must not flag as irreversible
+    hits = [v for k, v in _IRREVERSIBLE.items()
+            if re.search(r"\b" + re.escape(k) + r"\b", text)
+            and not re.search(r"\b(no|not|without|never)\s+(\w+\s+){0,2}" + re.escape(k), text)]
     if hits:
         risk = f"⚠️ IRREVERSIBLE — {hits[0]}. Cannot be auto-undone. Approve only if you mean it."
     else:
