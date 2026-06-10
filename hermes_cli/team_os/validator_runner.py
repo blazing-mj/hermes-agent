@@ -18,6 +18,7 @@ from typing import Any, Callable, Sequence
 from .contracts import check_contract
 
 Reviewer = Callable[[str], str]
+WorkerFixer = Callable[[dict[str, Any], dict[str, Any], dict[str, Any], int], dict[str, Any]]
 _VERDICT_RE = re.compile(r"^\s*VERDICT\s*:\s*(PASS|BOUNCE)\b", re.IGNORECASE | re.MULTILINE)
 
 
@@ -172,6 +173,92 @@ def run_validator(
         "auto_done_allowed": False,
         "gates_off": True,
         "review_text": review_text.strip(),
+    }
+
+
+def run_bounce_loop(
+    *,
+    contract: dict[str, Any],
+    initial_handoff: dict[str, Any],
+    state_path: Path,
+    reviewer: Reviewer | None = None,
+    review_cmd: Sequence[str] | None = None,
+    worker_fixer: WorkerFixer | None = None,
+    max_bounces: int = 3,
+) -> dict[str, Any]:
+    """Run the bounded cruel-Validator -> Worker-fix loop.
+
+    The loop is intentionally narrow and auditable: Validator BOUNCE text may be
+    fed to a Worker fixer, but only while the bounce count is below
+    ``max_bounces``.  It never marks Linear Done, live-dispatches, or disables
+    the human gate.
+    """
+
+    if max_bounces < 1:
+        raise ValueError("max_bounces must be >= 1")
+
+    current_handoff = dict(initial_handoff)
+    validator_results: list[dict[str, Any]] = []
+    handoffs: list[dict[str, Any]] = [dict(current_handoff)]
+
+    with tempfile.TemporaryDirectory(prefix="team-os-bounce-loop-") as tmp:
+        tmp_path = Path(tmp)
+        contract_path = tmp_path / "contract.json"
+        handoff_path = tmp_path / "handoff.json"
+        contract_path.write_text(json.dumps(contract, indent=2, sort_keys=True), encoding="utf-8")
+
+        for attempt in range(1, max_bounces + 1):
+            handoff_path.write_text(json.dumps(current_handoff, indent=2, sort_keys=True), encoding="utf-8")
+            result = run_validator(
+                contract_path=contract_path,
+                handoff_path=handoff_path,
+                state_path=state_path,
+                reviewer=reviewer,
+                review_cmd=review_cmd,
+            )
+            result["attempt"] = attempt
+            validator_results.append(result)
+
+            if result["verdict"] == "PASS":
+                return {
+                    "status": "passed",
+                    "attempts": attempt,
+                    "max_bounces": max_bounces,
+                    "source_ticket": result["source_ticket"],
+                    "validator_results": validator_results,
+                    "handoffs": handoffs,
+                    "escalate_mj": False,
+                    "human_gate_required": True,
+                    "loop_feed_allowed": False,
+                    "auto_dispatch_allowed": False,
+                    "auto_done_allowed": False,
+                    "gates_off": True,
+                }
+
+            if attempt >= max_bounces:
+                break
+            if worker_fixer is None:
+                break
+            current_handoff = worker_fixer(contract, current_handoff, result, attempt)
+            if not isinstance(current_handoff, dict):
+                raise ValueError("worker_fixer must return a handoff dict")
+            handoffs.append(dict(current_handoff))
+
+    status = "max_bounces_exceeded" if len(validator_results) >= max_bounces else "bounced_no_worker_fix"
+    return {
+        "status": status,
+        "attempts": len(validator_results),
+        "max_bounces": max_bounces,
+        "source_ticket": str(contract.get("source_ticket") or initial_handoff.get("source_ticket") or "unknown"),
+        "validator_results": validator_results,
+        "handoffs": handoffs,
+        "escalate_mj": True,
+        "human_gate_required": True,
+        "loop_feed_allowed": False,
+        "auto_dispatch_allowed": False,
+        "auto_done_allowed": False,
+        "gates_off": True,
+        "tripwire": f"MJ escalation required after {len(validator_results)} BOUNCE verdict(s)",
     }
 
 

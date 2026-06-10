@@ -430,8 +430,13 @@ def _spine_body(ticket: str, payload: dict[str, Any], stage: str, gated: bool) -
     triage = ""
     if stage != "worker" and isinstance(payload.get("triage_protocol"), dict):
         triage = (payload.get("triage_protocol") or {}).get("comment") or ""
+        if stage != "validator":
+            triage = triage.replace("Validator", "cold-reviewer").replace("validator", "cold-reviewer")
     linear_ref = payload.get("url") or ticket
     task_title = payload.get("title") or ticket
+    if stage != "validator":
+        task_title = str(task_title).replace("Validator", "cold-reviewer").replace("validator", "cold-reviewer")
+        linear_ref = ticket
     if stage == "worker":
         linear_ref = ticket
         task_title = f"{ticket} implementation slice"

@@ -187,3 +187,62 @@ def test_validator_runner_cli_returns_nonzero_for_bounce_and_zero_for_pass(tmp_p
     assert '"verdict": "BOUNCE"' in bad.stdout
     assert good.returncode == 0
     assert '"verdict": "PASS"' in good.stdout
+
+
+def test_bounce_loop_feeds_cruel_validator_critique_to_worker_fix_then_passes(tmp_path):
+    from hermes_cli.team_os.validator_runner import run_bounce_loop
+
+    calls: list[dict] = []
+
+    def fake_cold_reviewer(prompt: str) -> str:
+        return "VERDICT: BOUNCE\nstep_summary: proof missing" if '"proof": []' in prompt else "VERDICT: PASS\nstep_summary: proof fixed"
+
+    def fake_worker_fixer(contract: dict, handoff: dict, validator_result: dict, attempt: int) -> dict:
+        calls.append({"attempt": attempt, "verdict": validator_result["verdict"], "review_text": validator_result["review_text"]})
+        fixed = dict(handoff)
+        fixed["proof"] = ["python3.13 -m pytest tests/hermes_cli/test_team_os_validator_runner.py -q => passed"]
+        return fixed
+
+    result = run_bounce_loop(
+        contract=_contract(),
+        initial_handoff=_handoff(flawed=True),
+        state_path=tmp_path / "bounce-state.json",
+        reviewer=fake_cold_reviewer,
+        worker_fixer=fake_worker_fixer,
+        max_bounces=3,
+    )
+
+    assert result["status"] == "passed"
+    assert [r["verdict"] for r in result["validator_results"]] == ["BOUNCE", "PASS"]
+    assert result["attempts"] == 2
+    assert calls == [{"attempt": 1, "verdict": "BOUNCE", "review_text": "VERDICT: BOUNCE\nstep_summary: proof missing"}]
+    assert result["human_gate_required"] is True
+    assert result["auto_done_allowed"] is False
+    assert result["loop_feed_allowed"] is False
+
+
+def test_bounce_loop_stops_after_three_bounces_and_escalates_to_mj(tmp_path):
+    from hermes_cli.team_os.validator_runner import run_bounce_loop
+
+    fixer_attempts: list[int] = []
+
+    def still_bad(contract: dict, handoff: dict, validator_result: dict, attempt: int) -> dict:
+        fixer_attempts.append(attempt)
+        return dict(handoff)
+
+    result = run_bounce_loop(
+        contract=_contract(),
+        initial_handoff=_handoff(flawed=True),
+        state_path=tmp_path / "bounce-state.json",
+        reviewer=lambda prompt: "VERDICT: BOUNCE\nstep_summary: still bad",
+        worker_fixer=still_bad,
+        max_bounces=3,
+    )
+
+    assert result["status"] == "max_bounces_exceeded"
+    assert result["attempts"] == 3
+    assert [r["verdict"] for r in result["validator_results"]] == ["BOUNCE", "BOUNCE", "BOUNCE"]
+    assert fixer_attempts == [1, 2]
+    assert result["escalate_mj"] is True
+    assert result["human_gate_required"] is True
+    assert result["auto_done_allowed"] is False

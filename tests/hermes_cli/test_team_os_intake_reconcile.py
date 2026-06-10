@@ -290,3 +290,20 @@ def test_spine_body_carries_triage_dual_brief_to_cto_worker_validator():
     assert "Cortex Triage Protocol v1" in body
     assert "Human brief: hello" in body
     assert "Agent brief: file:line proof" in body
+
+
+def test_spine_body_sanitizes_validator_word_for_non_validator_stages():
+    motor = _load_intake_motor()
+
+    payload = {
+        "title": "Cruel Validator loop",
+        "body": "Docs and tests only.",
+        "project": "Hermes System",
+        "triage_protocol": {"comment": "Human brief: cruel Validator\nAgent brief: validator critique"},
+    }
+
+    body = motor._spine_body("AGENTS-240", payload, "cortex", gated=False)
+
+    assert "Validator" not in body
+    assert "validator" not in body
+    assert "cold-reviewer" in body
