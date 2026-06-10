@@ -166,7 +166,11 @@ def grade(ticket: str) -> int:
     # 8. deployed-live (v3): if a landed commit sha is recorded, it must be on main
     # AND the default gateway must have (re)started after the commit time.
     sha_m = re.search(r"\b([0-9a-f]{9,40})\b(?=[^\n]*(?:land|merge|commit|main))", text, re.I)
-    if claims_landed and sha_m:
+    if claims_landed and not sha_m:
+        # v4 (AGENTS-244): a landing with no commit sha anywhere in the chain is the
+        # empty-landing signature — ceremony without work product.
+        rows.append(("FAIL", "deployed-live", "landing claimed but NO commit sha in chain — EMPTY LANDING suspect"))
+    elif claims_landed and sha_m:
         sha = sha_m.group(1)
         repo = str(Path.home() / ".hermes" / "hermes-agent")
         on_main = "main" in sh(["git", "-C", repo, "branch", "--contains", sha])
