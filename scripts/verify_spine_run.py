@@ -20,8 +20,17 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
+
+
+def sh(args: list[str], timeout: int = 20) -> str:
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
 
 BOARDS = glob.glob(os.path.expanduser("~/.hermes/kanban/boards/*/kanban.db")) + \
          [os.path.expanduser("~/.hermes/kanban.db")]
@@ -140,6 +149,45 @@ def grade(ticket: str) -> int:
     dur = (max(ends) - min(starts)) / 60 if starts and ends else None
     rows.append(("PASS" if dur is not None else "WARN", "duration measured",
                  f"{dur:.0f} min across chain" if dur is not None else "no run timestamps"))
+
+    # 7. landing authenticity (v3): if the chain claims work LANDED (merge/commit on
+    # main), require Integrator evidence — otherwise it was hand-pushed. Gated runs
+    # that stop at Needs-MJ legitimately have no landing: WARN-neutral, not FAIL.
+    text = " ".join(all_comments)
+    claims_landed = bool(re.search(r"\b(landed|merged to main|auto-?land|fast-forward)\b", text, re.I))
+    integrator_evidence = bool(re.search(r"integrator|auto-?land.*(rollback|fyi)|fyi.*auto-?land", text, re.I))
+    if not claims_landed:
+        rows.append(("WARN", "integrator landing", "no landing claimed (gated/in-flight run)"))
+    elif integrator_evidence:
+        rows.append(("PASS", "integrator landing", "landing carries Integrator evidence"))
+    else:
+        rows.append(("FAIL", "integrator landing", "landing claimed WITHOUT Integrator evidence — hand-push"))
+
+    # 8. deployed-live (v3): if a landed commit sha is recorded, it must be on main
+    # AND the default gateway must have (re)started after the commit time.
+    sha_m = re.search(r"\b([0-9a-f]{9,40})\b(?=[^\n]*(?:land|merge|commit|main))", text, re.I)
+    if claims_landed and sha_m:
+        sha = sha_m.group(1)
+        repo = str(Path.home() / ".hermes" / "hermes-agent")
+        on_main = "main" in sh(["git", "-C", repo, "branch", "--contains", sha])
+        ct_raw = sh(["git", "-C", repo, "show", "-s", "--format=%ct", sha]).strip()
+        gw_after = False
+        try:
+            import subprocess as _sp
+            out = _sp.run(["launchctl", "list"], capture_output=True, text=True, timeout=10).stdout
+            pid = next((l.split("\t")[0] for l in out.splitlines() if l.endswith("ai.hermes.gateway")), "")
+            lst = _sp.run(["ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True, timeout=10).stdout.strip()
+            if lst and ct_raw.isdigit():
+                from datetime import datetime as _dt
+                gw_after = _dt.strptime(lst, "%a %b %d %H:%M:%S %Y").timestamp() > int(ct_raw)
+        except Exception:
+            pass
+        if on_main and gw_after:
+            rows.append(("PASS", "deployed-live", f"{sha[:9]} on main; gateway restarted after commit"))
+        elif on_main:
+            rows.append(("FAIL", "deployed-live", f"{sha[:9]} on main but gateway PREDATES it — committed-not-live"))
+        else:
+            rows.append(("FAIL", "deployed-live", f"claimed landed sha {sha[:9]} is NOT on main"))
 
     # print
     print(f"\n  ── spine run scorecard: {ticket}  (board: {board}) ──")
