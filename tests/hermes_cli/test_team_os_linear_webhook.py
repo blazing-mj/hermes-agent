@@ -57,6 +57,7 @@ def test_approved_status_requeues_mj_review_event_and_comments_with_notes(tmp_pa
     state.mark_event_mj_review(event_id, reason="human gate required")
     comments: list[tuple[str, str]] = []
     wakes: list[dict] = []
+    integrator_calls: list[dict] = []
 
     import hermes_cli.team_os.linear_webhook as linear_webhook
     monkeypatch = __import__("pytest").MonkeyPatch()
@@ -67,21 +68,25 @@ def test_approved_status_requeues_mj_review_event_and_comments_with_notes(tmp_pa
     )
     try:
         result = handle_linear_webhook(
-        _issue_payload("Approved", comment_body="Approved, but keep Phase 6 stopped."),
-        state=state,
-        add_comment=lambda issue_id, body: comments.append((issue_id, body)),
+            _issue_payload("Approved", comment_body="Approved, but keep Phase 6 stopped."),
+            state=state,
+            add_comment=lambda issue_id, body: comments.append((issue_id, body)),
             run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True, "pid": 4321},
+            run_integrator_auto_land=lambda **kwargs: integrator_calls.append(kwargs) or {"status": "auto_landed", "fyi_sent": True},
         )
     finally:
         monkeypatch.undo()
 
     assert result["decision"] == "approved"
     row = state.get_outbox_event(event_id)
-    assert row["state"] == "queued"
+    assert row["state"] == "succeeded"
     assert "Approved, but keep Phase 6 stopped." in row["payload"]["mj_notes"]
-    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'hermes-system', 'worker': 't_worker', 'unblocked': True}), and woke the intake/dispatch motor.")]
+    assert row["payload"]["integrator_auto_land"]["status"] == "auto_landed"
+    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'hermes-system', 'worker': 't_worker', 'unblocked': True}), woke the intake/dispatch motor, and ran Integrator ({'status': 'auto_landed', 'fyi_sent': True}).")]
     assert wakes == [{"issue_id": "AGENTS-205", "wake_source": "completion"}]
+    assert integrator_calls == [{"ticket": "AGENTS-205", "project": "Hermes System", "notes": "Approved, but keep Phase 6 stopped."}]
     assert result["kanban"] == {"board": "hermes-system", "worker": "t_worker", "unblocked": True}
+    assert result["integrator"] == {"status": "auto_landed", "fyi_sent": True}
     assert result["started"] is True
 
 
@@ -163,13 +168,14 @@ def test_approved_comment_on_needs_mj_requeues_event(tmp_path, monkeypatch):
         state=state,
         add_comment=lambda issue_id, body: comments.append((issue_id, body)),
         run_intake_wake=lambda **kwargs: wakes.append(kwargs) or {"started": True},
+        run_integrator_auto_land=lambda **kwargs: {"status": "auto_landed", "fyi_sent": True},
     )
 
     assert result["decision"] == "approved"
     row = state.get_outbox_event(event_id)
-    assert row["state"] == "queued"
+    assert row["state"] == "succeeded"
     assert "keep Phase 6 blocked" in row["payload"]["mj_notes"]
-    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'hermes-system', 'worker': 't_worker', 'unblocked': True}), and woke the intake/dispatch motor.")]
+    assert comments == [("AGENTS-205", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'hermes-system', 'worker': 't_worker', 'unblocked': True}), woke the intake/dispatch motor, and ran Integrator ({'status': 'auto_landed', 'fyi_sent': True}).")]
     assert wakes == [{"issue_id": "AGENTS-205", "wake_source": "completion"}]
     assert result["kanban"] == {"board": "hermes-system", "worker": "t_worker", "unblocked": True}
 
@@ -341,13 +347,14 @@ def test_handle_team_os_linear_webhook_default_db_matches_intake_motor_env(tmp_p
         "unblock_approved_kanban_worker",
         lambda ticket, project: {"board": "openclaw-core", "worker": "t_worker", "unblocked": True},
     )
+    monkeypatch.setattr(linear_webhook, "run_integrator_auto_land", lambda **kwargs: {"status": "auto_landed", "fyi_sent": True})
 
     result = linear_webhook.handle_team_os_linear_webhook(_issue_payload("Approved", issue_id="AGENTS-5"))
 
     assert result["decision"] == "approved"
     assert result["reason"] == "intake script missing"
-    assert TeamOSState(db_path).get_outbox_event(event_id)["state"] == "queued"
-    assert comments == [("AGENTS-5", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'openclaw-core', 'worker': 't_worker', 'unblocked': True}), and woke the intake/dispatch motor.")]
+    assert TeamOSState(db_path).get_outbox_event(event_id)["state"] == "succeeded"
+    assert comments == [("AGENTS-5", "Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({'board': 'openclaw-core', 'worker': 't_worker', 'unblocked': True}), woke the intake/dispatch motor, and ran Integrator ({'status': 'auto_landed', 'fyi_sent': True}).")]
 
 
 def test_linear_webhook_adapter_handles_linear_signature_and_invokes_team_os_handler(monkeypatch):

@@ -20,6 +20,7 @@ from .db import TeamOSState
 
 AddComment = Callable[[str, str], None]
 RunIntakeWake = Callable[..., dict[str, Any]]
+RunIntegratorAutoLand = Callable[..., dict[str, Any]]
 
 BOARD_BY_PROJECT = {
     "Hermes System": "hermes-system",
@@ -164,10 +165,13 @@ def _update_outbox_payload_and_state(
     new_state: str,
     note: str = "",
     last_error: str = "",
+    extra_payload: dict[str, Any] | None = None,
 ) -> None:
     payload = dict(row.get("payload") or {})
     if note:
         payload["mj_notes"] = note
+    if extra_payload:
+        payload.update(extra_payload)
     payload["mj_decision_at"] = int(time.time())
     payload["mj_decision_state"] = new_state
     now = int(time.time())
@@ -262,6 +266,96 @@ def unblock_approved_kanban_worker(ticket: str, project: str) -> dict[str, Any]:
         conn.close()
 
 
+def _send_integrator_fyi(ticket: str, body: str) -> dict[str, Any]:
+    try:
+        from tools.send_message_tool import send_message_tool
+
+        raw = send_message_tool({"target": "telegram", "message": body})
+    except Exception as exc:  # noqa: BLE001 - FYI failure must be visible but not hide rollback/proof.
+        return {"sent": False, "reason": str(exc)[:200]}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        parsed = {"raw": raw}
+    if isinstance(parsed, dict) and parsed.get("success"):
+        message_id = parsed.get("message_id") or parsed.get("id") or parsed.get("result")
+        return {"sent": True, "message_id": message_id, "raw": parsed}
+    return {"sent": False, "raw": parsed}
+
+
+def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict[str, Any]:
+    """Deterministically land the approved reversible Team OS continuation.
+
+    This is intentionally narrower than git/deploy auto-land: for the human-gate
+    continuation proof, Integrator lands the reversible local Team OS state
+    transition only — worker completion, Integrator audit task, Linear comment,
+    and training-wheel FYI ping.  It never restarts trader/billprinter, edits
+    credentials, sends customer mail, or touches money/trading surfaces.
+    """
+
+    board = BOARD_BY_PROJECT.get(project, "hermes-system")
+    conn = kanban_db.connect(board=board)
+    try:
+        worker = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (f"linear:{ticket}:spine:worker",),
+        ).fetchone()
+        validator = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (f"linear:{ticket}:spine:validator",),
+        ).fetchone()
+        if not worker:
+            return {"status": "did_not_fire", "board": board, "reason": "worker task not found"}
+        if not validator or validator["status"] != "done":
+            return {"status": "needs_mj", "board": board, "worker": worker["id"], "reason": "validator PASS task not done"}
+
+        worker_id = str(worker["id"])
+        if worker["status"] != "done":
+            if not kanban_db.complete_task(
+                conn,
+                worker_id,
+                summary="Approved continuation landed: reversible investigation/work may proceed; no trader/billprinter restart, credentials, live sends, money, or production/customer writes performed.",
+                metadata={"linear_ticket": ticket, "approved_notes": notes, "integrator": "auto_land"},
+            ):
+                return {"status": "did_not_fire", "board": board, "worker": worker_id, "reason": f"worker status is {worker['status']}"}
+
+        integrator_id = kanban_db.create_task(
+            conn,
+            title=f"{ticket} Integrator auto-land / reversible continuation",
+            body=(
+                f"Linear: {ticket}\nProject: {project}\n"
+                "Scope: reversible Team OS continuation marker only. No trader/billprinter restart, credentials, live sends, money, or production/customer writes.\n"
+                f"MJ notes: {notes or '<none>'}"
+            ),
+            assignee="default",
+            created_by="team-os-integrator",
+            workspace_kind="dir",
+            idempotency_key=f"linear:{ticket}:spine:integrator",
+            parents=[worker_id, str(validator["id"])],
+            initial_status="running",
+            board=board,
+        )
+        kanban_db.add_comment(
+            conn,
+            integrator_id,
+            "team-os-integrator",
+            "Integrator auto-landed reversible continuation after Linear Approved. Rollback: move card back to Needs-MJ and reopen worker block; no external side effects were performed.",
+        )
+        kanban_db.complete_task(
+            conn,
+            integrator_id,
+            summary="Integrator auto_landed reversible continuation; FYI ping attempted; rollback is recorded in this comment.",
+            metadata={"linear_ticket": ticket, "reversibility": "reversible", "fyi": "training-wheel"},
+        )
+        fyi = _send_integrator_fyi(
+            ticket,
+            f"FYI: {ticket} Integrator auto-landed the reversible Team OS continuation after your Linear Approved decision. No trader/billprinter restart, credentials, live sends, money, or production/customer writes were performed. Rollback is recorded on Linear/Kanban.",
+        )
+        return {"status": "auto_landed", "board": board, "worker": worker_id, "integrator": integrator_id, "fyi_sent": bool(fyi.get("sent")), "fyi": fyi}
+    finally:
+        conn.close()
+
+
 def _question_reply(issue_id: str, title: str, comment_body: str) -> str:
     question_line = f"\n\nMJ question captured: {comment_body}" if comment_body else ""
     return (
@@ -280,6 +374,7 @@ def handle_linear_webhook(
     state: TeamOSState,
     add_comment: AddComment,
     run_intake_wake: RunIntakeWake = run_cortex_intake_wake,
+    run_integrator_auto_land: RunIntegratorAutoLand | None = None,
 ) -> dict[str, Any]:
     """Handle one Linear webhook payload for Team OS approval UX.
 
@@ -328,11 +423,22 @@ def handle_linear_webhook(
         apply_mj_decision(state, row, decision=_APPROVED, note=note)
         kanban_result = unblock_approved_kanban_worker(issue_id, _kanban_project_from_row(row))
         wake = run_intake_wake(issue_id=issue_id, wake_source="completion")
+        integrator_runner = run_integrator_auto_land or globals()["run_integrator_auto_land"]
+        integrator_result = integrator_runner(ticket=issue_id, project=_kanban_project_from_row(row), notes=note)
+        refreshed = state.get_outbox_event(int(row["id"]))
+        final_state = "succeeded" if integrator_result.get("status") == "auto_landed" else str(refreshed.get("state") or "queued")
+        _update_outbox_payload_and_state(
+            state,
+            refreshed,
+            new_state=final_state,
+            note=note,
+            extra_payload={"integrator_auto_land": integrator_result},
+        )
         add_comment(
             issue_id,
-            f"Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({kanban_result}), and woke the intake/dispatch motor.",
+            f"Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({kanban_result}), woke the intake/dispatch motor, and ran Integrator ({integrator_result}).",
         )
-        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, "kanban": kanban_result, **wake}
+        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, "kanban": kanban_result, "integrator": integrator_result, **wake}
 
     if comment_decision == _REJECTED or current in {_REJECTED, _NOT_APPROVED}:
         apply_mj_decision(state, row, decision=_REJECTED, note=note)

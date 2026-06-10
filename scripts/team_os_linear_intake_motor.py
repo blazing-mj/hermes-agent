@@ -27,7 +27,7 @@ from hermes_cli import kanban_db
 from hermes_cli.team_os.db import TeamOSState
 from hermes_cli.team_os.event_router import route_linear_observation
 from hermes_cli.team_os.intake_reconcile import WakeSource, pick_one_after_reconcile, reconcile_full_backlog
-from hermes_cli.team_os.linear_webhook import apply_mj_decision
+from hermes_cli.team_os.linear_webhook import apply_mj_decision, run_integrator_auto_land
 from hermes_cli.team_os.schema import Observation
 
 LINEAR = Path("/Users/alfred/.hermes/bin/linear-agent")
@@ -257,11 +257,23 @@ def reconcile_pending_decisions(state: TeamOSState, decision_cards: list[dict[st
             continue
         new_state = apply_mj_decision(state, row, decision=decision, note=str(card.get("note") or ""))
         kanban_result: dict[str, Any] = {}
+        integrator_result: dict[str, Any] = {}
         if new_state == "queued":
             kanban_result = _unblock_approved_kanban_worker(ticket, str(card.get("project") or ""))
+            integrator_result = run_integrator_auto_land(ticket=ticket, project=str(card.get("project") or ""), notes=str(card.get("note") or ""))
+            if integrator_result.get("status") == "auto_landed":
+                latest = state.get_outbox_event(int(row["id"]))
+                payload = dict(latest.get("payload") or {})
+                payload["integrator_auto_land"] = integrator_result
+                with state.connect() as conn:
+                    conn.execute(
+                        "UPDATE outbox SET state='succeeded', payload_json=?, completed_at=?, updated_at=? WHERE id=?",
+                        (json.dumps(payload, sort_keys=True), int(time.time()), int(time.time()), int(row["id"])),
+                    )
+                    conn.commit()
         try:
             if new_state == "queued":
-                _linear_comment(ticket, f"Decision sweep saw Linear Approved and queued Team OS continuation. This is the fallback path for a missed webhook delivery. Kanban worker unblock: {kanban_result}.")
+                _linear_comment(ticket, f"Decision sweep saw Linear Approved, queued Team OS continuation, unblocked the worker, and ran Integrator. This is the fallback path for a missed webhook delivery. Kanban worker unblock: {kanban_result}. Integrator: {integrator_result}.")
             elif new_state == "failed":
                 _linear_comment(ticket, "Decision sweep saw Linear Rejected and stopped Team OS continuation. This is the fallback path for a missed webhook delivery.")
         except Exception as exc:
@@ -273,6 +285,8 @@ def reconcile_pending_decisions(state: TeamOSState, decision_cards: list[dict[st
         item: dict[str, Any] = {"id": ticket, "decision": decision, "new_state": new_state}
         if kanban_result:
             item["kanban"] = kanban_result
+        if integrator_result:
+            item["integrator"] = integrator_result
         processed.append(item)
     return processed
 
