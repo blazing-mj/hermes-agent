@@ -448,3 +448,103 @@ def test_linear_delivery_header_dedupes_retries(monkeypatch):
     assert first.status == 200
     assert json.loads(second.text)["status"] == "duplicate"
     assert calls == [payload]
+
+
+# ── AGENTS-238: Integrator final hop — auto-Done + landed-summary ───────────
+
+
+def test_landed_summary_commit_evidence_is_human_language_with_rollback():
+    from hermes_cli.team_os.linear_webhook import _compose_landed_summary
+
+    body = _compose_landed_summary(
+        "AGENTS-238",
+        {"ok": True, "kind": "commit", "sha": "abcdef1234567", "repo": "/Users/alfred/.hermes/hermes-agent"},
+        notes="keep the flag off in prod",
+    )
+    assert "abcdef123" in body and "revert" in body
+    assert "hermes-agent" in body
+    assert "MJ constraints carried forward: keep the flag off in prod" in body
+    # GATE-CARD tone: no code blocks beyond refs, states the no-side-effects scope
+    assert "production/customer writes" in body
+
+
+def test_landed_summary_no_code_declares_nothing_to_roll_back():
+    from hermes_cli.team_os.linear_webhook import _compose_landed_summary
+
+    body = _compose_landed_summary("AGENTS-238", {"ok": True, "kind": "no-code-declared"}, notes="")
+    assert "nothing to roll back" in body
+    assert "revert" not in body
+
+
+def test_finalize_routes_through_restricted_writer_with_allowlist_tuple(monkeypatch):
+    from hermes_cli.team_os import linear_webhook as lw
+
+    captured: dict = {}
+
+    def fake_run(cmd, *, input, capture_output, text, timeout):  # noqa: A002
+        captured["cmd"] = cmd
+        captured["proposal"] = json.loads(input)
+
+        class P:
+            returncode = 0
+            stdout = '{"ok": true}'
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr(lw.subprocess, "run", fake_run)
+    out = lw._integrator_finalize_linear(
+        "AGENTS-238", {"ok": True, "kind": "commit", "sha": "abcdef1234567", "repo": "/tmp/r"}, ""
+    )
+    assert out["done_moved"] is True
+    actions = captured["proposal"]["actions"]
+    assert actions[0]["action"] == "comment" and actions[0]["issue"] == "AGENTS-238"
+    status = actions[1]
+    assert (status["from"], status["to"], status["by"]) == ("Approved", "Done", "integrator")
+    assert set(status["conditions"]) == {
+        "mj_approved", "validator_pass_independent", "landing_evidence_present",
+    }
+    assert captured["cmd"][1].endswith("restricted_linear_writer.py")
+
+
+def test_finalize_failure_never_unlands(monkeypatch):
+    from hermes_cli.team_os import linear_webhook as lw
+
+    def boom(*a, **kw):
+        raise RuntimeError("linear is down")
+
+    monkeypatch.setattr(lw.subprocess, "run", boom)
+    out = lw._integrator_finalize_linear("AGENTS-238", {"ok": True, "kind": "no-code-declared"}, "")
+    assert out["done_moved"] is False
+    assert "linear is down" in out["reason"]
+
+
+def test_restricted_writer_allowlist_accepts_integrator_final_hop():
+    """The allowlist tuple Approved→Done by integrator must validate with all
+    three conditions supplied, and reject when one is missing."""
+    import importlib.util as ilu
+    from pathlib import Path as P
+
+    spec = ilu.spec_from_file_location(
+        "rlw", P("/Users/alfred/.hermes/hermes-agent/scripts/restricted_linear_writer.py"))
+    rlw = ilu.module_from_spec(spec)
+    spec.loader.exec_module(rlw)
+
+    ok = rlw._validate_status_action({
+        "action": "status", "issue": "AGENTS-238", "from": "Approved", "to": "Done",
+        "by": "integrator",
+        "conditions": ["mj_approved", "validator_pass_independent", "landing_evidence_present"],
+    })
+    assert ok == {"issue": "AGENTS-238", "from": "Approved", "to": "Done", "by": "integrator", "assignee": ""}
+
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="missing conditions"):
+        rlw._validate_status_action({
+            "action": "status", "issue": "AGENTS-238", "from": "Approved", "to": "Done",
+            "by": "integrator", "conditions": ["mj_approved"],
+        })
+    with _pytest.raises(ValueError, match="rejected by allowlist"):
+        rlw._validate_status_action({
+            "action": "status", "issue": "AGENTS-238", "from": "Approved", "to": "Done",
+            "by": "cortex", "conditions": ["mj_approved", "validator_pass_independent", "landing_evidence_present"],
+        })

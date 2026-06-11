@@ -1,9 +1,38 @@
 {
   "schema": "team_os.board_transitions.v1",
   "description": "Canonical transition allowlist for the Linear live operating surface (AGENTS-189 epic). The gated board-mover (AGENTS-190) MUST reject any (from,to,by) tuple not present here, and MUST enforce every listed condition before performing the move. MJ is the universal override.",
-  "lanes": ["Backlog", "Triage", "Todo", "In Progress", "In Review", "Needs-MJ", "Done", "Canceled"],
-  "roles": ["producer", "cortex", "cto", "validator", "sentinel", "reporter", "mj"],
-  "denied_surfaces": ["money", "trading", "billing", "production", "customer", "credential", "secret", "gateway-runtime", "env"],
+  "lanes": [
+    "Backlog",
+    "Triage",
+    "Todo",
+    "In Progress",
+    "In Review",
+    "Needs-MJ",
+    "Approved",
+    "Done",
+    "Canceled"
+  ],
+  "roles": [
+    "producer",
+    "cortex",
+    "cto",
+    "validator",
+    "sentinel",
+    "reporter",
+    "mj",
+    "integrator"
+  ],
+  "denied_surfaces": [
+    "money",
+    "trading",
+    "billing",
+    "production",
+    "customer",
+    "credential",
+    "secret",
+    "gateway-runtime",
+    "env"
+  ],
   "conditions_glossary": {
     "grounding_and_contract_present": "Triage output has grounding_doc(schema=team_os.grounding.v1) + thin_contract attached to the issue.",
     "assignee_set_cto": "Issue assignee is set to the CTO at the same time as the move.",
@@ -11,29 +40,198 @@
     "classified_low_cost": "failure_cost classifier returned low-cost AND reversible with confidence; uncertainty => false.",
     "no_denied_surface": "The contract's touched surfaces intersect NONE of denied_surfaces.",
     "validator_pass_independent": "Claude-Max adversarial review verdict=PASS with REAL runtime session_id != REAL author session_id (not self-declared labels).",
-    "human_gate_label_absent": "Issue does NOT carry the 'gate:human' label."
+    "human_gate_label_absent": "Issue does NOT carry the 'gate:human' label.",
+    "mj_approved": "MJ moved the card Needs-MJ -> Approved on Linear; that human decision is what fires the Integrator.",
+    "landing_evidence_present": "Integrator verified a real landed commit sha in a local repo (git cat-file) OR an explicit no-code/investigation-only declaration in the chain (AGENTS-244 gate)."
   },
   "transitions": [
-    {"from": "Backlog", "to": "Triage", "by": ["cortex", "mj"], "conditions": [], "note": "Cortex claims one eligible item for triage."},
-    {"from": "Backlog", "to": "Canceled", "by": ["cortex", "mj"], "conditions": [], "note": "Junk/duplicate/out-of-scope."},
-    {"from": "Triage", "to": "Todo", "by": ["cortex", "mj"], "conditions": ["grounding_and_contract_present", "assignee_set_cto", "human_gate_label_absent"], "note": "Gate-only Cortex hands off to CTO. Cortex MUST NOT author the fix."},
-    {"from": "Triage", "to": "Needs-MJ", "by": ["cortex", "mj"], "conditions": [], "note": "Consequential OR carries gate:human label OR classifier uncertain."},
-    {"from": "Triage", "to": "Backlog", "by": ["cortex", "mj"], "conditions": [], "note": "Defer / needs more context."},
-    {"from": "Triage", "to": "Canceled", "by": ["cortex", "mj"], "conditions": []},
-    {"from": "Todo", "to": "In Progress", "by": ["cto", "mj"], "conditions": [], "note": "CTO claims and starts the engine slice."},
-    {"from": "In Progress", "to": "In Review", "by": ["cto", "mj"], "conditions": ["worker_handoff_present"], "note": "Worker (delegate_task) handoff exists."},
-    {"from": "In Progress", "to": "Todo", "by": ["cto", "mj"], "conditions": [], "note": "Bounce/retry."},
-    {"from": "In Review", "to": "Done", "by": ["validator", "mj"], "conditions": ["classified_low_cost", "no_denied_surface", "validator_pass_independent", "human_gate_label_absent"], "note": "AUTO-DONE. All four conditions required. Any failure => route to Needs-MJ instead."},
-    {"from": "In Review", "to": "Needs-MJ", "by": ["validator", "mj"], "conditions": [], "note": "Consequential / denied-surface / uncertain / gate:human / not low-cost."},
-    {"from": "In Review", "to": "Todo", "by": ["validator", "mj"], "conditions": [], "note": "Validator BOUNCE — claims unsupported; retry."},
-    {"from": "Needs-MJ", "to": "Done", "by": ["mj"], "conditions": [], "note": "ONLY MJ closes a gated ticket."},
-    {"from": "Needs-MJ", "to": "Todo", "by": ["mj"], "conditions": [], "note": "Send back for rework."},
-    {"from": "Needs-MJ", "to": "Backlog", "by": ["mj"], "conditions": []},
-    {"from": "Needs-MJ", "to": "Canceled", "by": ["mj"], "conditions": []}
+    {
+      "from": "Backlog",
+      "to": "Triage",
+      "by": [
+        "cortex",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Cortex claims one eligible item for triage."
+    },
+    {
+      "from": "Backlog",
+      "to": "Canceled",
+      "by": [
+        "cortex",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Junk/duplicate/out-of-scope."
+    },
+    {
+      "from": "Triage",
+      "to": "Todo",
+      "by": [
+        "cortex",
+        "mj"
+      ],
+      "conditions": [
+        "grounding_and_contract_present",
+        "assignee_set_cto",
+        "human_gate_label_absent"
+      ],
+      "note": "Gate-only Cortex hands off to CTO. Cortex MUST NOT author the fix."
+    },
+    {
+      "from": "Triage",
+      "to": "Needs-MJ",
+      "by": [
+        "cortex",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Consequential OR carries gate:human label OR classifier uncertain."
+    },
+    {
+      "from": "Triage",
+      "to": "Backlog",
+      "by": [
+        "cortex",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Defer / needs more context."
+    },
+    {
+      "from": "Triage",
+      "to": "Canceled",
+      "by": [
+        "cortex",
+        "mj"
+      ],
+      "conditions": []
+    },
+    {
+      "from": "Todo",
+      "to": "In Progress",
+      "by": [
+        "cto",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "CTO claims and starts the engine slice."
+    },
+    {
+      "from": "In Progress",
+      "to": "In Review",
+      "by": [
+        "cto",
+        "mj"
+      ],
+      "conditions": [
+        "worker_handoff_present"
+      ],
+      "note": "Worker (delegate_task) handoff exists."
+    },
+    {
+      "from": "In Progress",
+      "to": "Todo",
+      "by": [
+        "cto",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Bounce/retry."
+    },
+    {
+      "from": "In Review",
+      "to": "Done",
+      "by": [
+        "validator",
+        "mj"
+      ],
+      "conditions": [
+        "classified_low_cost",
+        "no_denied_surface",
+        "validator_pass_independent",
+        "human_gate_label_absent"
+      ],
+      "note": "AUTO-DONE. All four conditions required. Any failure => route to Needs-MJ instead."
+    },
+    {
+      "from": "In Review",
+      "to": "Needs-MJ",
+      "by": [
+        "validator",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Consequential / denied-surface / uncertain / gate:human / not low-cost."
+    },
+    {
+      "from": "In Review",
+      "to": "Todo",
+      "by": [
+        "validator",
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Validator BOUNCE \u2014 claims unsupported; retry."
+    },
+    {
+      "from": "Needs-MJ",
+      "to": "Done",
+      "by": [
+        "mj"
+      ],
+      "conditions": [],
+      "note": "ONLY MJ closes a gated ticket."
+    },
+    {
+      "from": "Needs-MJ",
+      "to": "Todo",
+      "by": [
+        "mj"
+      ],
+      "conditions": [],
+      "note": "Send back for rework."
+    },
+    {
+      "from": "Needs-MJ",
+      "to": "Backlog",
+      "by": [
+        "mj"
+      ],
+      "conditions": []
+    },
+    {
+      "from": "Needs-MJ",
+      "to": "Canceled",
+      "by": [
+        "mj"
+      ],
+      "conditions": []
+    },
+    {
+      "from": "Approved",
+      "to": "Done",
+      "by": [
+        "integrator",
+        "mj"
+      ],
+      "conditions": [
+        "mj_approved",
+        "validator_pass_independent",
+        "landing_evidence_present"
+      ],
+      "note": "AGENTS-238 final hop. MJ's Approved IS the human closure decision; the Integrator performs the mechanical Done move and posts the human-language landed-summary. Empty landings are bounced before this point (AGENTS-244)."
+    }
   ],
   "producer_creates": {
     "into": "Backlog",
-    "by": ["producer", "sentinel", "cortex", "mj"],
+    "by": [
+      "producer",
+      "sentinel",
+      "cortex",
+      "mj"
+    ],
     "note": "New issues (incl. Sentinel regression re-opens) are CREATED in Backlog with a link back to the source issue. Sentinel never moves a Done card back; it creates a new linked ticket."
   },
   "human_override": {
@@ -42,7 +240,7 @@
     "note": "MJ can drag any card to any lane at any time; agents respect the new lane on their next tick."
   },
   "invariants": [
-    "Done is reachable only by mj (from Needs-MJ) OR by validator from In Review with ALL four auto-Done conditions true.",
+    "Done is reachable only by mj (from Needs-MJ), by validator from In Review with ALL four auto-Done conditions true, or by integrator from Approved after MJ's Approved decision with validator PASS + landing evidence (AGENTS-238).",
     "A ticket whose contract touches any denied_surface can NEVER auto-Done; it MUST route In Review -> Needs-MJ.",
     "Cortex is gate-only: it may not enter In Progress / In Review / Done, may not author fixes, may not write *VALIDATION* artifacts.",
     "auto-Done requires an independent validator PASS proven by REAL differing runtime session ids, not self-declared JSON labels.",

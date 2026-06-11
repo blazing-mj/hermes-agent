@@ -319,6 +319,80 @@ def _landing_evidence(conn: Any, ticket: str) -> dict[str, Any]:
     return {"ok": False}
 
 
+_RESTRICTED_WRITER = "/Users/alfred/.hermes/hermes-agent/scripts/restricted_linear_writer.py"
+
+
+def _compose_landed_summary(ticket: str, evidence: dict[str, Any], notes: str) -> str:
+    """Human-language landed summary (GATE-CARD-TEMPLATE tone): what changed,
+    where, and the rollback ref — readable by MJ without opening code."""
+    if evidence.get("kind") == "commit":
+        repo = Path(str(evidence.get("repo", ""))).name or "repo"
+        sha = str(evidence.get("sha", ""))[:9]
+        what = (
+            f"Landed: the approved change is committed in `{repo}` at `{sha}`.\n"
+            f"Rollback: `git -C {evidence.get('repo')} revert {sha}` restores the previous behavior."
+        )
+    else:
+        what = (
+            "Landed: investigation/no-code outcome — findings are recorded in this ticket's chain; "
+            "no code or config changed, so there is nothing to roll back."
+        )
+    notes_line = f"\nMJ constraints carried forward: {notes}" if notes else ""
+    return (
+        f"{what}\n"
+        "Validator: independent PASS. Gate: MJ approved on Linear; the Integrator completed the final "
+        "hop automatically (AGENTS-238). No trader/billprinter restart, credentials, live sends, money, "
+        f"or production/customer writes were performed.{notes_line}"
+    )
+
+
+def _integrator_finalize_linear(ticket: str, evidence: dict[str, Any], notes: str) -> dict[str, Any]:
+    """AGENTS-238 final hop: landed-summary comment + Approved→Done through the
+    gated restricted writer (allowlist tuple: Approved→Done by integrator).
+
+    Failure here must never un-land the run — the kanban chain already carries
+    the rollback story; the caller records this outcome either way.
+    """
+    import sys as _sys
+
+    proposal = {
+        "actions": [
+            {
+                "action": "comment",
+                "issue": ticket,
+                "body": _compose_landed_summary(ticket, evidence, notes),
+            },
+            {
+                "action": "status",
+                "issue": ticket,
+                "from": "Approved",
+                "to": "Done",
+                "by": "integrator",
+                "conditions": [
+                    "mj_approved",
+                    "validator_pass_independent",
+                    "landing_evidence_present",
+                ],
+            },
+        ]
+    }
+    try:
+        proc = subprocess.run(
+            [_sys.executable, _RESTRICTED_WRITER],
+            input=json.dumps(proposal),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return {
+            "done_moved": proc.returncode == 0,
+            "writer_rc": proc.returncode,
+            "writer_out": (proc.stdout or proc.stderr or "")[:400],
+        }
+    except Exception as exc:  # noqa: BLE001 - finalize failure must not unland the run
+        return {"done_moved": False, "reason": str(exc)[:200]}
+
+
 def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict[str, Any]:
     """Deterministically land the approved reversible Team OS continuation.
 
@@ -397,7 +471,9 @@ def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict
             ticket,
             f"FYI: {ticket} Integrator auto-landed the reversible Team OS continuation after your Linear Approved decision. No trader/billprinter restart, credentials, live sends, money, or production/customer writes were performed. Rollback is recorded on Linear/Kanban.",
         )
-        return {"status": "auto_landed", "board": board, "worker": worker_id, "integrator": integrator_id, "fyi_sent": bool(fyi.get("sent")), "fyi": fyi}
+        # AGENTS-238 final hop: ticket → Done + human-language landed-summary.
+        finalize = _integrator_finalize_linear(ticket, evidence, notes)
+        return {"status": "auto_landed", "board": board, "worker": worker_id, "integrator": integrator_id, "fyi_sent": bool(fyi.get("sent")), "fyi": fyi, "linear_finalize": finalize}
     finally:
         conn.close()
 
