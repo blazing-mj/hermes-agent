@@ -8,6 +8,7 @@
     "In Progress",
     "In Review",
     "Needs-MJ",
+    "Rejected",
     "Approved",
     "Done",
     "Canceled"
@@ -222,6 +223,15 @@
         "landing_evidence_present"
       ],
       "note": "AGENTS-238 final hop. MJ's Approved IS the human closure decision; the Integrator performs the mechanical Done move and posts the human-language landed-summary. Empty landings are bounced before this point (AGENTS-244)."
+    },
+    {
+      "from": "Needs-MJ",
+      "to": "Rejected",
+      "by": [
+        "mj"
+      ],
+      "conditions": [],
+      "note": "MJ rejects a gated card (Telegram Reject button or Linear move) \u2014 send back / do not ship."
     }
   ],
   "producer_creates": {

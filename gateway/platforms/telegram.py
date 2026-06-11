@@ -493,6 +493,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # previous approval remains pending and therefore fails closed.
         # (chat_id:user_id) -> (token, action)
         self._team_os_modify_capture: Dict[str, tuple] = {}
+        # AGENTS-243: Linear "Question" button parks here so MJ's next reply is
+        # posted as a comment on the ticket. (chat_id:user_id) -> ticket
+        self._team_os_linear_question_capture: Dict[str, str] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -2735,6 +2738,78 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_team_os_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def _run_team_os_linear_writer(self, proposal: dict) -> tuple[bool, str]:
+        """Run the gated restricted_linear_writer with a proposal. Returns (ok, detail).
+
+        The writer is the single mutation path for Team OS board moves — it
+        enforces the transition allowlist (or human_override for by='mj') and an
+        idempotent outbox, so a double-press cannot double-post.
+        """
+        import asyncio
+        import sys
+
+        writer = "/Users/alfred/.hermes/hermes-agent/scripts/restricted_linear_writer.py"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, writer,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(
+                proc.communicate(json.dumps(proposal).encode()), timeout=60
+            )
+            ok = proc.returncode == 0
+            return ok, (out or err or b"").decode("utf-8", "replace")[:300]
+        except Exception as exc:  # noqa: BLE001 - surfaced to the button presser
+            return False, str(exc)[:200]
+
+    async def _handle_team_os_linear_decision(
+        self, query, action: str, ticket: str, who: str, caller_id: str, chat_id,
+    ) -> None:
+        """Approve/Reject/Question a Needs-MJ ticket from its inline buttons.
+
+        The button does exactly ONE thing — move the Linear card via the gated
+        writer (as 'mj' = human override). The existing Linear webhook flow then
+        drives continuation/Integrator, so buttons and Linear never diverge.
+        Question parks a capture so MJ's next reply is posted as a comment.
+        """
+        if action in ("approve", "reject"):
+            to_lane = "Approved" if action == "approve" else "Rejected"
+            proposal = {"actions": [{
+                "action": "status", "issue": ticket,
+                "from": "Needs-MJ", "to": to_lane, "by": "mj",
+            }]}
+            ok, detail = await self._run_team_os_linear_writer(proposal)
+            if ok:
+                await query.answer(text=f"{'✅ Approved' if action == 'approve' else '❌ Rejected'}")
+                msg = (f"✅ {ticket} — Approved by {who}. It ships itself; you'll get a landed note."
+                       if action == "approve"
+                       else f"❌ {ticket} — Rejected by {who}. Sent back, not shipped.")
+            else:
+                await query.answer(text="Move failed — see message.")
+                msg = f"⚠️ {ticket}: couldn't move the card ({detail}). Decide in Linear."
+            try:
+                await query.edit_message_text(text=msg, reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        if action == "question":
+            capture_key = f"{chat_id if chat_id is not None else caller_id}:{caller_id}"
+            self._team_os_linear_question_capture[capture_key] = ticket
+            await query.answer(text="Reply with your question.")
+            try:
+                await query.edit_message_text(
+                    text=f"💬 {ticket}: reply to this with your question — I'll post it on the ticket.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        await query.answer(text="Unknown decision.")
+
     async def handle_team_os_stop(
         self,
         *,
@@ -3256,6 +3331,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Linear Needs-MJ decision buttons (lm:action:ticket) — AGENTS-243 ---
+        if data.startswith("lm:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                action, ticket = parts[1], parts[2]
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to decide tickets.")
+                    return
+                who = getattr(query.from_user, "first_name", "MJ") or "MJ"
+                await self._handle_team_os_linear_decision(query, action, ticket, who, caller_id, query_chat_id)
+            else:
+                await query.answer(text="Invalid decision data.")
             return
 
         # --- Team OS approval callbacks (ta:action:token) ---
@@ -5204,6 +5300,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if sender_user_id is None:
             return False
         capture_key = f"{chat_id}:{sender_user_id}"
+
+        # AGENTS-243: a parked Linear "Question" reply → post as a ticket comment.
+        ticket = self._team_os_linear_question_capture.pop(capture_key, None)
+        if ticket:
+            question = (getattr(msg, "text", None) or "").strip()
+            if question:
+                ok, detail = await self._run_team_os_linear_writer({
+                    "actions": [{"action": "comment", "issue": ticket,
+                                 "body": f"MJ question (via Telegram): {question}"}]
+                })
+                try:
+                    await self._bot.send_message(
+                        chat_id=int(chat_id),
+                        text=(f"💬 Posted your question on {ticket}." if ok
+                              else f"⚠️ Couldn't post to {ticket} ({detail})."),
+                        **self._link_preview_kwargs(),
+                    )
+                except Exception:
+                    pass
+            return True
+
         entry = self._team_os_modify_capture.pop(capture_key, None)
         if not entry:
             return False

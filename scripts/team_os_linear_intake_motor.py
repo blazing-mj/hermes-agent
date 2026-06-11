@@ -576,10 +576,18 @@ def _send_needs_mj_ping_once(state: TeamOSState, ticket: str, payload: dict[str,
         return {"sent": False, "reason": "already_sent"}
     assigned = _assign_to_viewer(ticket)
     body = _compose_needs_mj_message(ticket, payload, chain)
+    # AGENTS-243: inline Approve/Reject/Question buttons. A press moves the
+    # Linear card via the gated writer (gateway telegram callback); the existing
+    # webhook flow drives continuation, so buttons and Linear never diverge.
+    # callback_data: lm:<action>:<ticket> (well under Telegram's 64-byte cap).
+    keyboard = [
+        [("✅ Approve", f"lm:approve:{ticket}"), ("❌ Reject", f"lm:reject:{ticket}")],
+        [("💬 Question", f"lm:question:{ticket}")],
+    ]
     try:
         _load_env_file()
         from tools.send_message_tool import send_message_tool
-        send_result = send_message_tool({"target": "telegram", "message": body})
+        send_result = send_message_tool({"target": "telegram", "message": body, "inline_keyboard": keyboard})
     except Exception as exc:
         send_result = json.dumps({"error": str(exc)[:200]})
     try:

@@ -170,6 +170,7 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    inline_keyboard = args.get("inline_keyboard")  # Telegram-only: [[(text, callback_data)]]
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -300,6 +301,9 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        # Only thread inline_keyboard when present, so the common (button-less)
+        # call signature stays unchanged for callers and tests.
+        _kb = {"inline_keyboard": inline_keyboard} if inline_keyboard else {}
         result = _run_async(
             _send_to_platform(
                 platform,
@@ -309,6 +313,7 @@ def _handle_send(args):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
+                **_kb,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -555,7 +560,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, inline_keyboard=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -624,6 +629,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
+            # Only pass inline_keyboard when buttons are actually present, so the
+            # common (button-less) call path stays byte-for-byte unchanged.
+            _kb_kwargs = {"inline_keyboard": inline_keyboard} if (is_last and inline_keyboard) else {}
             result = await _send_telegram(
                 pconfig.token,
                 chat_id,
@@ -632,6 +640,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 disable_link_previews=disable_link_previews,
                 force_document=force_document,
+                **_kb_kwargs,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -810,13 +819,36 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+def _build_inline_keyboard(inline_keyboard):
+    """Build an InlineKeyboardMarkup from [[(text, callback_data), ...], ...].
+
+    Returns None on empty/invalid input so callers can pass it unconditionally.
+    """
+    if not inline_keyboard:
+        return None
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        rows = []
+        for row in inline_keyboard:
+            buttons = [InlineKeyboardButton(text=str(t), callback_data=str(cb)) for t, cb in row]
+            if buttons:
+                rows.append(buttons)
+        return InlineKeyboardMarkup(rows) if rows else None
+    except Exception:
+        return None
+
+
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, inline_keyboard=None):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
     so that bold, links, and headers render correctly.  If the message
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
+
+    ``inline_keyboard`` (optional): rows of (text, callback_data) tuples,
+    attached as a reply_markup on the text send. The polling gateway bot
+    receives the callback_query — see _handle_callback_query.
     """
     try:
         from telegram import Bot
@@ -895,6 +927,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         text_kwargs = dict(thread_kwargs)
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
+        _markup = _build_inline_keyboard(inline_keyboard)
+        if _markup is not None:
+            text_kwargs["reply_markup"] = _markup
 
         last_msg = None
         warnings = []
