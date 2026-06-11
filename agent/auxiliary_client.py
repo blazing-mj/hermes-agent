@@ -2096,6 +2096,33 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+# Chain entries that spend metered API credit (vs. subscription/local).
+# Consulted by _get_provider_chain() when auxiliary.subscription_only is set.
+_METERED_CHAIN_LABELS = frozenset({"openrouter", "nous", "api-key"})
+_subscription_only_logged = False
+
+
+def _read_aux_subscription_only() -> bool:
+    """True when config.yaml sets ``auxiliary.subscription_only``.
+
+    Box-level routing policy: auxiliary tasks may use the main
+    (subscription) provider and free local/custom endpoints, but must
+    never fall back to metered API providers (OpenRouter, Nous Portal,
+    direct API-key providers).  Explicit per-task overrides
+    (``auxiliary.<task>.provider``) are unaffected — an explicit pin is
+    the user's own call, not a silent fallback.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        aux = load_config().get("auxiliary", {})
+        if isinstance(aux, dict):
+            return bool(aux.get("subscription_only", False))
+    except Exception:
+        pass
+    return False
+
+
 def _get_provider_chain() -> List[tuple]:
     """Return the ordered provider detection chain.
 
@@ -2108,13 +2135,28 @@ def _get_provider_chain() -> List[tuple]:
     fails more often than not.  Codex is used only when the user's main
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
+
+    When ``auxiliary.subscription_only`` is set, metered entries
+    (``_METERED_CHAIN_LABELS``) are removed: subscription-only boxes
+    fail clean instead of burning API credit on side tasks.
     """
-    return [
+    global _subscription_only_logged
+    chain = [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
     ]
+    if _read_aux_subscription_only():
+        chain = [(label, fn) for label, fn in chain if label not in _METERED_CHAIN_LABELS]
+        if not _subscription_only_logged:
+            logger.info(
+                "Auxiliary: subscription_only is set — metered fallback "
+                "providers (%s) removed from the auto chain.",
+                ", ".join(sorted(_METERED_CHAIN_LABELS)),
+            )
+            _subscription_only_logged = True
+    return chain
 
 
 # ── Auxiliary "recently 402'd" unhealthy-provider cache ────────────────────

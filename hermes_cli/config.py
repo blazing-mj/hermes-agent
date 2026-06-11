@@ -1025,6 +1025,11 @@ DEFAULT_CONFIG = {
     # Each aux task is independent — main-agent provider_routing and
     # openrouter.min_coding_score do NOT propagate to aux calls by design.
     "auxiliary": {
+        # Box-level policy: when true, auxiliary auto-routing never falls back
+        # to metered API providers (OpenRouter, Nous, direct API keys) — only
+        # the main (subscription) provider and free local/custom endpoints.
+        # Explicit per-task provider pins still win.
+        "subscription_only": False,
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"

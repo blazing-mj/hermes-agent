@@ -1340,6 +1340,54 @@ class TestGetProviderChain:
             chain = _get_provider_chain()
         assert chain[0] == ("openrouter", sentinel)
 
+    def test_subscription_only_removes_metered_entries(self):
+        """auxiliary.subscription_only=true strips every metered provider
+        from the auto chain (AGENTS-122) — only free local/custom remains."""
+        with patch("agent.auxiliary_client._read_aux_subscription_only", return_value=True):
+            chain = _get_provider_chain()
+        labels = [label for label, _ in chain]
+        assert labels == ["local/custom"]
+
+    def test_subscription_only_off_keeps_full_chain(self):
+        with patch("agent.auxiliary_client._read_aux_subscription_only", return_value=False):
+            chain = _get_provider_chain()
+        labels = [label for label, _ in chain]
+        assert labels == ["openrouter", "nous", "local/custom", "api-key"]
+
+    def test_subscription_only_gates_payment_fallback(self):
+        """_try_payment_fallback iterates _get_provider_chain(), so the
+        subscription_only filter must keep it away from metered providers."""
+        from agent.auxiliary_client import _try_payment_fallback
+
+        called = []
+        def _spy_metered():
+            called.append("metered")
+            return None, None
+        def _spy_custom():
+            called.append("local/custom")
+            return None, None
+        with patch("agent.auxiliary_client._read_aux_subscription_only", return_value=True), \
+             patch("agent.auxiliary_client._try_openrouter", _spy_metered), \
+             patch("agent.auxiliary_client._try_nous", _spy_metered), \
+             patch("agent.auxiliary_client._try_custom_endpoint", _spy_custom), \
+             patch("agent.auxiliary_client._resolve_api_key_provider", _spy_metered):
+            client, model, label = _try_payment_fallback("anthropic", task="compression")
+        assert client is None
+        assert called == ["local/custom"]
+
+    def test_subscription_only_reads_config(self):
+        """_read_aux_subscription_only reads auxiliary.subscription_only."""
+        from agent.auxiliary_client import _read_aux_subscription_only
+
+        with patch("hermes_cli.config.load_config",
+                   return_value={"auxiliary": {"subscription_only": True}}):
+            assert _read_aux_subscription_only() is True
+        with patch("hermes_cli.config.load_config",
+                   return_value={"auxiliary": {}}):
+            assert _read_aux_subscription_only() is False
+        with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
+            assert _read_aux_subscription_only() is False
+
 
 class TestTryPaymentFallback:
     """_try_payment_fallback skips the failed provider and tries alternatives."""
