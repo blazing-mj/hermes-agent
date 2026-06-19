@@ -122,6 +122,24 @@ def test_allowed_actions_build_expected_linear_agent_argv(mod):
     assert calls[3] == ([mod.LINEAR_AGENT, "comment", "AGENTS-42", "-"], "Ship it")
 
 
+def test_type_field_is_accepted_as_action_alias_for_classifier_output(mod):
+    calls = []
+
+    def runner(argv, stdin=None):
+        calls.append((argv, stdin))
+        return "ok"
+
+    result = mod.execute_proposal(
+        {"actions": [{"type": "comment", "issue": "AGENTS-246", "body": "upstream watch note"}]},
+        runner=runner,
+    )
+
+    assert result["ok"] is True
+    assert result["executed"] == 1
+    assert result["denied"] == 0
+    assert calls == [([mod.LINEAR_AGENT, "comment", "AGENTS-246", "-"], "upstream watch note")]
+
+
 def test_default_runner_uses_subprocess_without_shell(mod, monkeypatch):
     calls = []
 

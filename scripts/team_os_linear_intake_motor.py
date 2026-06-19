@@ -373,6 +373,53 @@ def _brief_line(text: str, max_chars: int = 180) -> str:
     return compact[: max_chars - 1].rstrip() + "…"
 
 
+def _build_scoping_decision(ticket: str, payload: dict[str, Any], *, gated: bool) -> dict[str, Any]:
+    """Build the Linear scoping harness decision before worker dispatch.
+
+    This is the queue-not-loop guard from the agentic workflow audit: vague
+    issues get grilled in Linear and never reach a worker; clear reversible
+    Hermes issues get a mission/contract artifact attached before execution.
+    """
+
+    title = str(payload.get("title") or ticket).strip()
+    body = str(payload.get("body") or "").strip()
+    text = _payload_text(payload)
+    project = str(payload.get("project") or "")
+    labels = [str(x) for x in payload.get("labels", [])] if isinstance(payload.get("labels"), list) else []
+    vague_tokens = ("vague", "unclear", "tbd", "somehow", "figure out", "decide", "make it better", "improve the flow")
+    body_too_thin = len(body.split()) < 10
+    is_vague = any(token in text for token in vague_tokens) or body_too_thin
+    if is_vague:
+        comment = (
+            f"Linear scoping harness — {ticket}\n"
+            "CLASSIFICATION: Question\n"
+            "Worker dispatch: blocked until scope is clarified.\n\n"
+            "Grill-me questions:\n"
+            "- What exact behavior should change?\n"
+            "- What is explicitly out of scope?\n"
+            "- What proof would satisfy Done?\n"
+            "- Is this Hermes-only reversible work, or does it touch runtime/config/client systems?\n"
+            "- Should this be split into smaller Linear issues before a worker starts?"
+        )
+        return {"classification": "Question", "dispatch_allowed": False, "comment": comment}
+
+    allowed = "reversible code/tests/docs under Hermes/Linear only"
+    forbidden = "No OpenClaw/Vilimed/client work; no daemon restart; no credentials/providers; no external sends; no production/customer writes."
+    proof = "focused tests, verifier/readback, independent validator PASS/BOUNCE comment, and concise Linear proof before Done"
+    comment = (
+        f"MISSION/CONTRACT — {ticket}\n"
+        "CLASSIFICATION: Mission-Contract\n\n"
+        f"Problem: {title}\n"
+        f"Goal: {_brief_line(body or title, 420)}\n"
+        f"Project: {project or '<unknown>'}; labels={labels}.\n\n"
+        f"Allowed actions: {allowed}.\n"
+        f"Forbidden actions: {forbidden}\n"
+        f"Proof required: {proof}.\n"
+        f"Human gate: {'yes — gated surface detected' if gated else 'no for this reversible Hermes-only slice; required if scope expands'}."
+    )
+    return {"classification": "Mission-Contract", "dispatch_allowed": True, "comment": comment}
+
+
 def _build_cortex_triage_artifact(ticket: str, payload: dict[str, Any], *, gated: bool) -> dict[str, Any]:
     """Build the deterministic artifact shell for Cortex Triage Protocol v1.
 
@@ -657,8 +704,23 @@ def main() -> int:
 
     payload = dict(pick.card.get("payload") or {})
     gated = _is_gated(payload)
+    scoping_decision = _build_scoping_decision(picked, payload, gated=gated)
+    if not scoping_decision["dispatch_allowed"]:
+        _linear_status(picked, "Question")
+        _linear_comment(
+            picked,
+            "Autonomous Team OS intake selected this card after full Backlog reconcile, but the Linear scoping harness blocked worker dispatch because the issue is not specific enough.\n"
+            f"Wake source: {source.value}; wake issue: {WAKE_ISSUE or '<none>'}.\n"
+            f"Ledger: before={before_count}, added={list(result.added)}, removed={list(result.removed)}, current={result.current_count}.\n"
+            "No Kanban worker was created and no code/config/runtime changes were performed.\n\n"
+            f"{scoping_decision['comment']}"
+        )
+        summary.update({"gated": gated, "scoping": scoping_decision, "target_state": "Question"})
+        print(json.dumps(summary, sort_keys=True))
+        return 0
     triage_artifact = _build_cortex_triage_artifact(picked, payload, gated=gated)
     payload["triage_protocol"] = triage_artifact
+    payload["mission_contract"] = scoping_decision
     chain = _ensure_spine_chain(picked, payload, gated=gated)
     outbox = _queue_or_hold_outbox(state, payload, gated=gated)
     target_state = "Needs-MJ" if gated else "In Progress"
@@ -675,9 +737,10 @@ def main() -> int:
         f"Outbox: id={outbox.get('outbox_id')} state={outbox.get('outbox_state')}.\n"
         f"Next state: {target_state}; gated={gated}; needs_mj_ping={ping}.\n"
         "No trader/billprinter restart, credentials, external sends, or production writes were performed by intake.\n\n"
+        f"{scoping_decision['comment']}\n\n"
         f"{triage_artifact['comment']}"
     )
-    summary.update({"gated": gated, "triage_protocol": triage_artifact, "chain": chain, "outbox": outbox, "needs_mj_ping": ping, "target_state": target_state})
+    summary.update({"gated": gated, "scoping": scoping_decision, "triage_protocol": triage_artifact, "chain": chain, "outbox": outbox, "needs_mj_ping": ping, "target_state": target_state})
     print(json.dumps(summary, sort_keys=True))
     return 0
 

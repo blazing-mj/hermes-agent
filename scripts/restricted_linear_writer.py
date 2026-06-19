@@ -419,7 +419,7 @@ def _default_runner(argv: list[str], stdin: str | None = None) -> str:
 
 
 def _build_argv(action: dict[str, Any]) -> tuple[list[str], str | None, dict[str, Any] | None]:
-    kind = str(action.get("action") or "").strip().lower()
+    kind = str(action.get("action") or action.get("type") or "").strip().lower()
 
     if kind == "comment":
         issue = sanitize_text(action.get("issue") or action.get("id") or "").strip()
@@ -503,7 +503,11 @@ def execute_proposal(
     ledger_path = Path(ledger_dir)
 
     for action in _actions_from(proposal):
-        kind = str(action.get("action") or "").strip().lower()
+        # The unattended classifier prompt historically says “actions” and lists
+        # verbs, but LLMs sometimes emit {"type":"comment"} instead of
+        # {"action":"comment"}. Treat that as a surface-schema alias only;
+        # all allowlist and payload validation below still applies unchanged.
+        kind = str(action.get("action") or action.get("type") or "").strip().lower()
         if kind not in ALLOWED_ACTIONS:
             denied += 1
             messages.append(f"denied action {kind!r}: not in allowlist {sorted(ALLOWED_ACTIONS)}")

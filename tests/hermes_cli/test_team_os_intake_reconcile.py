@@ -307,3 +307,46 @@ def test_spine_body_sanitizes_validator_word_for_non_validator_stages():
     assert "Validator" not in body
     assert "validator" not in body
     assert "cold-reviewer" in body
+
+
+def test_scoping_harness_grills_vague_hermes_issue_before_worker_dispatch():
+    motor = _load_intake_motor()
+
+    payload = {
+        "title": "Make Linear better",
+        "body": "Let's improve the flow somehow. TBD. Need to decide what good looks like.",
+        "project": "Hermes System",
+        "labels": ["system:hermes", "type:ops"],
+        "url": "https://linear.example/AGENTS-272",
+    }
+
+    decision = motor._build_scoping_decision("AGENTS-272", payload, gated=False)
+
+    assert decision["classification"] == "Question"
+    assert decision["dispatch_allowed"] is False
+    assert "Grill-me questions" in decision["comment"]
+    assert "What exact behavior should change?" in decision["comment"]
+    assert "What proof would satisfy Done?" in decision["comment"]
+    assert "Worker dispatch: blocked until scope is clarified" in decision["comment"]
+
+
+def test_scoping_harness_writes_mission_contract_for_clear_hermes_issue():
+    motor = _load_intake_motor()
+
+    payload = {
+        "title": "Replace polling cron with Linear webhook doorbell",
+        "body": "Implement Hermes-only event intake for Linear status/comment changes. Scope: tests and reversible code only. No daemon restart, no credential changes, no OpenClaw or Vilimed changes.",
+        "project": "Hermes System",
+        "labels": ["system:hermes", "type:ops"],
+        "url": "https://linear.example/AGENTS-273",
+    }
+
+    decision = motor._build_scoping_decision("AGENTS-273", payload, gated=False)
+
+    assert decision["classification"] == "Mission-Contract"
+    assert decision["dispatch_allowed"] is True
+    assert "MISSION/CONTRACT — AGENTS-273" in decision["comment"]
+    assert "Allowed actions:" in decision["comment"]
+    assert "Forbidden actions:" in decision["comment"]
+    assert "Proof required:" in decision["comment"]
+    assert "No OpenClaw/Vilimed/client work" in decision["comment"]
