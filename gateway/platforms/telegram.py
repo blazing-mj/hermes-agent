@@ -2738,6 +2738,27 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_team_os_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    @staticmethod
+    def _humanize_linear_writer_error(detail: str) -> str:
+        """Turn the gated writer's raw JSON/CLI error into a one-line, plain-
+        English explanation for the button presser. Falls back to a generic
+        line so the user is never shown a stack of JSON."""
+        d = (detail or "").lower()
+        if "entity not found" in d or "not found: issue" in d:
+            return ("that ticket isn't in Linear anymore (already closed, moved, or the wrong "
+                    "board) — nothing to move. Open Linear to check.")
+        if "transition rejected" in d or "not in transition lane allowlist" in d or "allowlist" in d:
+            return ("that move isn't allowed from the card's current lane — it may have already "
+                    "left Needs-MJ. Open Linear to decide.")
+        if "missing conditions" in d:
+            return ("the move is missing a required condition (it's not ready to approve yet). "
+                    "Open Linear to check the card.")
+        if "timed out" in d or "timeout" in d:
+            return "Linear was slow to respond — try again, or decide in Linear."
+        if "secret" in d or "redacted" in d:
+            return "the move was blocked for safety (a secret-shaped value was detected). Decide in Linear."
+        return "Linear rejected the move. Open the card in Linear to decide."
+
     async def _run_team_os_linear_writer(self, proposal: dict) -> tuple[bool, str]:
         """Run the gated restricted_linear_writer with a proposal. Returns (ok, detail).
 
@@ -2787,8 +2808,8 @@ class TelegramAdapter(BasePlatformAdapter):
                        if action == "approve"
                        else f"❌ {ticket} — Rejected by {who}. Sent back, not shipped.")
             else:
-                await query.answer(text="Move failed — see message.")
-                msg = f"⚠️ {ticket}: couldn't move the card ({detail}). Decide in Linear."
+                await query.answer(text="Couldn't do that — see message.")
+                msg = f"⚠️ {ticket}: {self._humanize_linear_writer_error(detail)}"
             try:
                 await query.edit_message_text(text=msg, reply_markup=None)
             except Exception:
