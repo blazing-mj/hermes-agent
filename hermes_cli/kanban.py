@@ -225,6 +225,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- init ---
     sub.add_parser("init", help="Create kanban.db if missing (idempotent)")
 
+    p_recover = sub.add_parser(
+        "recover",
+        help="Salvage a corrupt board DB (sqlite .recover + atomic swap); keeps a backup",
+    )
+    p_recover.add_argument(
+        "board_slug",
+        nargs="?",
+        help="Board to recover (defaults to the active board; ignored with --all)",
+    )
+    p_recover.add_argument(
+        "--all",
+        action="store_true",
+        dest="recover_all",
+        help="Recover every board that is currently corrupt",
+    )
+    p_recover.add_argument(
+        "--allow-empty",
+        action="store_true",
+        dest="recover_allow_empty",
+        help="Permit swapping in a recovered DB even if zero tasks were salvaged",
+    )
+
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
         "boards",
@@ -860,6 +882,12 @@ def kanban_command(args: argparse.Namespace) -> int:
     if action == "boards":
         return _dispatch_boards(args)
 
+    # `recover` must bypass the auto-init below: the board DB is corrupt by
+    # definition here, and `kb.init_db()` would raise KanbanDbCorruptError
+    # before any handler runs. It resolves and recovers boards itself.
+    if action == "recover":
+        return _cmd_recover(args)
+
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
     # (rather than threading `board=` through 50+ kb.connect() sites)
@@ -1212,6 +1240,65 @@ def _parse_duration(val) -> Optional[int]:
             raise ValueError(f"malformed duration {val!r}") from exc
         return int(n * units[s[-1]])
     raise ValueError(f"malformed duration {val!r} (expected 30s, 5m, 2h, 1d, or a number)")
+
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    """Salvage corrupt board DB(s) via :func:`kanban_db.recover_corrupt_db`.
+
+    The data-preserving alternative to ``init``: runs sqlite ``.recover`` and
+    atomically swaps a clean DB in, always keeping a backup of the corrupt
+    original. Routed before the usual auto-init so a corrupt board can still be
+    repaired (auto-init would raise ``KanbanDbCorruptError`` on it).
+    """
+    recover_all = getattr(args, "recover_all", False)
+    allow_empty = getattr(args, "recover_allow_empty", False)
+
+    if recover_all:
+        targets = [b["slug"] for b in kb.list_boards(include_archived=True) if b.get("slug")]
+    else:
+        raw = getattr(args, "board_slug", None) or getattr(args, "board", None)
+        if raw:
+            try:
+                slug = kb._normalize_board_slug(raw)
+            except ValueError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            if not slug:
+                print("kanban: recover requires a board slug", file=sys.stderr)
+                return 2
+        else:
+            slug = kb.get_current_board()
+        targets = [slug]
+
+    rc = 0
+    recovered_any = False
+    for slug in targets:
+        path = kb.kanban_db_path(board=slug)
+        try:
+            result = kb.recover_corrupt_db(path, allow_empty=allow_empty)
+        except Exception as exc:  # defensive — recovery must never crash the CLI
+            print(f"kanban: recover crashed on board {slug!r}: {exc}", file=sys.stderr)
+            rc = 1
+            continue
+        if result.recovered:
+            recovered_any = True
+            print(
+                f"recovered board {slug!r}: {result.tasks} task(s) salvaged; "
+                f"clean DB swapped in (corrupt original kept at {result.backup_path})."
+            )
+        elif "healthy" in result.reason:
+            if not recover_all:
+                print(f"board {slug!r} is healthy ({result.tasks} task(s)); nothing to recover.")
+        elif result.reason.startswith("missing or empty"):
+            if not recover_all:
+                print(f"board {slug!r}: no database to recover.")
+        else:
+            print(f"kanban: could not recover board {slug!r}: {result.reason}", file=sys.stderr)
+            rc = 1
+
+    if recover_all and not recovered_any and rc == 0:
+        print("No corrupt boards found; nothing to recover.")
+    return rc
 
 
 def _cmd_init(args: argparse.Namespace) -> int:

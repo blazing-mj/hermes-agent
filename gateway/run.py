@@ -5798,6 +5798,11 @@ class GatewayRunner:
         disabled_corrupt_boards: dict[
             str, tuple[tuple[str, int | None, int | None], float]
         ] = {}
+        # Distinct corrupt fingerprints we've already tried to auto-recover, so
+        # an unrecoverable DB doesn't trigger a heavy `.recover` every tick. A
+        # *changed* (still-corrupt) fingerprint becomes eligible again.
+        healed_fingerprints: set[tuple[str, int | None, int | None]] = set()
+        auto_recover_enabled = bool(kanban_cfg.get("auto_recover", True))
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -5821,6 +5826,61 @@ class GatewayRunner:
             return (
                 "file is not a database" in msg
                 or "database disk image is malformed" in msg
+            )
+
+        def _quarantine_corrupt_board(
+            slug: str, fingerprint: "tuple[str, int | None, int | None]"
+        ) -> None:
+            """Auto-recover a corrupt board once per distinct corrupt fingerprint;
+            quarantine only if recovery is disabled, unavailable, or fails.
+
+            Auto-recovery (sqlite ``.recover`` + an atomic, WAL-safe swap that
+            always keeps a backup) lets the dispatcher self-heal instead of
+            sitting dead until a human intervenes. The worst case of a bad
+            recovery is identical to the prior behaviour minus the manual step,
+            because the corrupt original is always preserved as a backup.
+            """
+            if auto_recover_enabled and fingerprint not in healed_fingerprints:
+                healed_fingerprints.add(fingerprint)
+                result = None
+                try:
+                    result = _kb.recover_corrupt_db(_kb.kanban_db_path(slug))
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: auto-recover crashed on board %s", slug
+                    )
+                if result is not None and getattr(result, "recovered", False):
+                    logger.warning(
+                        "kanban dispatcher: board %s was corrupt (%s); auto-recovered "
+                        "%d task(s), backup at %s. Resuming dispatch.",
+                        slug,
+                        fingerprint[0],
+                        result.tasks,
+                        result.backup_path,
+                    )
+                    disabled_corrupt_boards.pop(slug, None)
+                    return
+                if result is not None and "healthy" in getattr(result, "reason", ""):
+                    logger.info(
+                        "kanban dispatcher: board %s already healthy on recover; resuming.",
+                        slug,
+                    )
+                    disabled_corrupt_boards.pop(slug, None)
+                    return
+                logger.error(
+                    "kanban dispatcher: board %s auto-recover did not succeed (%s).",
+                    slug,
+                    getattr(result, "reason", "crashed") if result else "crashed",
+                )
+            disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+            logger.error(
+                "kanban dispatcher: board %s database %s is not a valid SQLite "
+                "database; pausing dispatch until the file changes, the gateway "
+                "restarts, or the quarantine timer expires. Run "
+                "`hermes kanban recover` to salvage tasks (or `hermes kanban init` "
+                "to reset the board).",
+                slug,
+                fingerprint[0],
             )
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
@@ -5874,31 +5934,13 @@ class GatewayRunner:
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _quarantine_corrupt_board(slug, fingerprint)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _quarantine_corrupt_board(slug, fingerprint)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None

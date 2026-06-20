@@ -1135,7 +1135,9 @@ class KanbanDbCorruptError(RuntimeError):
         backup_str = str(backup_path) if backup_path is not None else "<backup failed>"
         super().__init__(
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
-            f"Original preserved; backup at {backup_str}."
+            f"Original preserved; backup at {backup_str}. "
+            f"Run `hermes kanban recover` to salvage tasks "
+            f"(or `hermes kanban init` to reset the board)."
         )
 
 
@@ -1249,6 +1251,192 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
+
+
+@dataclass
+class KanbanDbRecoverResult:
+    """Outcome of :func:`recover_corrupt_db`.
+
+    ``recovered`` is True only when a salvaged, integrity-clean DB was
+    atomically swapped in over the corrupt original. ``tasks`` is the row
+    count in the recovered ``tasks`` table; ``backup_path`` is the preserved
+    copy of the corrupt original (content-addressed ``.corrupt.<hash>.bak``).
+    ``reason`` is a short human-readable status, set on success and failure.
+    """
+
+    recovered: bool
+    path: Path
+    reason: str
+    tasks: int = 0
+    backup_path: Optional[Path] = None
+
+
+def _integrity_is_ok(path: Path) -> bool:
+    """True iff ``PRAGMA integrity_check`` returns ``ok`` for an openable DB.
+
+    Side-effect free: opens its own short-lived connection and never mutates
+    WAL state. A file SQLite refuses to open (bad header) or a malformed page
+    past the header both yield False.
+    """
+    try:
+        probe = sqlite3.connect(str(path), timeout=5.0)
+    except sqlite3.Error:
+        return False
+    try:
+        row = probe.execute("PRAGMA integrity_check").fetchone()
+        return bool(row) and (row[0] or "").strip().lower() == "ok"
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        probe.close()
+
+
+def _count_tasks(path: Path) -> int:
+    """Row count of the ``tasks`` table, or 0 if it can't be read."""
+    try:
+        probe = sqlite3.connect(str(path), timeout=5.0)
+    except sqlite3.Error:
+        return 0
+    try:
+        row = probe.execute("SELECT count(*) FROM tasks").fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.DatabaseError:
+        return 0
+    finally:
+        probe.close()
+
+
+def recover_corrupt_db(
+    path: Path,
+    *,
+    expected_min_tasks: int = 0,
+    allow_empty: bool = False,
+    timeout: float = 300.0,
+) -> KanbanDbRecoverResult:
+    """Salvage a corrupt kanban DB with ``sqlite3 .recover`` and atomically swap it in.
+
+    The data-preserving counterpart to ``hermes kanban init`` (which wipes the
+    board). Mirrors the manual SQLite recovery procedure:
+
+    1. No-op when the DB is missing, empty, or already healthy (idempotent).
+    2. Rebuild a *main-DB-only* snapshot via the ``sqlite3`` CLI's ``.recover``
+       into a temp DB — the slow step, run **without** the cross-process lock
+       so concurrent readers aren't blocked for seconds.
+    3. Verify the rebuilt DB passes ``integrity_check`` and clears the task
+       floor — refuse to swap an empty recovery over a DB that may have held
+       data (silent loss is worse than staying quarantined).
+    4. Under the cross-process init lock (held only for the fast swap):
+       re-confirm the live file is still corrupt, preserve it as a
+       content-addressed ``.corrupt.<hash>.bak``, delete the now-stale
+       ``-wal``/``-shm`` sidecars so SQLite can't replay them onto the new
+       file, then ``os.replace`` the clean DB in atomically.
+
+    WAL-safety is the point: replacing a DB file under another process's open
+    WAL connection is itself a corruptor, so the swap is an atomic same-dir
+    rename with the stale sidecars dropped. The corrupt original is always
+    preserved; on any verification failure the live file is left untouched.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        return KanbanDbRecoverResult(False, path, f"cannot resolve path: {exc}")
+    try:
+        if not resolved.exists() or resolved.stat().st_size == 0:
+            return KanbanDbRecoverResult(
+                False, resolved, "missing or empty; nothing to recover"
+            )
+    except OSError as exc:
+        return KanbanDbRecoverResult(False, resolved, f"cannot stat: {exc}")
+
+    if _integrity_is_ok(resolved):
+        return KanbanDbRecoverResult(
+            False, resolved, "already healthy", tasks=_count_tasks(resolved)
+        )
+
+    sqlite3_bin = shutil.which("sqlite3")
+    if not sqlite3_bin:
+        return KanbanDbRecoverResult(
+            False, resolved, "sqlite3 CLI not found on PATH; cannot run .recover"
+        )
+
+    parent = resolved.parent
+    pid = os.getpid()
+    snapshot = parent / f"{resolved.name}.recover-src.{pid}.tmp"
+    rebuilt = parent / f"{resolved.name}.recovered.{pid}.tmp"
+    try:
+        try:
+            shutil.copy2(resolved, snapshot)
+        except OSError as exc:
+            return KanbanDbRecoverResult(
+                False, resolved, f"could not snapshot corrupt DB: {exc}"
+            )
+
+        # Rebuild via `.recover` (reads the corrupt file structurally, bypassing
+        # the b-tree) then load the emitted SQL into a fresh DB.
+        try:
+            dump = subprocess.run(
+                [sqlite3_bin, str(snapshot), ".recover"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            subprocess.run(
+                [sqlite3_bin, str(rebuilt)],
+                input=dump.stdout,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return KanbanDbRecoverResult(False, resolved, f".recover failed: {exc}")
+
+        if not rebuilt.exists() or not _integrity_is_ok(rebuilt):
+            return KanbanDbRecoverResult(
+                False,
+                resolved,
+                "recovered DB still failed integrity_check; live file untouched",
+            )
+        tasks = _count_tasks(rebuilt)
+        floor = expected_min_tasks if allow_empty else max(expected_min_tasks, 1)
+        if tasks < floor:
+            return KanbanDbRecoverResult(
+                False,
+                resolved,
+                f"recovered only {tasks} task(s) (floor {floor}); "
+                f"refusing to swap to avoid silent data loss",
+                tasks=tasks,
+            )
+
+        with _cross_process_init_lock(resolved):
+            # Re-check under the lock: another process may have healed it while
+            # our slow rebuild ran.
+            if _integrity_is_ok(resolved):
+                return KanbanDbRecoverResult(
+                    False,
+                    resolved,
+                    "already healthy under lock; no swap needed",
+                    tasks=tasks,
+                )
+            backup = _backup_corrupt_db(resolved)
+            for suffix in ("-wal", "-shm"):
+                sidecar = parent / (resolved.name + suffix)
+                try:
+                    sidecar.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            os.replace(rebuilt, resolved)
+            _INITIALIZED_PATHS.discard(str(resolved))
+        return KanbanDbRecoverResult(
+            True, resolved, "recovered", tasks=tasks, backup_path=backup
+        )
+    finally:
+        for tmp in (snapshot, rebuilt):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def connect(
