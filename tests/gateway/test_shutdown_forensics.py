@@ -63,6 +63,17 @@ class TestSnapshotShutdownContext:
         assert "parent" in ctx
         assert ctx["parent"]["pid"] == os.getppid()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="no /proc or libproc")
+    def test_proc_summary_captures_cmdline_on_current_platform(self):
+        """The process cmdline must be captured on the *running* platform —
+        via /proc on Linux, via libproc on macOS. Regression guard for the
+        macOS-blindness bug: with no /proc and no libproc fallback, the
+        parent's identity (the key "who killed us" signal) came back empty.
+        """
+        summary = sf._proc_summary(os.getpid())
+        assert summary["pid"] == os.getpid()
+        assert summary.get("cmdline"), "no cmdline captured for the current process"
+
     def test_under_systemd_flag_uses_invocation_id(self, monkeypatch):
         monkeypatch.setenv("INVOCATION_ID", "abc123")
         ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
@@ -176,6 +187,14 @@ class TestSpawnAsyncDiagnostic:
         contents = log_path.read_text(encoding="utf-8", errors="replace")
         assert "shutdown diagnostic" in contents
         assert "SIGTERM" in contents
+        # The diagnostic must capture REAL data, not just headers. Regression
+        # guard for the macOS-blindness bug, where the Linux-only commands
+        # (ps auxf / pstree / dmesg / cat /proc/*) produced empty sections.
+        assert "=== end ===" in contents, "diagnostic did not run to completion"
+        assert "python" in contents.lower() or str(os.getpid()) in contents, \
+            "diagnostic captured no process-table data"
+        if sys.platform == "darwin":
+            assert "Pages" in contents, "vm_stat memory snapshot missing on macOS"
 
     def test_returns_none_on_windows(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sf, "sys", type("M", (), {"platform": "win32"})())
