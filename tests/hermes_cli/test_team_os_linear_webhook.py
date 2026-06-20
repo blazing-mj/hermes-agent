@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from pathlib import Path as _P
+ROOT_HA=_P("/Users/alfred/.hermes/hermes-agent")
 from hermes_cli.team_os.db import TeamOSState
 
 
@@ -548,3 +550,75 @@ def test_restricted_writer_allowlist_accepts_integrator_final_hop():
             "action": "status", "issue": "AGENTS-238", "from": "Approved", "to": "Done",
             "by": "cortex", "conditions": ["mj_approved", "validator_pass_independent", "landing_evidence_present"],
         })
+
+
+# ── Hard-pause gate (kill-switch) + non-dispatchable spine markers ──────────
+
+
+def test_webhook_hard_pause_ignores_approved_and_does_not_land(tmp_path, monkeypatch):
+    """With the kill-switch enabled, an Approved webhook must NOT land."""
+    from hermes_cli.team_os import linear_webhook as lw
+    from hermes_cli.team_os.db import TeamOSState
+
+    monkeypatch.setattr(lw, "_team_os_paused", lambda: True)
+    state = TeamOSState(tmp_path / "t.db")
+    landed = []
+    payload = _issue_payload("Approved", issue_id="AGENTS-900", previous="Needs-MJ")
+    res = lw.handle_linear_webhook(
+        payload, state=state, add_comment=lambda *a, **k: None,
+        run_integrator_auto_land=lambda *a, **k: landed.append(1) or {"status": "auto_landed"},
+    )
+    assert res["decision"] == "ignored"
+    assert "paused" in res["reason"]
+    assert landed == []  # nothing landed while paused
+
+
+def test_webhook_hard_pause_ignores_doorbell(tmp_path, monkeypatch):
+    from hermes_cli.team_os import linear_webhook as lw
+    from hermes_cli.team_os.db import TeamOSState
+
+    monkeypatch.setattr(lw, "_team_os_paused", lambda: True)
+    woke = []
+    payload = _issue_payload("Backlog", issue_id="AGENTS-901", previous="Triage")
+    res = lw.handle_linear_webhook(
+        payload, state=TeamOSState(tmp_path / "t.db"), add_comment=lambda *a, **k: None,
+        run_intake_wake=lambda **k: woke.append(1) or {"started": True},
+    )
+    assert res["decision"] == "ignored" and "paused" in res["reason"]
+    assert woke == []  # no intake spawned while paused
+
+
+def test_webhook_processes_normally_when_not_paused(tmp_path, monkeypatch):
+    """Regression: with pause OFF, the webhook still handles events."""
+    from hermes_cli.team_os import linear_webhook as lw
+    from hermes_cli.team_os.db import TeamOSState
+
+    monkeypatch.setattr(lw, "_team_os_paused", lambda: False)
+    state = TeamOSState(tmp_path / "t.db")
+    payload = _issue_payload("Backlog", issue_id="AGENTS-902", previous="Triage")
+    woke = []
+    res = lw.handle_linear_webhook(
+        payload, state=state, add_comment=lambda *a, **k: None,
+        run_intake_wake=lambda **k: woke.append(1) or {"started": True},
+    )
+    assert res.get("decision") != "ignored" or "paused" not in str(res.get("reason", ""))
+
+
+def test_kill_switch_path_honors_hermes_home(monkeypatch, tmp_path):
+    from hermes_cli.team_os import linear_webhook as lw
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    p = lw._kill_switch_path()
+    assert p == tmp_path / "state" / "team-os-kill-switch.json"
+
+
+def test_spine_markers_use_non_dispatchable_assignee():
+    """Fix 1: spine tasks must NOT use a real-profile assignee, or the kanban
+    dispatcher tries to spawn the control-plane markers (the jam we hit)."""
+    src = (ROOT_HA / "scripts" / "team_os_linear_intake_motor.py").read_text()
+    start = src.index("stages = [")
+    block = src[start:src.index("\n\n", start)]  # the stages = [...] literal
+    assert block.count('"team-os"') >= 4, "spine stages must use the non-profile control-plane label"
+    for real_profile in ('"default", ["', '"cortex", ["', '"cto", ["', '"claude-max-code"'):
+        assert real_profile not in block, f"spine still uses dispatchable assignee {real_profile!r}"
+    wh = (ROOT_HA / "hermes_cli" / "team_os" / "linear_webhook.py").read_text()
+    assert 'assignee="team-os"' in wh and 'assignee="default"' not in wh

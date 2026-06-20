@@ -447,7 +447,7 @@ def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict
                 "Scope: reversible Team OS continuation marker only. No trader/billprinter restart, credentials, live sends, money, or production/customer writes.\n"
                 f"MJ notes: {notes or '<none>'}"
             ),
-            assignee="default",
+            assignee="team-os",  # control-plane marker — non-profile so the kanban dispatcher skips it
             created_by="team-os-integrator",
             workspace_kind="dir",
             idempotency_key=f"linear:{ticket}:spine:integrator",
@@ -490,6 +490,27 @@ def _question_reply(issue_id: str, title: str, comment_body: str) -> str:
     )
 
 
+def _kill_switch_path() -> Path:
+    """Global Team OS kill-switch file. Honors HERMES_HOME (so test isolation
+    and profile homes resolve correctly), defaulting to ~/.hermes — the root
+    home the main gateway that serves this webhook runs under."""
+    home = os.environ.get("HERMES_HOME", "").strip() or "~/.hermes"
+    return Path(home).expanduser() / "state" / "team-os-kill-switch.json"
+
+
+def _team_os_paused() -> bool:
+    """Team OS hard-pause gate. ``KillSwitch`` fails CLOSED on a corrupt/
+    unreadable state file (treats it as enabled), and this wrapper also returns
+    True on any unexpected error — so the webhook errs toward NOT landing when
+    the pause state can't be determined. Pending decisions are recovered by the
+    intake sweep once the pause is lifted, so nothing is lost."""
+    try:
+        from .kill_switch import KillSwitch
+        return KillSwitch(_kill_switch_path()).is_enabled()
+    except Exception:
+        return True
+
+
 def handle_linear_webhook(
     payload: dict[str, Any],
     *,
@@ -505,10 +526,16 @@ def handle_linear_webhook(
     - Comment created on a Needs-MJ issue.
 
     Low-cost or unrelated cards are ignored: no assignment, no ping, no comment.
+    When the Team OS kill-switch is enabled this is a HARD pause: nothing is
+    processed (no doorbell intake, no approval landing) — pending Approved/
+    Rejected cards are reconciled by the intake sweep when the pause lifts.
     """
     issue_id = _issue_identifier(payload)
     if not issue_id:
         return {"decision": "ignored", "reason": "missing issue identifier"}
+
+    if _team_os_paused():
+        return {"decision": "ignored", "reason": "team-os paused (kill-switch)", "issue": issue_id}
 
     if _is_backlog_intake_doorbell(payload):
         wake = run_intake_wake(issue_id=issue_id, wake_source="doorbell")

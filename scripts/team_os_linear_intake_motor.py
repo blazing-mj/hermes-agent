@@ -503,11 +503,21 @@ def _ensure_spine_chain(ticket: str, payload: dict[str, Any], *, gated: bool) ->
     board = str(payload.get("board") or BOARD_BY_PROJECT.get(str(payload.get("project") or ""), "hermes-system"))
     conn = kanban_db.connect(board=board)
     try:
+        # Spine tasks are TeamOS control-plane MARKERS, completed by the TeamOS
+        # state machine (intake bootstrap / webhook / integrator) — they are NOT
+        # generic kanban work. Their assignee must therefore be a non-profile
+        # label so the embedded kanban dispatcher skips them (same mechanism
+        # that excludes control-plane lanes like orion-cc). Previously the
+        # worker used "default" (a real profile) + workspace_kind="dir" with no
+        # workspace_path, so once unblocked it went ready, the dispatcher tried
+        # to spawn it, and failed every tick ("workspace_kind=dir but no
+        # workspace_path") — jamming the whole dispatcher. The real worker runs
+        # via the Cortex outbox path (run_worker), never this marker.
         stages = [
-            ("cortex", f"{ticket} Cortex triage / grounding", "cortex", []),
-            ("cto", f"{ticket} CTO contract", "cto", ["cortex"]),
-            ("worker", f"{ticket} Worker implementation / gated handoff", "default", ["cto"]),
-            ("validator", f"{ticket} Validator independent proof", "claude-max-code", ["worker"]),
+            ("cortex", f"{ticket} Cortex triage / grounding", "team-os", []),
+            ("cto", f"{ticket} CTO contract", "team-os", ["cortex"]),
+            ("worker", f"{ticket} Worker implementation / gated handoff", "team-os", ["cto"]),
+            ("validator", f"{ticket} Validator independent proof", "team-os", ["worker"]),
         ]
         ids: dict[str, str] = {}
         for stage, title, assignee, parent_stages in stages:
@@ -649,8 +659,9 @@ def _send_needs_mj_ping_once(state: TeamOSState, ticket: str, payload: dict[str,
 
 
 def _loop_paused() -> bool:
-    """MJ pause button (scripts/team_os_control.py). Paused = stop NEW picks;
-    decisions and in-flight chains are unaffected."""
+    """MJ pause button (scripts/team_os_control.py). HARD pause: stops NEW picks
+    AND decision processing/landing, so a paused Team OS advances nothing.
+    Pending Approved/Rejected cards are reconciled by the sweep once unpaused."""
     try:
         ks = os.path.expanduser("~/.hermes/state/team-os-kill-switch.json")
         if os.path.exists(ks):
@@ -663,15 +674,23 @@ def _loop_paused() -> bool:
 
 def main() -> int:
     state = TeamOSState(STATE_DB)
+    paused = _loop_paused()
     cards = fetch_backlog_cards(PROJECTS)
     decision_error = ""
-    try:
-        decision_cards = fetch_decision_cards(PROJECTS)
-        decision_results = reconcile_pending_decisions(state, decision_cards)
-    except Exception as exc:
+    if paused:
+        # Hard pause: do not process MJ decisions / landings while paused. The
+        # sweep re-reads Linear and reconciles any pending Approved/Rejected
+        # cards on the first unpaused tick, so no decision is lost.
         decision_cards = []
         decision_results = []
-        decision_error = str(exc)[:300]
+    else:
+        try:
+            decision_cards = fetch_decision_cards(PROJECTS)
+            decision_results = reconcile_pending_decisions(state, decision_cards)
+        except Exception as exc:
+            decision_cards = []
+            decision_results = []
+            decision_error = str(exc)[:300]
     try:
         source = WakeSource(WAKE_SOURCE)
     except ValueError:
@@ -679,7 +698,6 @@ def main() -> int:
     before_count = len(state.list_intake_candidates())
     result = reconcile_full_backlog(state=state, backlog_cards=cards, wake_source=source)
     pick = pick_one_after_reconcile(state=state, busy=active_work_busy() or bool(decision_results))
-    paused = _loop_paused()
     picked = None if paused else (pick.card["id"] if pick.card else None)
     summary = {
         "status": "paused" if (paused and not decision_results) else ("decision_processed" if decision_results else ("busy" if pick.busy else ("picked" if picked else "empty"))),
