@@ -26,6 +26,7 @@ if str(HERMES_REPO) not in sys.path:
 
 from hermes_cli import kanban_db
 from hermes_cli.team_os.cortex_agent import cortex_audit
+from hermes_cli.team_os.cto_agent import cto_contract
 from hermes_cli.team_os.db import TeamOSState
 from hermes_cli.team_os.event_router import route_linear_observation
 from hermes_cli.team_os.intake_reconcile import WakeSource, pick_one_after_reconcile, reconcile_full_backlog
@@ -730,6 +731,10 @@ def main() -> int:
     cortex_verdict = cortex_audit(payload, keyword_gated=keyword_gated)
     gated = bool(cortex_verdict["gated"])
     payload["cortex_audit"] = cortex_verdict
+    # Stage B: the real CTO scopes the work into a contract (off by default via
+    # TEAM_OS_CTO_AGENT → template fallback). Attached as metadata for the
+    # worker (Stage C, still inactive); does not affect the live gate decision.
+    payload["cto_contract"] = cto_contract(payload, cortex_verdict)
     scoping_decision = _build_scoping_decision(picked, payload, gated=gated)
     if not scoping_decision["dispatch_allowed"]:
         _linear_status(picked, "Question")
