@@ -5338,6 +5338,7 @@ def _record_task_failure(
     failure_limit: int = None,
     release_claim: bool = False,
     end_run: bool = False,
+    force_block: bool = False,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -5399,8 +5400,9 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if failures >= effective_limit:
-            # Trip the breaker.
+        if force_block or failures >= effective_limit:
+            # Trip the breaker (or block immediately on a permanent,
+            # non-retryable failure when ``force_block`` is set).
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
@@ -5440,6 +5442,7 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "forced": force_block,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
@@ -5491,6 +5494,7 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    force_block: bool = False,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -5498,6 +5502,7 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        force_block=force_block,
     )
 
 
@@ -5615,22 +5620,30 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile AND which the dispatcher
+    would actually attempt to spawn this tick (i.e. it is not being held
+    by :func:`check_respawn_guard`).
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
+    work waiting → usually broken venv/PATH/credentials) or a "correctly
+    idle / correctly held" condition. Tasks that are only *nominally* ready
+    but the dispatcher is deliberately deferring this tick — auth/quota
+    backoff, a recent successful run awaiting review, or an already-open PR
+    (see :func:`check_respawn_guard`) — must NOT count as stuck, or the
+    warning cries wolf and blames infra for a per-task hold. Tasks with a
+    permanent workspace-config error no longer reach here: they are blocked
+    on the first dispatch attempt.
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     if not rows:
         return False
@@ -5640,8 +5653,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
+        if not profile_exists(row["assignee"]):
+            continue
+        if check_respawn_guard(conn, row["id"]) is not None:
+            # Dispatcher is deliberately holding this task this tick
+            # (backoff / recent success / active PR) — not a stuck signal.
+            continue
+        return True
     return False
 
 
@@ -5855,7 +5873,22 @@ def dispatch_once(
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
+        except ValueError as exc:
+            # Permanent workspace-config error (dir without a path,
+            # non-absolute path, unknown kind): retrying can never fix it,
+            # so block the task immediately instead of slow-failing across
+            # many ticks. A lingering unspawnable task also tripped the
+            # dispatcher's "stuck" health warning with a misleading
+            # "check venv/PATH/credentials" cause.
+            _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit, force_block=True,
+            )
+            result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
+            # Transient failure (e.g. mkdir hit a full disk): record it and
+            # let the circuit breaker trip after ``failure_limit`` retries.
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -5941,7 +5974,22 @@ def dispatch_once(
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
+        except ValueError as exc:
+            # Permanent workspace-config error (dir without a path,
+            # non-absolute path, unknown kind): retrying can never fix it,
+            # so block the task immediately instead of slow-failing across
+            # many ticks. A lingering unspawnable task also tripped the
+            # dispatcher's "stuck" health warning with a misleading
+            # "check venv/PATH/credentials" cause.
+            _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit, force_block=True,
+            )
+            result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
+            # Transient failure (e.g. mkdir hit a full disk): record it and
+            # let the circuit breaker trip after ``failure_limit`` retries.
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,

@@ -332,14 +332,20 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         conn.close()
 
 
-def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spawnable):
-    """`dir:` workspace with no path should fail workspace resolution AND
-    count against the failure budget — not just crash the tick."""
+def test_workspace_resolution_failure_blocks_immediately(kanban_home, all_assignees_spawnable):
+    """`dir:` workspace with no path is a permanent, non-retryable config
+    error. It must fail workspace resolution AND block on the FIRST attempt
+    (``force_block``) — retrying a deterministic failure only wastes ticks
+    and previously left such tasks lingering in ``ready``, tripping the
+    dispatcher's false "stuck: check venv/PATH/credentials" warning. The
+    failure still counts (counter=1) and funnels through the unified failure
+    path, so the original "must count, never loop forever" guarantee holds —
+    just sooner.
+    """
     conn = kb.connect()
     try:
-        # Manually insert a broken task: dir workspace but workspace_path is NULL
-        # after initial create. We achieve this by creating via kanban_db then
-        # UPDATE-ing workspace_path to NULL.
+        # A dir workspace whose path is NULL (the shape real legacy tasks
+        # ended up in): created with a path, then UPDATE-d to NULL.
         tid = kb.create_task(
             conn, title="x", assignee="worker",
             workspace_kind="dir", workspace_path="/tmp/kanban_e2e_dir",
@@ -349,16 +355,11 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
                 "UPDATE tasks SET workspace_path = NULL WHERE id = ?", (tid,),
             )
         res = kb.dispatch_once(conn, failure_limit=3)
-        task = kb.get_task(conn, tid)
-        assert task.consecutive_failures == 1
-        assert task.status == "ready"
-        assert task.last_failure_error and "workspace" in task.last_failure_error
-        # Run twice more → auto-blocked.
-        kb.dispatch_once(conn, failure_limit=3)
-        res = kb.dispatch_once(conn, failure_limit=3)
         assert tid in res.auto_blocked
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.consecutive_failures == 1   # counted, not silently looped
+        assert task.status == "blocked"         # blocked immediately, not after the budget
+        assert task.last_failure_error and "workspace" in task.last_failure_error
     finally:
         conn.close()
 
