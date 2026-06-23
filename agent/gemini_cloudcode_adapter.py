@@ -243,9 +243,14 @@ def _normalize_thinking_config(config: Any) -> Optional[Dict[str, Any]]:
     level = config.get("thinkingLevel", config.get("thinking_level"))
     include = config.get("includeThoughts", config.get("include_thoughts"))
     normalized: Dict[str, Any] = {}
-    if isinstance(budget, (int, float)):
+    has_level = isinstance(level, str) and bool(level.strip())
+    # Gemini rejects a request that sets BOTH thinkingBudget and thinkingLevel
+    # (HTTP 400: "you can only set one of thinking budget and thinking level").
+    # Prefer the level (Gemini 3.x API) and drop the budget (2.5-era) when both
+    # are present; sending both silently muted the fallback.
+    if isinstance(budget, (int, float)) and not has_level:
         normalized["thinkingBudget"] = int(budget)
-    if isinstance(level, str) and level.strip():
+    if has_level:
         normalized["thinkingLevel"] = level.strip().lower()
     if isinstance(include, bool):
         normalized["includeThoughts"] = include
