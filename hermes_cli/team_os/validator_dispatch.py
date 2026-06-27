@@ -10,10 +10,10 @@ Safety / rollout:
   • OFF by default (``TEAM_OS_VALIDATOR_DISPATCH``); flag-off → not run.
   • FAIL-CLOSED: any error → verdict BOUNCE (never let unreviewed work pass
     because the validator crashed).
-  • Independent session: the validator runs as its own claude rail invocation,
-    separate from the worker's session. For true CROSS-MODEL review, point the
-    validator at a different model than the worker via ``review_cmd`` — the
-    worker uses opus, so a different validator model is the stronger setup.
+  • CROSS-MODEL by default: the verifier runs on CODEX (gpt-5.5 via the ChatGPT
+    subscription) while the Worker runs on opus (Claude) — a genuinely different
+    model, so the verifier doesn't share the builder's blind spots. Callers can
+    still inject their own reviewer/review_cmd to override.
   • No board writes / side effects — returns a verdict dict only.
 """
 from __future__ import annotations
@@ -28,6 +28,33 @@ Reviewer = Callable[[str], str]
 
 _STATE = Path.home() / ".hermes" / "state"
 _BOUNCE_STATE = _STATE / "team-os-validator-bounce.json"
+_HERMES = os.environ.get("HERMES_BIN", str(Path.home() / ".local" / "bin" / "hermes"))
+
+
+def codex_reviewer(prompt: str, *, timeout: float = 120.0) -> str:
+    """CROSS-MODEL verifier: run the validation on CODEX (gpt-5.5 via the ChatGPT
+    subscription) — a DIFFERENT model than the Worker (Claude/opus), so the
+    verifier does not share the builder's blind spots (true Builder≠Verifier
+    independence, per the over-engineering-gate plan). No tools — pure judgment.
+
+    Returns the model's text (the validator parses 'VERDICT: PASS|BOUNCE' from
+    it). Returns '' on any error → the validator fails CLOSED to BOUNCE, so a
+    codex outage over-blocks rather than rubber-stamps. Never raises."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [_HERMES, "chat", "-Q", "--provider", "openai-codex", "-m", "gpt-5.5",
+             "--no-tools", "-q", prompt],
+            capture_output=True, text=True, timeout=timeout, check=False,
+            # cron/launchd give a minimal PATH that lacks ~/.local/bin — make it explicit.
+            env={**os.environ, "PATH": f"{Path.home()}/.local/bin:/opt/homebrew/bin:" + os.environ.get("PATH", "")},
+        )
+        # strip the 'session_id:' line + blanks (same shape the cron scripts expect)
+        lines = [l for l in (proc.stdout or "").splitlines()
+                 if not l.startswith("session_id:") and l.strip()]
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 - verifier failure must fail closed, never raise
+        return ""
 
 
 def dispatch_validator(
@@ -71,6 +98,11 @@ def dispatch_validator(
         hpath = tmp / "handoff.json"
         cpath.write_text(json.dumps(contract), encoding="utf-8")
         hpath.write_text(json.dumps(handoff), encoding="utf-8")
+        # Default verifier = CODEX (cross-model from the opus Worker). Callers can
+        # still inject a reviewer/review_cmd (tests do); only when neither is given
+        # do we use codex instead of the engine's same-model opus default.
+        if reviewer is None and review_cmd is None:
+            reviewer = codex_reviewer
         result = run_validator(
             contract_path=cpath, handoff_path=hpath, state_path=sp,
             reviewer=reviewer, review_cmd=review_cmd,

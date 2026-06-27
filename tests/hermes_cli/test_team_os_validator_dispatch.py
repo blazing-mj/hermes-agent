@@ -65,3 +65,25 @@ def test_garbage_verdict_fails_closed(tmp_path):
     out = dispatch_validator(CONTRACT, HANDOFF, reviewer=lambda p: "the model rambled",
                              state_path=tmp_path / "b.json", enabled=True)
     assert out["verdict"] == "BOUNCE"
+
+
+def test_default_verifier_is_codex_cross_model(monkeypatch, tmp_path):
+    """With no reviewer injected, the verifier defaults to codex (cross-model
+    from the opus worker), not the engine's same-model opus default."""
+    import hermes_cli.team_os.validator_dispatch as vd
+    used = {}
+
+    def _fake_codex(p, **k):
+        used["called"] = True
+        return "VERDICT: PASS"
+
+    monkeypatch.setattr(vd, "codex_reviewer", _fake_codex)
+    out = vd.dispatch_validator(CONTRACT, HANDOFF, state_path=tmp_path / "b.json", enabled=True)
+    assert used.get("called") is True and out["verdict"] == "PASS"
+
+
+def test_codex_reviewer_empty_on_error_fails_closed(monkeypatch):
+    import hermes_cli.team_os.validator_dispatch as vd
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("codex down")))
+    assert vd.codex_reviewer("x") == ""  # error → empty → validator bounces
