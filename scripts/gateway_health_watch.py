@@ -64,13 +64,13 @@ _TERMINAL_RE = re.compile(
     r"could not generate a response",
     re.I,
 )
-# Recovery / liveness markers in the SAME window ⇒ the system kept working;
-# suppress the terminal alert (avoids false-positive on a recovered blip).
-_RECOVERY_RE = re.compile(
-    r"falling back to|switched to|retrying with|\b✓\b|connected|"
-    r"response (?:sent|delivered)",
-    re.I,
-)
+# MODEL-CHAIN recovery markers only: the chain found an alternative provider in
+# the same window ⇒ the terminal failure was recovered, not an outage. Kept
+# deliberately NARROW — transport/channel signals (✓ connected, response sent)
+# are NOT model recovery, and including them risks suppressing a real
+# alive-but-model-failing outage (a false-negative, the worst failure for a
+# safety floor).
+_RECOVERY_RE = re.compile(r"falling back to|switched to|retrying with", re.I)
 # Log line timestamp: "2026-06-27 20:17:05,760 ..."
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 

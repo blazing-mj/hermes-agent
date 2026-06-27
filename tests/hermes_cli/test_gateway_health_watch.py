@@ -63,6 +63,12 @@ class TestModelChainFailure:
         lines = ["API call failed error_type=AuthenticationError 401 token is expired"] * 3
         assert any(x.kind == "model_chain_failed" for x in ghw.detect(_inp(new_error_lines=lines)))
 
+    def test_transport_noise_does_not_suppress_real_outage(self):
+        # a channel reconnect ("✓ telegram connected") is NOT model recovery —
+        # it must NOT suppress a genuine model-chain outage alert (false-negative guard)
+        lines = ["no Codex OAuth token"] * 3 + ["✓ telegram connected", "response sent"]
+        assert any(x.kind == "model_chain_failed" for x in ghw.detect(_inp(new_error_lines=lines)))
+
 
 class TestTimestampParsing:
     def test_parses_real_format(self):
