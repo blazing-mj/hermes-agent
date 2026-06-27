@@ -571,6 +571,22 @@ def handle_linear_webhook(
     if comment_decision == _APPROVED or current == _APPROVED:
         apply_mj_decision(state, row, decision=_APPROVED, note=note)
         kanban_result = unblock_approved_kanban_worker(issue_id, _kanban_project_from_row(row))
+        # WIRE (Stage E hook, dormant): MJ approved a gated ticket → run the real
+        # Worker→Validator on its contract BEFORE the Integrator lands (so there's
+        # a real commit for the no-empty-landing gate). MJ's approval satisfies
+        # the human gate, so clear it for this run. execute_spine self-gates on
+        # TEAM_OS_WORKER_DISPATCH/VALIDATOR_DISPATCH (off → no-op), so this is
+        # byte-for-byte unchanged until turn-on.
+        execution: dict[str, Any] = {"ran": False, "reason": "no contract"}
+        try:
+            from .worker_dispatch import execute_spine
+            _decoded = state.get_outbox_event(int(row["id"]))
+            _contract = dict((_decoded.get("payload") or {}).get("cto_contract") or {})
+            if _contract:
+                _contract["human_gate_required"] = False  # MJ's approval satisfied the gate
+                execution = execute_spine(_contract)
+        except Exception as exc:  # noqa: BLE001 - dormant wire must never break approval
+            execution = {"ran": False, "reason": f"execute_spine error: {str(exc)[:160]}"}
         wake = run_intake_wake(issue_id=issue_id, wake_source="completion")
         integrator_runner = run_integrator_auto_land or globals()["run_integrator_auto_land"]
         integrator_result = integrator_runner(ticket=issue_id, project=_kanban_project_from_row(row), notes=note)
@@ -587,7 +603,7 @@ def handle_linear_webhook(
             issue_id,
             f"Approved received — Team OS queued continuation with MJ notes attached, cleared the Kanban worker block ({kanban_result}), woke the intake/dispatch motor, and ran Integrator ({integrator_result}).",
         )
-        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, "kanban": kanban_result, "integrator": integrator_result, **wake}
+        return {"decision": "approved", "issue": issue_id, "commented": True, "queued": True, "kanban": kanban_result, "integrator": integrator_result, "execution": execution, **wake}
 
     if comment_decision == _REJECTED or current in {_REJECTED, _NOT_APPROVED}:
         apply_mj_decision(state, row, decision=_REJECTED, note=note)

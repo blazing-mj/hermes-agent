@@ -27,6 +27,7 @@ if str(HERMES_REPO) not in sys.path:
 from hermes_cli import kanban_db
 from hermes_cli.team_os.cortex_agent import cortex_audit
 from hermes_cli.team_os.cto_agent import cto_contract
+from hermes_cli.team_os.worker_dispatch import execute_spine
 from hermes_cli.team_os.db import TeamOSState
 from hermes_cli.team_os.event_router import route_linear_observation
 from hermes_cli.team_os.intake_reconcile import WakeSource, pick_one_after_reconcile, reconcile_full_backlog
@@ -753,6 +754,15 @@ def main() -> int:
     payload["triage_protocol"] = triage_artifact
     payload["mission_contract"] = scoping_decision
     chain = _ensure_spine_chain(picked, payload, gated=gated)
+    # WIRE (Stage E hook, dormant): a non-gated (reversible, autonomous) ticket
+    # runs the real Worker→Validator slice here. execute_spine self-gates on
+    # TEAM_OS_WORKER_DISPATCH + TEAM_OS_VALIDATOR_DISPATCH (both OFF by default)
+    # and the connectors refuse human-gated work, so with flags off this is a
+    # no-op and the live flow is unchanged. Gated tickets run post-approval
+    # (webhook). The kill-switch (_loop_paused) already blocked the pick above
+    # when paused, so this never runs while Team OS is paused.
+    if not gated:
+        payload["execution"] = execute_spine(payload.get("cto_contract") or {})
     outbox = _queue_or_hold_outbox(state, payload, gated=gated)
     target_state = "Needs-MJ" if gated else "In Progress"
     _linear_status(picked, target_state)

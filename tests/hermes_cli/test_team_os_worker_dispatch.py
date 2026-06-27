@@ -88,3 +88,44 @@ def test_commit_worktree_bad_path_fails_safe():
     from hermes_cli.team_os.worker_dispatch import _commit_worktree
     sha, err = _commit_worktree(Path("/nonexistent/worktree/xyz"), "AGENTS-1")
     assert sha is None and err  # graceful, no raise
+
+
+# ── execute_spine: the wire that chains Worker → Validator (dormant by default) ──
+
+def test_execute_spine_noop_when_worker_disabled(monkeypatch):
+    import hermes_cli.team_os.worker_dispatch as wd
+    monkeypatch.setattr(wd, "dispatch_worker", lambda c, **k: {"dispatched": False, "reason": "disabled"})
+    out = wd.execute_spine({"source_ticket": "A-1"})
+    assert out["ran"] is False and out["landable"] is False
+    assert out["validator"] is None  # validator never reached
+
+
+def test_execute_spine_landable_on_worker_commit_plus_validator_pass(monkeypatch):
+    import hermes_cli.team_os.worker_dispatch as wd
+    import hermes_cli.team_os.validator_dispatch as vd
+    monkeypatch.setattr(wd, "dispatch_worker", lambda c, **k: {
+        "dispatched": True, "worker_status": "completed", "commit": "a" * 40, "handoff": {"x": 1}})
+    monkeypatch.setattr(vd, "dispatch_validator", lambda c, h, **k: {"verdict": "PASS", "bounce_count": 0})
+    out = wd.execute_spine({"source_ticket": "A-1"})
+    assert out["ran"] is True and out["landable"] is True and out["commit"] == "a" * 40
+
+
+def test_execute_spine_not_landable_on_validator_bounce(monkeypatch):
+    import hermes_cli.team_os.worker_dispatch as wd
+    import hermes_cli.team_os.validator_dispatch as vd
+    monkeypatch.setattr(wd, "dispatch_worker", lambda c, **k: {
+        "dispatched": True, "worker_status": "completed", "commit": "b" * 40, "handoff": {}})
+    monkeypatch.setattr(vd, "dispatch_validator", lambda c, h, **k: {"verdict": "BOUNCE"})
+    out = wd.execute_spine({"source_ticket": "A-1"})
+    assert out["ran"] is True and out["landable"] is False  # built but not validated
+
+
+def test_execute_spine_worker_incomplete_skips_validator(monkeypatch):
+    import hermes_cli.team_os.worker_dispatch as wd
+    called = []
+    monkeypatch.setattr(wd, "dispatch_worker", lambda c, **k: {
+        "dispatched": True, "worker_status": "boundary_denied", "commit": None})
+    import hermes_cli.team_os.validator_dispatch as vd
+    monkeypatch.setattr(vd, "dispatch_validator", lambda c, h, **k: called.append(1) or {"verdict": "PASS"})
+    out = wd.execute_spine({"source_ticket": "A-1"})
+    assert out["landable"] is False and called == []  # validator not run on incomplete work

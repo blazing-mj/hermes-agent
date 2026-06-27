@@ -135,5 +135,37 @@ def _commit_worktree(worktree_path: Path, ticket: str) -> tuple[Optional[str], O
         return None, f"commit error: {str(exc)[:160]}"
 
 
+def execute_spine(contract: dict[str, Any], *, repo_root: Path | str | None = None) -> dict[str, Any]:
+    """The autonomous execution slice: run the Worker, and IF it produced a real
+    commit, run the Validator on its handoff.
+
+    This is the wire that connects the built-but-dormant agents into the live
+    flow. It changes NOTHING until both connectors' flags are on AND TeamOS is
+    unpaused, because:
+      - dispatch_worker is OFF unless TEAM_OS_WORKER_DISPATCH (and refuses
+        human-gated contracts), and
+      - dispatch_validator is OFF unless TEAM_OS_VALIDATOR_DISPATCH.
+    So with the flags off (default), this returns ran=False and the live flow is
+    byte-for-byte unchanged. Never raises.
+
+    Returns: {ran, worker, validator, commit, landable, reason} where
+    landable = a real commit exists AND the Validator returned PASS.
+    """
+    from .validator_dispatch import dispatch_validator
+
+    w = dispatch_worker(contract, repo_root=repo_root)
+    if not w.get("dispatched"):
+        return {"ran": False, "worker": w, "validator": None,
+                "commit": None, "landable": False, "reason": w.get("reason")}
+    if w.get("worker_status") != "completed":
+        return {"ran": True, "worker": w, "validator": None, "commit": w.get("commit"),
+                "landable": False, "reason": f"worker status {w.get('worker_status')}"}
+    v = dispatch_validator(contract, w.get("handoff") or {})
+    landable = bool(w.get("commit")) and v.get("verdict") == "PASS"
+    return {"ran": True, "worker": w, "validator": v, "commit": w.get("commit"),
+            "landable": landable,
+            "reason": "validated PASS" if landable else f"validator {v.get('verdict')}"}
+
+
 def _flag_on(value: str | None) -> bool:
     return bool(value) and value.strip().lower() not in {"", "0", "false", "no", "off"}
