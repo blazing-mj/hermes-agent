@@ -286,6 +286,58 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+def _configured_openai_codex_broker_base_url(model_cfg: Optional[Dict[str, Any]]) -> str:
+    """Return an explicitly enabled loopback Codex broker URL from config.
+
+    Built-in ``openai-codex`` normally talks directly to the ChatGPT Codex
+    backend. For MJ's shared-subscription topology, a local ``hermes proxy`` can
+    own the OAuth chain while clients use a dummy bearer. Keep this opt-in and
+    loopback-only so a stale or hostile ``base_url`` cannot hijack ChatGPT OAuth
+    traffic to a remote host.
+    """
+    if not model_cfg:
+        return ""
+    provider = str(model_cfg.get("provider") or "").strip().lower()
+    if provider != "openai-codex":
+        return ""
+    enabled = bool(model_cfg.get("use_local_broker") or model_cfg.get("codex_broker"))
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    if runtime in {"codex_broker", "local_broker", "local_codex_broker"}:
+        enabled = True
+    if not enabled:
+        return ""
+    base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    if not base_url:
+        return ""
+    hostname = base_url_hostname(base_url)
+    if hostname == "0.0.0.0":
+        return ""
+    if _loopback_hostname(hostname):
+        return base_url
+    logger.warning(
+        "Ignoring openai-codex local broker base_url with non-loopback host: %s",
+        base_url,
+    )
+    return ""
+
+
+_CODEX_BROKER_DUMMY_API_KEY = "hermes-local-codex-broker"
+
+
+def _apply_openai_codex_broker_runtime(runtime: Dict[str, Any], model_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    broker_base_url = _configured_openai_codex_broker_base_url(model_cfg)
+    if not broker_base_url:
+        return runtime
+    updated = dict(runtime)
+    updated["base_url"] = broker_base_url
+    updated["api_key"] = _CODEX_BROKER_DUMMY_API_KEY
+    updated["api_mode"] = "codex_responses"
+    source = str(updated.get("source") or "config")
+    if "+local-broker" not in source:
+        updated["source"] = f"{source}+local-broker"
+    return updated
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -412,7 +464,7 @@ def _resolve_runtime_from_pool_entry(
         provider=provider, api_mode=api_mode, model_cfg=model_cfg
     )
 
-    return {
+    runtime = {
         "provider": provider,
         "api_mode": api_mode,
         "base_url": base_url,
@@ -421,6 +473,9 @@ def _resolve_runtime_from_pool_entry(
         "credential_pool": pool,
         "requested_provider": requested_provider,
     }
+    if provider == "openai-codex":
+        runtime = _apply_openai_codex_broker_runtime(runtime, model_cfg)
+    return runtime
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -1099,7 +1154,7 @@ def _resolve_explicit_runtime(
             last_refresh = creds.get("last_refresh")
             if not explicit_base_url:
                 base_url = creds.get("base_url", "").rstrip("/") or base_url
-        return {
+        runtime = {
             "provider": "openai-codex",
             "api_mode": "codex_responses",
             "base_url": base_url,
@@ -1108,6 +1163,9 @@ def _resolve_explicit_runtime(
             "last_refresh": last_refresh,
             "requested_provider": requested_provider,
         }
+        if explicit_base_url:
+            return runtime
+        return _apply_openai_codex_broker_runtime(runtime, model_cfg)
 
     if provider == "nous":
         state = auth_mod.get_provider_auth_state("nous") or {}
@@ -1361,7 +1419,7 @@ def resolve_runtime_provider(
     if provider == "openai-codex":
         try:
             creds = resolve_codex_runtime_credentials()
-            return {
+            runtime = {
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
                 "base_url": creds.get("base_url", "").rstrip("/"),
@@ -1370,6 +1428,7 @@ def resolve_runtime_provider(
                 "last_refresh": creds.get("last_refresh"),
                 "requested_provider": requested_provider,
             }
+            return _apply_openai_codex_broker_runtime(runtime, model_cfg)
         except AuthError:
             if requested_provider != "auto":
                 raise

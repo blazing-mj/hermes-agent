@@ -14,6 +14,7 @@ import pytest
 
 from hermes_cli.proxy.adapters import ADAPTERS, get_adapter
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy.adapters.codex import OpenAICodexAdapter
 from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
 from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
 
@@ -31,6 +32,10 @@ def test_registry_lists_xai():
     assert "xai" in ADAPTERS
 
 
+def test_registry_lists_openai_codex():
+    assert "openai-codex" in ADAPTERS
+
+
 def test_get_adapter_returns_instance():
     adapter = get_adapter("nous")
     assert isinstance(adapter, NousPortalAdapter)
@@ -43,10 +48,27 @@ def test_get_adapter_returns_xai_instance():
     assert isinstance(adapter, UpstreamAdapter)
 
 
+def test_get_adapter_returns_openai_codex_instance():
+    adapter = get_adapter("openai-codex")
+    assert isinstance(adapter, OpenAICodexAdapter)
+    assert isinstance(adapter, UpstreamAdapter)
+
+
+def test_upstream_credential_stays_hashable_with_extra_headers():
+    cred = UpstreamCredential(
+        bearer="token",
+        base_url="https://example.test/v1",
+        extra_headers=(("X-Test", "1"),),
+    )
+
+    assert hash(cred)
+
+
 def test_get_adapter_case_insensitive():
     assert isinstance(get_adapter("NOUS"), NousPortalAdapter)
     assert isinstance(get_adapter("  Nous  "), NousPortalAdapter)
     assert isinstance(get_adapter("XAI"), XAIGrokAdapter)
+    assert isinstance(get_adapter("OPENAI-CODEX"), OpenAICodexAdapter)
 
 
 def test_get_adapter_unknown_provider_raises():

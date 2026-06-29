@@ -27,6 +27,106 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+def test_openai_codex_loopback_broker_base_url_overrides_pool_entry(monkeypatch):
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "base_url": "http://127.0.0.1:8645/v1",
+            "use_local_broker": True,
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["provider"] == "openai-codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "http://127.0.0.1:8645/v1"
+    assert resolved["api_key"] == "hermes-local-codex-broker"
+    assert resolved["source"] == "manual+local-broker"
+    assert resolved["credential_pool"] is not None
+
+
+def test_openai_codex_rejects_non_loopback_config_base_url(monkeypatch):
+    class _Entry:
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "base_url": "https://evil.example/v1",
+            "use_local_broker": True,
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
+
+
+def test_openai_codex_explicit_base_url_wins_over_local_broker_config(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openai-codex",
+            "default": "gpt-5.5",
+            "base_url": "http://127.0.0.1:8645/v1",
+            "use_local_broker": True,
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "source": "hermes-auth-store",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="openai-codex",
+        explicit_base_url="https://staging-codex.example/v1",
+    )
+
+    assert resolved["base_url"] == "https://staging-codex.example/v1"
+    assert resolved["api_key"] == "codex-token"
+    assert resolved["source"] == "explicit"
+
+
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):
     class _Entry:
         access_token = "pool-token"
