@@ -91,3 +91,29 @@ class TestPrompt:
         p = build_cto_prompt(TICKET, CORTEX_GATED)
         assert "AGENTS-50" in p and "credential rotation" in p and "files_to_touch" in p
         assert "Use NO tools" in p
+
+
+class TestDefinitionOfDone:
+    """§9 verifiable-goal: the contract must carry a concrete, runnable done-check."""
+
+    def test_carries_definition_of_done_through(self):
+        c = cto_contract(TICKET, CORTEX_SAFE, enabled=True,
+                         reviewer=lambda p: _good_contract_json(
+                             definition_of_done="pytest tests/test_net.py::test_retry exits 0"))
+        assert c["contract_source"] == "cto-agent"
+        assert c["definition_of_done"] == "pytest tests/test_net.py::test_retry exits 0"
+        assert check_contract(c) == []  # optional field doesn't break validation
+
+    def test_prompt_demands_a_runnable_done_check(self):
+        p = build_cto_prompt(TICKET, CORTEX_SAFE)
+        assert "definition_of_done" in p
+        assert "run" in p.lower() and "placeholder" in p.lower()  # the verifiable-goal rule
+
+    def test_missing_commands_signals_incomplete_not_a_fake_command(self):
+        # model returns a valid contract but NO real proof command → we must NOT
+        # paper it with a fake command; signal incompleteness so the Validator bounces.
+        c = cto_contract(TICKET, CORTEX_SAFE, enabled=True,
+                         reviewer=lambda p: _good_contract_json(commands=[]))
+        assert c["contract_source"] == "cto-agent"
+        assert any("no proof command" in str(x).lower() for x in c["commands"])
+        assert not any("loop-runner" in str(x) for x in c["commands"])  # no fake placeholder

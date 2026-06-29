@@ -246,3 +246,16 @@ def test_bounce_loop_stops_after_three_bounces_and_escalates_to_mj(tmp_path):
     assert result["escalate_mj"] is True
     assert result["human_gate_required"] is True
     assert result["auto_done_allowed"] is False
+
+
+def test_validator_prompt_enforces_definition_of_done():
+    from hermes_cli.team_os.validator_runner import build_validator_prompt
+    contract = {
+        "source_ticket": "AGENTS-1", "intended_behavior": "x", "non_goals": [],
+        "assertions": ["a"], "commands": ["pytest -q"], "bounce_conditions": ["b"],
+        "behavior_check_required": True, "human_gate_required": True, "risk": "low",
+        "definition_of_done": "pytest tests/test_x.py::test_y exits 0",
+    }
+    prompt = build_validator_prompt(contract=contract, handoff={"schema": "team_os.worker_handoff.v1"})
+    assert "definition_of_done" in prompt
+    assert "not demonstrated" in prompt  # declared-but-unproven done-check = BOUNCE

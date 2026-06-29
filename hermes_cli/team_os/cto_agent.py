@@ -45,21 +45,34 @@ _CTO_SYSTEM = (
     "turn it into a CONCRETE, MINIMAL implementation contract that a Worker will "
     "execute in an isolated worktree and a Validator will check. You do NOT "
     "implement anything — you scope it.\n\n"
+    "The single most important field is definition_of_done. A WEAK contract tells "
+    "the Worker to 'implement the plan'. A STRONG contract gives it something to be "
+    "TESTED against — expected behavior, a success check, a clear standard for done. "
+    "So:\n"
+    "- definition_of_done = the ONE concrete, runnable check that proves this ticket "
+    "is complete — ideally a command whose pass/fail is binary. When the code in "
+    "scope ALREADY has tests, or the ticket is a bug with a reproducible failure, "
+    "make the done-check 'these exact tests / this exact repro now pass' and NAME the "
+    "command. A goal you can run beats a goal you can only read.\n"
+    "- commands = the REAL proof commands that demonstrate done (the existing test "
+    "command, the failing repro that must now go green, the lint). NO generic "
+    "placeholders — if you cannot name a real proof command, the scope is still too "
+    "vague; tighten it until you can.\n"
+    "- assertions = the remaining acceptance criteria the Validator verifies, beyond "
+    "the done-check. Concrete and checkable.\n"
     "Rules:\n"
     "- Keep scope minimal and reversible. List the SPECIFIC files/areas to touch.\n"
-    "- assertions = the acceptance criteria the Validator will verify (tests pass, "
-    "lint clean, the specific behavior change). Be concrete and checkable.\n"
     "- non_goals = explicit out-of-scope to stop the Worker drifting.\n"
-    "- bounce_conditions = when the Worker/Validator must STOP (test fails, lint "
-    "errors, kill-switch active, scope creep, proof missing).\n"
+    "- bounce_conditions = when the Worker/Validator must STOP (definition_of_done "
+    "not met, test fails, lint errors, kill-switch active, scope creep, proof missing).\n"
     "- risk = one of low|medium|high|critical.\n"
     "- Use NO tools. Do not investigate the codebase. Scope ONLY from the ticket "
     "and Cortex grounding below; respond with the JSON immediately.\n\n"
     "Output ONLY a single JSON object, no prose, with exactly these keys:\n"
-    '{"intended_behavior": str, "files_to_touch": [str], "non_goals": [str], '
-    '"assertions": [str], "commands": [str], "bounce_conditions": [str], '
-    '"risk": "low|medium|high|critical", "behavior_check_required": true, '
-    '"human_gate_required": bool, "scope_summary": str}'
+    '{"intended_behavior": str, "definition_of_done": str, "files_to_touch": [str], '
+    '"non_goals": [str], "assertions": [str], "commands": [str], '
+    '"bounce_conditions": [str], "risk": "low|medium|high|critical", '
+    '"behavior_check_required": true, "human_gate_required": bool, "scope_summary": str}'
 )
 
 
@@ -165,10 +178,14 @@ def cto_contract(
         "role": "worker",
         "source_ticket": ticket,
         "intended_behavior": parsed.get("intended_behavior", ""),
+        "definition_of_done": parsed.get("definition_of_done", "") if isinstance(parsed.get("definition_of_done"), str) else "",
         "files_to_touch": parsed.get("files_to_touch", []) if isinstance(parsed.get("files_to_touch"), list) else [],
         "non_goals": parsed.get("non_goals", []),
         "assertions": parsed.get("assertions", []),
-        "commands": parsed.get("commands") or ["hermes team-os loop-runner --active --tasks <tasks.json>"],
+        # Real proof commands only. If the model named none, signal incompleteness
+        # (so the Validator BOUNCEs) rather than papering it with a fake command.
+        "commands": parsed.get("commands") if isinstance(parsed.get("commands"), list) and parsed.get("commands")
+        else ["(no proof command specified — contract incomplete, Validator must BOUNCE)"],
         "bounce_conditions": parsed.get("bounce_conditions", []),
         "risk": parsed.get("risk", "medium"),
         "behavior_check_required": True,

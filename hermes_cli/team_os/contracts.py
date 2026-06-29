@@ -92,6 +92,11 @@ WORKER_TEMPLATE: dict[str, Any] = {
         "Execute a focused implementation task inside a sandboxed worktree "
         "and write a proof artifact"
     ),
+    "definition_of_done": (
+        "The task's focused tests run and pass (exit 0) and the proof is "
+        "captured in proof_results — a concrete, runnable success check, not a "
+        "prose claim"
+    ),
     "non_goals": [
         "Do not expand scope beyond the assigned task",
         "Do not touch files unrelated to the task",
