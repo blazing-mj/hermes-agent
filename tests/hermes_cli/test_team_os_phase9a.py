@@ -637,8 +637,22 @@ def test_cli_kill_switch_status_output_path(tmp_path):
 
 
 def _telegram_mocks():
-    """Ensure the telegram module is mocked for tests."""
+    """Mock the telegram module ONLY when it isn't actually installed.
+
+    This runs at import time and uses sys.modules.setdefault, so when the real
+    telegram lib was not yet imported it permanently installed a MagicMock over
+    the key for the whole session — leaking into other tests that import the
+    real lib (e.g. test_team_os_telegram_buttons, which then saw a mock
+    InlineKeyboardMarkup and failed). If the real lib is present, use it and
+    never mock; only stub when genuinely headless.
+    """
     from unittest.mock import MagicMock
+
+    try:
+        import telegram  # noqa: F401 - real lib present → use it, never leak a mock
+        return
+    except ImportError:
+        pass
 
     mod = MagicMock()
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)

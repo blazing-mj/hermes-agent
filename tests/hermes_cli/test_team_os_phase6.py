@@ -382,6 +382,8 @@ def test_cli_loop_runner_active_success_path(tmp_path):
         lock=str(tmp_path / "cli-success.lock"),
         owner="phase6-cli-success",
         active=True,
+        # hermetic: don't read the machine's real kill-switch (TeamOS may be paused)
+        kill_switch_state=str(tmp_path / "kill-switch.json"),
         sandbox_root=str(sandbox_root),
         workspace=str(workspace_dir),
         worker_cmd=[sys.executable, "-c", _SUCCESS_WORKER],
@@ -479,6 +481,8 @@ def test_cli_loop_runner_active_failure_returns_non_zero(tmp_path):
         lock=str(tmp_path / "cli-failure.lock"),
         owner="phase6-cli-failure",
         active=True,
+        # hermetic: don't read the machine's real kill-switch (TeamOS may be paused)
+        kill_switch_state=str(tmp_path / "kill-switch.json"),
         sandbox_root=str(sandbox_root),
         workspace=str(workspace_dir),
         worker_cmd=[sys.executable, "-c", _FAILURE_WORKER],
