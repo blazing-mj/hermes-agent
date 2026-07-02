@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """worktree_integrity_check.py — canary for recurring git-tracked file loss.
 
 Read-only. For every git worktree of the hermes-agent repo, report any tracked

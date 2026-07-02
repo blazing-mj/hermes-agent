@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """Live Team OS Linear intake motor: doorbell/sweep -> full Backlog reconcile -> one pick.
 
 Linear webhooks are doorbells only; every wake scans the configured Linear

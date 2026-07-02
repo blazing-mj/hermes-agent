@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """verify_spine_run.py — deterministic scorecard for one Team OS spine run.
 
 Codifies the reviewer's manual checks: given a Linear ticket id (e.g. AGENTS-206),
@@ -10,7 +10,7 @@ Checks: all stages present (cortex→cto→worker→validator) · role separatio
 · instability (crashed/timed-out/spawn-failed runs) · manual interventions
 (controller hand-stops) · validator verdict · duration.
 
-Usage: python3.13 verify_spine_run.py AGENTS-206 [AGENTS-188 ...]
+Usage: python3 verify_spine_run.py AGENTS-206 [AGENTS-188 ...]
 Exit: 0 all PASS/WARN, 1 any FAIL.
 """
 from __future__ import annotations

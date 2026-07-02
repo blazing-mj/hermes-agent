@@ -1,11 +1,11 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """team_os_inbox.py — MJ's ONE screen: "what needs me, right now, in plain words."
 
 Pulls every ticket waiting on MJ (Needs-MJ / Blocked / Approved-not-Done) across
 all projects and renders a human-language decision list — no jargon, no JSON.
 The CLI answer to "⚡ My Decisions". Cron-able to DM a daily/▶ on-demand digest.
 
-Usage: python3.13 team_os_inbox.py [--plain]   (--plain = no ANSI, for Telegram)
+Usage: python3 team_os_inbox.py [--plain]   (--plain = no ANSI, for Telegram)
 """
 from __future__ import annotations
 

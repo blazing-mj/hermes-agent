@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """catch_deleter.py — high-frequency forensic watcher to catch the UNLOGGED
 tracked-file deleter in the act.
 

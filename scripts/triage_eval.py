@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """triage_eval.py — Phase 0 eval harness for TeamOS triage (eval-flywheel brief §5).
 
 Materializes the outbox into a versioned case store and scores ANY triage policy

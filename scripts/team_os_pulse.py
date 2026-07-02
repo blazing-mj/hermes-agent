@@ -1,10 +1,10 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """team_os_pulse.py — one-command live status of the whole Team OS machine.
 
 Answers "what is happening right now?": board lanes, active chains, motor health
 (sweep tick + webhook deliveries), gateways, integrity. Read-only, fail-soft.
 
-Usage: python3.13 team_os_pulse.py
+Usage: python3 team_os_pulse.py
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -95,7 +96,9 @@ def fleet() -> None:
     out = sh(["launchctl", "list"])
     up = [l.split("\t")[2] for l in out.splitlines() if "ai.hermes.gateway" in l and not l.startswith("-") and "watchdog" not in l]
     print(f"  gateways up: {len(up)}/5  ({', '.join(s.replace('ai.hermes.gateway','def').replace('-','') or 'default' for s in sorted(up))})")
-    integ = sh(["/opt/homebrew/bin/python3.13", str(HERMES / "scripts" / "worktree_integrity_check.py")])
+    # sys.executable: run the sibling check with THIS interpreter — a hardcoded
+    # /opt/homebrew/bin/python3.13 died when brew rotated to 3.14 (2026-07-02).
+    integ = sh([sys.executable, str(HERMES / "scripts" / "worktree_integrity_check.py")])
     ok = "OK" in integ
     print(f"  integrity: {G+'OK'+N if ok else R+'PROBLEMS — run worktree_integrity_check.py'+N}")
     # repo branch sanity

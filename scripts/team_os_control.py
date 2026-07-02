@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """team_os_control.py — the PAUSE / RESUME button for the autonomous loop.
 
 Writes the canonical kill-switch state file that the intake motor checks before

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """team_os_metrics.py — Phase 4 growth-loop foundation: the system measures itself.
 
 Reads the kanban boards and computes per-ticket + aggregate metrics:
@@ -9,7 +9,7 @@ and prints a human digest. Read-only over the DBs; safe to run anytime/cron.
 The weekly Reporter digest and "worst metric files its own improvement ticket"
 build on this output.
 
-Usage: python3.13 team_os_metrics.py [--days 7]
+Usage: python3 team_os_metrics.py [--days 7]
 """
 from __future__ import annotations
 

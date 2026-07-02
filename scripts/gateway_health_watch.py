@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3
 """gateway_health_watch.py — Phase 0.5 observability floor (TeamOS eval-flywheel brief §4).
 
 Alerts MJ on Telegram when the Hermes gateway goes SILENT or the model chain
@@ -27,9 +27,9 @@ This script performs NO mutations to any system — it reads logs and sends a
 Telegram message. Safe to run while Team OS is paused (it is monitoring, not
 Team OS activation).
 
-Run: python3.13 gateway_health_watch.py            # one tick (cron/launchd)
-     python3.13 gateway_health_watch.py --dry-run  # detect + print, no send
-     python3.13 gateway_health_watch.py --self-test
+Run: python3 gateway_health_watch.py            # one tick (cron/launchd)
+     python3 gateway_health_watch.py --dry-run  # detect + print, no send
+     python3 gateway_health_watch.py --self-test
 """
 from __future__ import annotations
 
