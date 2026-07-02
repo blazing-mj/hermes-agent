@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -70,6 +71,40 @@ def _read_proc_cmdline(pid: int) -> Optional[str]:
     return data.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
 
 
+def _macos_proc_summary(pid: int) -> Dict[str, str]:
+    """Process name + executable path on macOS via ``libproc``.
+
+    macOS has no ``/proc``, so the Linux readers above are no-ops there.
+    This recovers the single most useful "who killed us" signal — the
+    parent's identity — with one ``proc_pidpath`` syscall through ctypes.
+    Signal-handler-safe (no subprocess, no blocking) and never raises;
+    returns ``{}`` off macOS or on any failure.
+    """
+    if sys.platform != "darwin" or pid <= 0:
+        return {}
+    try:
+        import ctypes
+
+        _PROC_PIDPATHINFO_MAXSIZE = 4 * 1024
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.proc_pidpath.restype = ctypes.c_int
+        libc.proc_pidpath.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        buf = ctypes.create_string_buffer(_PROC_PIDPATHINFO_MAXSIZE)
+        n = libc.proc_pidpath(int(pid), buf, _PROC_PIDPATHINFO_MAXSIZE)
+        if not n or n <= 0:
+            return {}
+        path = buf.value.decode("utf-8", "replace")
+        if not path:
+            return {}
+        return {"name": path.rsplit("/", 1)[-1][:64], "cmdline": path[:300]}
+    except Exception:  # noqa: BLE001 — never raise from the signal-handler path
+        return {}
+
+
 def _proc_summary(pid: int) -> Dict[str, Any]:
     """Compact /proc/<pid> snapshot: pid, ppid, state, uid, cmdline.
 
@@ -98,6 +133,11 @@ def _proc_summary(pid: int) -> Dict[str, Any]:
     if cmdline:
         # Truncate aggressively — these can be 4KB
         summary["cmdline"] = cmdline[:300]
+    # macOS has no /proc, so every read above is a no-op there. Fill name +
+    # cmdline from libproc so the parent's identity is still captured.
+    if "cmdline" not in summary or "name" not in summary:
+        for key, value in _macos_proc_summary(pid).items():
+            summary.setdefault(key, value)
     return summary
 
 
@@ -226,19 +266,51 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
-    script = (
-        f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
-        "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
-        "echo '=== end ==='"
-    )
+    pid = os.getpid()
+    ppid = os.getppid()
+    if sys.platform == "darwin":
+        # macOS has no /proc, no pstree, no dmesg/journalctl, and BSD ``ps``
+        # rejects GNU ``auxf``/``--sort``. Use the native equivalents so the
+        # diagnostic actually captures the process table, our parent (the
+        # "who killed us" signal), and resource state — instead of the empty
+        # sections the Linux script produced here.
+        script = (
+            f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+            "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- ps (top 60 by cpu) ---'; "
+            "ps -axo pid,ppid,%cpu,%mem,stat,etime,command -r 2>/dev/null | head -61; "
+            f"echo '--- our parent (pid {pid} ppid {ppid}) ---'; "
+            f"ps -o pid,ppid,uid,stat,command -p {ppid} 2>/dev/null; "
+            "echo '--- load + memory ---'; "
+            "sysctl -n vm.loadavg 2>/dev/null; "
+            "vm_stat 2>/dev/null | head -12; "
+            "echo '=== end ==='"
+        )
+    else:
+        # Linux/systemd: /proc + pstree + dmesg/journalctl.
+        script = (
+            f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+            "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- ps auxf (top 60 by cpu) ---'; "
+            "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+            "echo '--- pstree of self ---'; "
+            f"pstree -plau {pid} 2>/dev/null | head -40 || true; "
+            "echo '--- /proc/loadavg ---'; "
+            "cat /proc/loadavg 2>/dev/null || true; "
+            "echo '--- recent dmesg (oom/killed) ---'; "
+            "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
+            "echo '=== end ==='"
+        )
+
+    # ``timeout`` bounds a wedged probe. It's GNU coreutils; macOS may only
+    # have ``gtimeout`` (Homebrew) or neither — fall back to bare ``bash``
+    # (the probe is already detached via start_new_session, so it can never
+    # block the gateway regardless).
+    timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+    if timeout_bin:
+        argv = [timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script]
+    else:
+        argv = ["bash", "-c", script]
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
@@ -255,7 +327,7 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            argv,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
