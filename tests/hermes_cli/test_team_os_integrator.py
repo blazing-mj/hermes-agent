@@ -46,7 +46,7 @@ def _validator(tmp_path: Path, verdict: str = "PASS") -> Path:
     return path
 
 
-def test_reversible_validator_pass_auto_lands_and_records_rollback(tmp_path: Path):
+def test_reversible_validator_pass_lands_locally_without_push_or_deploy_by_default(tmp_path: Path):
     calls: list[list[str]] = []
     comments: list[str] = []
     pings: list[str] = []
@@ -69,8 +69,10 @@ def test_reversible_validator_pass_auto_lands_and_records_rollback(tmp_path: Pat
 
     assert result.status == "auto_landed"
     assert result.reversibility == "reversible"
-    assert [c[0:2] for c in calls] == [["git", "branch"], ["git", "fetch"], ["git", "checkout"], ["git", "merge"], ["git", "push"], ["hermes", "gateway"]]
+    assert [c[0:2] for c in calls] == [["git", "branch"], ["git", "fetch"], ["git", "checkout"], ["git", "merge"]]
     assert calls[3] == ["git", "merge", "--ff-only", "ok"]
+    assert all(call[:2] != ["git", "push"] for call in calls)
+    assert all(call[:2] != ["hermes", "gateway"] for call in calls)
     assert "Rollback commands" in comments[-1]
     assert "git revert" in comments[-1]
     assert pings and "FYI" in pings[0]

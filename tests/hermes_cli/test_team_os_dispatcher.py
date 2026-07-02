@@ -304,7 +304,7 @@ def test_dispatcher_triggers_integrator_after_validator_pass_when_enabled(tmp_pa
         "source_ticket": "AGENTS-172",
         "handoff_exists": True,
         "validator_exists": True,
-        "deploy_command": ("hermes", "gateway", "restart"),
+        "deploy_command": (),
     }
 
 

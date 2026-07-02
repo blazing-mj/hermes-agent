@@ -249,10 +249,11 @@ def _rollback_commands(handoff: dict[str, Any], source_ticket: str, deploy_comma
     declared = tuple(_as_texts(handoff.get("rollback_commands")))
     if declared:
         return declared
-    rollback = [f"git revert <merge-commit-for-{source_ticket}> --no-edit"]
-    if deploy_command:
-        rollback.append(" ".join(deploy_command))
-    return tuple(rollback)
+    # Local-only Integrator rollback must not imply rerunning deploy hooks.  The
+    # deploy_command field is retained for backward-compatible input parsing but
+    # is not executed by AGENTS-297's canonical Integrator path.
+    _ = deploy_command
+    return (f"git revert <merge-commit-for-{source_ticket}> --no-edit",)
 
 
 def _run_auto_land_commands(
@@ -269,18 +270,16 @@ def _run_auto_land_commands(
     if source_branch == input_data.main_branch:
         raise RuntimeError("cannot auto-land: validated worktree is already on the main branch")
 
+    # AGENTS-297: local-only landing is the only safe default.  Do not push to
+    # remotes and do not run deploy commands from this Integrator; MJ pushes and
+    # deploys manually until a separate, explicitly gated remote path is built.
     for argv in (
         ("git", "fetch", "origin", input_data.main_branch),
         ("git", "checkout", input_data.main_branch),
         ("git", "merge", "--ff-only", source_branch),
-        ("git", "push", "origin", input_data.main_branch),
     ):
         runner(argv, input_data.worktree_path)
         commands.append(tuple(argv))
-    if input_data.deploy_command:
-        deploy = tuple(input_data.deploy_command)
-        runner(deploy, input_data.worktree_path)
-        commands.append(deploy)
     return tuple(commands)
 
 
@@ -348,7 +347,7 @@ def integrate_after_validator(
     if input_data.fyi_counter_path is not None:
         if AutoLandCounter(input_data.fyi_counter_path).should_send_and_increment(limit=input_data.fyi_limit):
             try:
-                fyi_sender(f"FYI: {input_data.source_ticket} reversible Validator PASS auto-landed and deployed. Rollback is recorded on Linear.")
+                fyi_sender(f"FYI: {input_data.source_ticket} reversible Validator PASS landed locally. No remote push or deploy was performed. Rollback is recorded on Linear.")
                 fyi_sent = True
             except Exception as exc:  # noqa: BLE001 - FYI must not hide rollback output.
                 suffix = f"fyi failed after auto-land; rollback commands preserved in Integrator result: {exc}"

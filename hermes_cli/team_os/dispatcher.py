@@ -324,7 +324,10 @@ def dispatch_outbox_event(
             handoff_path=handoff_path,
             validator_report_path=validator_path,
             main_branch=config.integrator_main_branch,
-            deploy_command=config.integrator_deploy_command,
+            # AGENTS-297: dispatcher must not smuggle deploy authority into the
+            # default Integrator path.  Remote/deploy is out of scope for the
+            # canonical local-only Integrator and must be a separate hard gate.
+            deploy_command=(),
             fyi_counter_path=config.integrator_fyi_counter_path,
             fyi_limit=config.integrator_fyi_limit,
         )
