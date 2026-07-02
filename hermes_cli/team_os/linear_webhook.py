@@ -319,6 +319,92 @@ def _landing_evidence(conn: Any, ticket: str) -> dict[str, Any]:
     return {"ok": False}
 
 
+def record_landing_evidence(ticket: str, project: str, sha: str, branch: str = "") -> dict[str, Any]:
+    """P0 (completion-plan brief): post the Worker's validated commit sha onto the
+    spine chain — the exact surface `_landing_evidence` reads — so the Integrator's
+    no-empty-landing gate can see real work. Before this, the sha lived only in
+    the outbox payload, which nothing consumed: validated commits were abandoned.
+
+    Idempotent (re-posting the same sha is skipped). Never raises — the callers
+    are the live motor/webhook wire, which must not break on bookkeeping.
+    """
+    board = BOARD_BY_PROJECT.get(project, "hermes-system")
+    if not re.fullmatch(r"[0-9a-f]{9,40}", (sha or "").strip()):
+        return {"recorded": False, "board": board, "reason": f"not a commit sha: {sha!r}"}
+    try:
+        conn = kanban_db.connect(board=board)
+    except Exception as exc:  # noqa: BLE001
+        return {"recorded": False, "board": board, "reason": f"kanban connect failed: {str(exc)[:120]}"}
+    try:
+        worker = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (f"linear:{ticket}:spine:worker",),
+        ).fetchone()
+        if not worker:
+            return {"recorded": False, "board": board, "reason": "worker spine task not found"}
+        worker_id = str(worker["id"])
+        existing = conn.execute(
+            "SELECT 1 FROM task_comments WHERE task_id = ? AND body LIKE ? LIMIT 1",
+            (worker_id, f"%{sha}%"),
+        ).fetchone()
+        if existing:
+            return {"recorded": True, "board": board, "worker": worker_id, "reason": "already recorded"}
+        kanban_db.add_comment(
+            conn,
+            worker_id,
+            "team-os-worker",
+            f"Worker output committed: {sha}"
+            + (f" on branch {branch}" if branch else "")
+            + " (validator PASS; pre-landing — not merged to main, not pushed anywhere).",
+        )
+        return {"recorded": True, "board": board, "worker": worker_id, "reason": "recorded"}
+    except Exception as exc:  # noqa: BLE001
+        return {"recorded": False, "board": board, "reason": f"record failed: {str(exc)[:120]}"}
+    finally:
+        conn.close()
+
+
+def _land_code_flag_on() -> bool:
+    value = os.environ.get("TEAM_OS_INTEGRATOR_LAND_CODE", "")
+    return bool(value) and value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _land_commit_locally(repo: str, sha: str, target_ref: str = "main") -> dict[str, Any]:
+    """P0: land a validated commit onto the repo's LOCAL `main` ref — fast-forward
+    only, never touching the working tree, never contacting a remote.
+
+    `git -C repo push . <sha>:refs/heads/main` updates the local branch ref with
+    git's own ff-only semantics: a non-ff (main moved since the worker branched)
+    is REFUSED — we bounce loudly rather than auto-resolve (completion-plan brief
+    P0 caution). If the sha is already an ancestor of main, this is an idempotent
+    no-op success. MJ pushes to remotes manually.
+    """
+    import subprocess as _sp
+
+    def _git(*argv: str) -> "_sp.CompletedProcess[str]":
+        return _sp.run(["git", "-C", repo, *argv], capture_output=True, text=True, timeout=30)
+
+    try:
+        if _git("rev-parse", "--verify", "--quiet", f"refs/heads/{target_ref}").returncode != 0:
+            return {"landed": False, "reason": f"repo has no local {target_ref!r} branch", "repo": repo, "sha": sha}
+        if _git("merge-base", "--is-ancestor", sha, target_ref).returncode == 0:
+            return {"landed": True, "reason": f"already on {target_ref}", "repo": repo, "sha": sha}
+        head = _git("symbolic-ref", "-q", "HEAD")
+        if head.returncode == 0 and head.stdout.strip() == f"refs/heads/{target_ref}":
+            # Moving a ref under a live checkout desyncs its working tree; git
+            # push would refuse anyway — say it clearly and land manually there.
+            return {"landed": False, "repo": repo, "sha": sha,
+                    "reason": f"{target_ref!r} is checked out in this repo's working tree — refusing to move the ref under a live checkout; land manually"}
+        push = _git("push", ".", f"{sha}:refs/heads/{target_ref}")
+        if push.returncode != 0:
+            detail = (push.stderr or push.stdout or "").strip()[-200:]
+            return {"landed": False, "repo": repo, "sha": sha,
+                    "reason": f"NOT fast-forward-able onto local {target_ref} — refusing to auto-resolve: {detail}"}
+        return {"landed": True, "reason": f"fast-forwarded local {target_ref} to {sha[:12]}", "repo": repo, "sha": sha}
+    except Exception as exc:  # noqa: BLE001 - landing must fail closed, loudly, never raise
+        return {"landed": False, "repo": repo, "sha": sha, "reason": f"landing error: {str(exc)[:160]}"}
+
+
 _RESTRICTED_WRITER = "/Users/alfred/.hermes/hermes-agent/scripts/restricted_linear_writer.py"
 
 
@@ -429,6 +515,25 @@ def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict
                 "reason": "no landed commit and no no-code declaration in chain — refusing ceremony landing",
             }
 
+        # P0 (completion-plan brief): actually LAND the validated commit onto the
+        # repo's LOCAL main — the missing driveshaft. Flag-gated OFF by default
+        # (flag off ⇒ behavior byte-for-byte unchanged: state-only landing).
+        # Fail-closed: if the commit can't fast-forward onto local main, bounce
+        # LOUDLY before any state changes — no ceremony Done over unlanded code.
+        # Local-only: never pushes to a remote, never deploys; MJ pushes manually.
+        code_landing: dict[str, Any] = {"landed": False, "reason": "land-code flag off (state-only landing)"}
+        if _land_code_flag_on():
+            if evidence.get("kind") == "commit":
+                code_landing = _land_commit_locally(str(evidence["repo"]), str(evidence["sha"]))
+                if not code_landing["landed"]:
+                    return {
+                        "status": "bounced_code_landing", "board": board, "worker": str(worker["id"]),
+                        "code_landing": code_landing,
+                        "reason": f"validated commit could not be landed on local main — {code_landing['reason']}",
+                    }
+            else:
+                code_landing = {"landed": True, "reason": "no-code ticket — nothing to land"}
+
         worker_id = str(worker["id"])
         if worker["status"] != "done":
             if not kanban_db.complete_task(
@@ -473,7 +578,7 @@ def run_integrator_auto_land(ticket: str, project: str, notes: str = "") -> dict
         )
         # AGENTS-238 final hop: ticket → Done + human-language landed-summary.
         finalize = _integrator_finalize_linear(ticket, evidence, notes)
-        return {"status": "auto_landed", "board": board, "worker": worker_id, "integrator": integrator_id, "fyi_sent": bool(fyi.get("sent")), "fyi": fyi, "linear_finalize": finalize}
+        return {"status": "auto_landed", "board": board, "worker": worker_id, "integrator": integrator_id, "fyi_sent": bool(fyi.get("sent")), "fyi": fyi, "linear_finalize": finalize, "code_landing": code_landing}
     finally:
         conn.close()
 
@@ -587,6 +692,14 @@ def handle_linear_webhook(
                 execution = execute_spine(_contract)
         except Exception as exc:  # noqa: BLE001 - dormant wire must never break approval
             execution = {"ran": False, "reason": f"execute_spine error: {str(exc)[:160]}"}
+        # P0: a landable result (real commit + validator PASS) gets its sha posted
+        # onto the spine chain — the surface the Integrator's no-empty-landing
+        # gate reads — BEFORE run_integrator_auto_land below looks for it.
+        if execution.get("landable") and execution.get("commit"):
+            execution["evidence"] = record_landing_evidence(
+                issue_id, _kanban_project_from_row(row),
+                str(execution["commit"]), str((execution.get("worker") or {}).get("branch") or ""),
+            )
         wake = run_intake_wake(issue_id=issue_id, wake_source="completion")
         integrator_runner = run_integrator_auto_land or globals()["run_integrator_auto_land"]
         integrator_result = integrator_runner(ticket=issue_id, project=_kanban_project_from_row(row), notes=note)

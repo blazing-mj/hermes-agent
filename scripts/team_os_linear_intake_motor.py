@@ -31,7 +31,7 @@ from hermes_cli.team_os.worker_dispatch import execute_spine
 from hermes_cli.team_os.db import TeamOSState
 from hermes_cli.team_os.event_router import route_linear_observation
 from hermes_cli.team_os.intake_reconcile import WakeSource, pick_one_after_reconcile, reconcile_full_backlog
-from hermes_cli.team_os.linear_webhook import apply_mj_decision, run_integrator_auto_land
+from hermes_cli.team_os.linear_webhook import apply_mj_decision, record_landing_evidence, run_integrator_auto_land
 from hermes_cli.team_os.schema import Observation
 
 LINEAR = Path("/Users/alfred/.hermes/bin/linear-agent")
@@ -763,6 +763,15 @@ def main() -> int:
     # when paused, so this never runs while Team OS is paused.
     if not gated:
         payload["execution"] = execute_spine(payload.get("cto_contract") or {})
+        # P0: a landable result (real commit + validator PASS) gets its sha posted
+        # onto the spine chain so the Integrator's no-empty-landing gate can see
+        # real work (before this, the sha died unconsumed in the outbox payload).
+        _exec = payload["execution"]
+        if _exec.get("landable") and _exec.get("commit"):
+            _exec["evidence"] = record_landing_evidence(
+                str(picked), payload.get("project") or "",
+                str(_exec["commit"]), str((_exec.get("worker") or {}).get("branch") or ""),
+            )
     outbox = _queue_or_hold_outbox(state, payload, gated=gated)
     target_state = "Needs-MJ" if gated else "In Progress"
     _linear_status(picked, target_state)

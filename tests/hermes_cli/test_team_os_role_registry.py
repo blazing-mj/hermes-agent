@@ -70,3 +70,21 @@ def test_cto_validator_contract_template_pins_cold_rail_route():
 
 def test_assignment_violation_names_non_dispatchable_profiles():
     assert "not dispatchable" in (assignment_violation(title="ops task", body="", assignee="billprinter") or "")
+
+
+def test_control_plane_spine_markers_are_exempt_from_rail_routing():
+    """Regression (found by the P0 landing tests): the live motor creates its
+    validator spine MARKER as '<ticket> Validator independent proof' assigned to
+    'team-os' — the control-plane label the dispatcher skips (dispatcher-jam
+    fix). The registry rejected it, which would crash _ensure_spine_chain on
+    the next real pick. Markers are never dispatched, so rail rules don't apply."""
+    assert assignment_violation(
+        title="AGENTS-999 Validator independent proof",
+        body="spine marker", assignee="team-os",
+    ) is None
+    # the actual protection is intact: a REAL rail-routable profile still can't
+    # take validator work
+    assert assignment_violation(
+        title="AGENTS-999 Validator independent proof",
+        body="run it", assignee="default",
+    ) is not None

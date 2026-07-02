@@ -109,6 +109,7 @@ def dispatch_worker(
         "changed_files": changed,
         "commit": commit_sha,
         "commit_error": commit_error,
+        "branch": branch,
         "handoff": handoff,
     }
 

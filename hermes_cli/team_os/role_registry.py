@@ -91,6 +91,16 @@ def assignment_violation(*, title: Optional[str], body: Optional[str], assignee:
     if not assignee:
         return None
     profile = str(assignee).strip().casefold()
+    # "team-os" is the CONTROL-PLANE marker label (dispatcher-jam fix): spine
+    # markers carry it precisely so the kanban dispatcher SKIPS them — they are
+    # completed by the Team OS state machine and never executed by any rail.
+    # Rail-routing rules govern EXECUTABLE work, so they cannot apply here; the
+    # registry rejecting the motor's own "<ticket> Validator independent proof"
+    # marker crashed spine-chain creation (found by the P0 landing tests).
+    # Safe: a REAL validator task mis-assigned to team-os could never run at
+    # all (dispatcher skips it) — it parks visibly instead of running off-rail.
+    if profile == "team-os":
+        return None
     task_type = task_type_for(title=title, body=body, assignee=profile)
 
     if task_type == "validator":
